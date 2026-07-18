@@ -1,8 +1,11 @@
 name: Publish Video
 
 on:
-  schedule:
-    - cron: '0 14 * * *'
+  # Daily auto-schedule is disabled for now, at the user's request, while the
+  # first videos are reviewed manually. Re-enable the schedule block below
+  # once the channel owner approves the output quality:
+  #   schedule:
+  #     - cron: '0 14 * * *'
   workflow_dispatch: {}
 
 jobs:
