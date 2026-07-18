@@ -79,6 +79,8 @@ def get_access_token() -> str:
         },
         timeout=30,
     )
+    if resp.status_code != 200:
+        print(f"[pipeline] OAuth token refresh failed: {resp.status_code} {resp.text}")
     resp.raise_for_status()
     return resp.json()["access_token"]
 
@@ -199,8 +201,8 @@ def score_quality(topic: str, script: dict) -> dict:
         Title: {script['title']}
         Script: {" ".join(script['sentences'])}
 
-        Return ONLY valid JSON: {"score": <integer 1-10>, "notes": "<one
-        sentence justification>"}
+        Return ONLY valid JSON: {{"score": <integer 1-10>, "notes": "<one
+        sentence justification>"}}
     """).strip()
     raw = call_gemini(prompt)
     return json.loads(raw)
