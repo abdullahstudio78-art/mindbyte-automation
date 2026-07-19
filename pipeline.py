@@ -495,10 +495,7 @@ async def _synthesize(text: str, dest_path: str, voice: str = "en-US-AriaNeural"
     await communicate.save(dest_path)
 
 
-def generate_voiceover(sentences: list, dest_path: str) -> None:
-    import asyncio
-    full_text = " ".join(sentences)
-    asyncio.run(_synthesize(full_text, dest_path))
+SENTENCE_GAP_MS = 220  # brief pause between beats
 
 
 def ffprobe_duration(path: str) -> float:
@@ -510,17 +507,66 @@ def ffprobe_duration(path: str) -> float:
     return float(out.stdout.strip())
 
 
-def compute_segment_durations(sentences: list, total_duration: float) -> list:
-    """Split total narration duration across sentences by word-count share.
+def generate_voiceover_segments(sentences: list, workdir: str) -> tuple:
+    """Synthesize each sentence as its OWN edge-tts clip and splice them
+    together with a short silence gap, instead of one Communicate() call
+    over the whole script joined into a paragraph.
 
-    Used for BOTH the caption timing and the video-clip cut timing, so a
-    new clip appears on screen at exactly the moment the caption changes -
-    this is what makes cuts feel intentional and paced with the narration
-    instead of landing on an arbitrary fixed timer.
+    A single combined call produces one continuous, flat prosody contour
+    across the entire script - it reads as someone reading straight
+    through a paragraph rather than distinct punchy beats (user feedback:
+    "audio flow not matching story like its like someone constantly
+    reading"). Synthesizing per sentence resets intonation at each
+    boundary, and the inserted gap gives the ear a natural beat break.
+
+    This also means caption/cut timing can use the REAL measured duration
+    of each sentence's audio instead of a word-count estimate, which is
+    more accurate than the previous compute_segment_durations() approach.
+
+    Returns (combined_audio_path, segment_durations) where
+    segment_durations[i] is the real duration (seconds, including the
+    trailing gap) of sentences[i]'s audio.
     """
-    word_counts = [max(len(s.split()), 1) for s in sentences]
-    total_words = sum(word_counts)
-    return [total_duration * (wc / total_words) for wc in word_counts]
+    import asyncio
+
+    clip_paths = []
+    for i, sentence in enumerate(sentences):
+        clip_path = os.path.join(workdir, f"voice_{i}.mp3")
+        asyncio.run(_synthesize(sentence, clip_path))
+        clip_paths.append(clip_path)
+
+    gap_seconds = SENTENCE_GAP_MS / 1000
+    segment_durations = [ffprobe_duration(p) + gap_seconds for p in clip_paths]
+
+    silence_path = os.path.join(workdir, "silence.mp3")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+            "-t", f"{gap_seconds:.3f}", "-c:a", "libmp3lame", "-q:a", "4",
+            silence_path,
+        ],
+        check=True, capture_output=True,
+    )
+
+    concat_list = os.path.join(workdir, "voice_concat.txt")
+    with open(concat_list, "w") as f:
+        for i, p in enumerate(clip_paths):
+            f.write(f"file '{os.path.abspath(p)}'\n")
+            if i < len(clip_paths) - 1:
+                f.write(f"file '{os.path.abspath(silence_path)}'\n")
+
+    combined_path = os.path.join(workdir, "voiceover.mp3")
+    # Re-encode (not stream copy) since edge-tts output and the
+    # ffmpeg-generated silence clip may not share identical encoding
+    # parameters, which can glitch a stream-copy concat.
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
+            "-c:a", "libmp3lame", "-q:a", "4", combined_path,
+        ],
+        check=True, capture_output=True,
+    )
+    return combined_path, segment_durations
 
 
 def build_srt(sentences: list, segment_durations: list, dest_path: str) -> None:
@@ -551,10 +597,10 @@ def build_srt(sentences: list, segment_durations: list, dest_path: str) -> None:
 
 def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
                     srt_path: str, output_path: str) -> None:
-    # Each clip is trimmed to the duration of the sentence it illustrates
-    # (see compute_segment_durations), so cuts land exactly on sentence
-    # boundaries instead of an even, content-blind split. zip() naturally
-    # trims to the shorter list in the rare case a clip slot was unfilled.
+    # Each clip is trimmed to the real measured duration of the sentence it
+    # illustrates (see generate_voiceover_segments), so cuts land exactly on
+    # sentence boundaries instead of an even, content-blind split. zip()
+    # naturally trims to the shorter list if a clip slot was unfilled.
     workdir = os.path.dirname(output_path)
     normalized = []
     for i, (clip, dur) in enumerate(zip(clip_paths, segment_durations)):
@@ -692,8 +738,12 @@ def main() -> None:
             print("[pipeline] no clips found - aborting")
             return
 
-        audio_path = os.path.join(workdir, "voiceover.mp3")
-        generate_voiceover(script["sentences"], audio_path)
+        # Each sentence is synthesized as its own TTS clip (not one long
+        # combined paragraph) so the delivery has distinct beats instead of
+        # a flat, run-on read - see generate_voiceover_segments() docstring.
+        # segment_durations here are REAL measured per-sentence durations,
+        # not a word-count estimate, so captions/cuts land exactly on them.
+        audio_path, segment_durations = generate_voiceover_segments(script["sentences"], workdir)
         audio_duration = ffprobe_duration(audio_path)
 
         # Background music is best-effort: fetch + mix under the narration,
@@ -716,10 +766,6 @@ def main() -> None:
                     )
             except Exception as e:  # noqa: BLE001 - music mix must never abort the run
                 print(f"[pipeline] music mix failed, continuing without music: {e}")
-
-        # Computed once and shared by captions + clip cuts, so a new clip
-        # appears on screen at exactly the moment the caption changes.
-        segment_durations = compute_segment_durations(script["sentences"], audio_duration)
 
         srt_path = os.path.join(workdir, "captions.srt")
         build_srt(script["sentences"], segment_durations, srt_path)
