@@ -740,11 +740,11 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
     # far from where FontSize/MarginV intended (reported as captions
     # appearing in the middle of the screen instead of the lower third).
     # FontSize is sized relative to the real 1080x1920 output (13 was a
-    # leftover from an unscaled default and was nearly invisible/mispositioned).
+    # leftover from an unscaled default and was nearly invisible/mispositioned). MarginV raised 220->420 and MarginL/MarginR=60 added 2026-07-19: on a real phone, YouTube Shorts' own title/channel-name/view-count overlay covers roughly the bottom 300px, so captions at 220 sat underneath it (user-reported via screenshot).
     subtitle_style = (
         f"FontName=Arial,Bold=1,FontSize=68,PrimaryColour=&H00FFFFFF,"
         f"OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,"
-        f"Alignment=2,MarginV=220,PlayResX={VIDEO_WIDTH},PlayResY={VIDEO_HEIGHT}"
+        f"Alignment=2,MarginV=420,MarginL=60,MarginR=60,PlayResX={VIDEO_WIDTH},PlayResY={VIDEO_HEIGHT}"
     )
 
     # Small "Follow MindByte for more" cue burned in for the last ~1.8s of
