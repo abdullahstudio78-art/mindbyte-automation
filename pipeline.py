@@ -531,7 +531,7 @@ def main() -> None:
         quality["score"], compliance["notes"], 0, 0, 0, 0, "", "", "",
     ]
 
-    if quality["score"] < 6 or not compliance["passed"]:
+    if quality["score"] < 8 or not compliance["passed"]:
         sheet_row_base[3] = "Rejected"
         sheet_row_base[14] = "Skipped upload: failed quality/compliance gate"
         sheet_append(access_token, "Videos!A:O", sheet_row_base)
