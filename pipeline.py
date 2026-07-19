@@ -153,6 +153,8 @@ def call_gemini(prompt: str) -> str:
         },
         timeout=60,
     )
+    if resp.status_code != 200:
+        print(f"[pipeline] Gemini call failed: {resp.status_code} {resp.text}")
     resp.raise_for_status()
     data = resp.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
