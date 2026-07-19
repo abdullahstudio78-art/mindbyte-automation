@@ -228,13 +228,21 @@ def generate_script(topic: str, feedback: str = "") -> dict:
           general). This is critical: each keyword will be used to cut to
           a new clip exactly when that sentence is spoken, so it must be
           distinct from its neighbors and concretely tied to that line.
+        - Also produce "tags": an array of 10-15 SEARCH TERMS a real viewer
+          would type into YouTube to find this content (NOT stock-footage
+          descriptions) - a mix of broad terms ("psychology facts", "mind
+          tricks", "brain facts", "self improvement"), topic-specific terms
+          drawn from "{topic}", and the channel name "MindByte". These are
+          used as the video's YouTube tags for discoverability, separate
+          from visual_keywords.
 
         Return ONLY valid JSON with this exact shape:
         {{
           "title": "...",
           "description": "...",
           "sentences": ["...", "..."],
-          "visual_keywords": ["...", "..."]
+          "visual_keywords": ["...", "..."],
+          "tags": ["...", "..."]
         }}
     """).strip()
     raw = call_groq(prompt)
@@ -248,6 +256,11 @@ def generate_script(topic: str, feedback: str = "") -> dict:
     elif len(keywords) > len(sentences):
         keywords = keywords[: len(sentences)]
     data["visual_keywords"] = keywords
+    # Defensive: fall back to the visual keywords (still better than nothing)
+    # if the model omits "tags" entirely, so upload never crashes on a
+    # missing field.
+    if not data.get("tags"):
+        data["tags"] = keywords
     return data
 
 
@@ -291,26 +304,54 @@ def score_quality(topic: str, script: dict) -> dict:
     return json.loads(raw)
 
 
+MIN_SCRIPT_WORDS = 130  # keeps narration filling the 45-55s target instead of drifting to ~30s
+
+
 def generate_and_score_script(topic: str, max_attempts: int = MAX_SCRIPT_ATTEMPTS) -> tuple:
     """Generate + score a script, retrying with feedback if it falls short
-    of the quality bar, so a single pipeline run gets multiple shots at
-    clearing the gate instead of failing outright on one weak first draft.
-    Returns the (script, quality) pair with the highest score seen.
+    of the quality bar OR is too short to fill the target duration, so a
+    single pipeline run gets multiple shots at clearing both bars instead
+    of failing outright (or silently landing short) on one weak first draft.
+
+    Videos were consistently landing at 30-35s despite the prompt asking
+    for 45-55s (~130-160 words) - the quality score alone doesn't catch
+    this, since a short script can still score well on hook/pacing. This
+    adds an explicit word-count floor to the retry decision, on top of the
+    existing quality check, so a script that's high-scoring but too short
+    gets sent back for another attempt with specific feedback instead of
+    being accepted as-is.
+
+    Returns the (script, quality) pair that best satisfies both bars, or
+    the best-scoring one seen if no attempt clears both within the budget.
     """
-    best_script, best_quality = None, {"score": -1, "notes": ""}
+    best_script, best_quality, best_meets_bar = None, {"score": -1, "notes": ""}, False
     feedback = ""
     for attempt in range(1, max_attempts + 1):
         script = generate_script(topic, feedback=feedback)
         quality = score_quality(topic, script)
+        word_count = sum(len(s.split()) for s in script["sentences"])
+        meets_bar = quality["score"] >= QUALITY_THRESHOLD and word_count >= MIN_SCRIPT_WORDS
         print(
             f"[pipeline] attempt {attempt}/{max_attempts}: "
-            f"quality score {quality['score']} - {quality['notes']}"
+            f"quality score {quality['score']} - {quality['notes']} "
+            f"(word count: {word_count})"
         )
-        if quality["score"] > best_quality["score"]:
-            best_script, best_quality = script, quality
-        if quality["score"] >= QUALITY_THRESHOLD:
+        is_better = (meets_bar and not best_meets_bar) or (
+            meets_bar == best_meets_bar and quality["score"] > best_quality["score"]
+        )
+        if best_script is None or is_better:
+            best_script, best_quality, best_meets_bar = script, quality, meets_bar
+        if meets_bar:
             break
-        feedback = quality.get("notes", "")
+        if quality["score"] >= QUALITY_THRESHOLD:
+            feedback = (
+                f"the script scored well but was only {word_count} words - too "
+                f"short to fill 45-55 seconds. Write at least {MIN_SCRIPT_WORDS} "
+                f"words this time by adding 2-3 more surprising beats, while "
+                f"keeping the same punchy short-sentence style."
+            )
+        else:
+            feedback = quality.get("notes", "")
     return best_script, best_quality
 
 
@@ -679,10 +720,24 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
         f"OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,"
         f"Alignment=2,MarginV=220,PlayResX={VIDEO_WIDTH},PlayResY={VIDEO_HEIGHT}"
     )
+
+    # Small "Follow MindByte for more" cue burned in for the last ~1.8s of
+    # the video, positioned near the TOP of the frame (captions own the
+    # bottom) so it never collides with the last line's caption. This is a
+    # plain growth/branding cue, not part of the spoken narration, so it
+    # doesn't affect compliance_check()'s originality scan.
+    total_duration = sum(segment_durations)
+    follow_from = max(total_duration - 1.8, 0.0)
+    follow_overlay = (
+        "drawtext=text='Follow MindByte for more':fontcolor=white:fontsize=54:"
+        "font=Arial:box=1:boxcolor=black@0.45:boxborderw=14:"
+        f"x=(w-text_w)/2:y=180:enable='gte(t\\,{follow_from:.3f})'"
+    )
+
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", silent_video, "-i", audio_path,
-            "-vf", f"subtitles={srt_escaped}:force_style='{subtitle_style}'",
+            "-vf", f"subtitles={srt_escaped}:force_style='{subtitle_style}',{follow_overlay}",
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "libx264", "-preset", "medium", "-crf", "17",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
@@ -814,7 +869,7 @@ def main() -> None:
         publish_at = datetime.now(timezone.utc) + timedelta(hours=PUBLISH_DELAY_HOURS)
         video_id = upload_to_youtube(
             access_token, output_path, script["title"], description,
-            script["visual_keywords"], publish_at.isoformat(),
+            script["tags"], publish_at.isoformat(),
         )
         print(f"[pipeline] uploaded video id: {video_id}")
 
