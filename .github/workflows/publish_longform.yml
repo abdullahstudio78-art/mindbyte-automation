@@ -1,0 +1,40 @@
+name: Publish Long-Form Video
+
+on:
+  # Phase 4 (long-form, 8-15 min landscape videos) - manual trigger ONLY.
+  # This must NOT be added to a schedule: cron until a human has reviewed
+  # at least one full end-to-end test run of pipeline_longform.py, exactly
+  # how the Shorts pipeline (publish.yml) was validated across runs #22/#23
+  # before its daily schedule was turned on (2026-07-19).
+  workflow_dispatch: {}
+
+jobs:
+  publish-longform:
+    runs-on: ubuntu-latest
+    # Longer than the Shorts workflow's 30 minutes - a paragraph-chunked
+    # 8-15 minute video means more TTS calls, more Pexels downloads, and a
+    # much longer ffmpeg render/concat than a 30-60 second Short.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run long-form pipeline
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          YOUTUBE_CHANNEL_ID: ${{ secrets.YOUTUBE_CHANNEL_ID }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python pipeline_longform.py
