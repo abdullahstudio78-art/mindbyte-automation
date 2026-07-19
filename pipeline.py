@@ -685,7 +685,7 @@ MUSIC_QUERIES = [
     "ambient technology", "dark ambient minimal", "inspiring ambient",
 ]
 MIN_MUSIC_DURATION_MS = 30000  # skip very short stingers that can't cover a full clip
-MUSIC_VOLUME = 0.15  # ducked well under the narration
+MUSIC_VOLUME = 0.22  # bumped up from 0.15 (2026-07-19) - user found music too quiet
 
 
 def fetch_background_music(dest_path: str, pillar: str) -> dict | None:
