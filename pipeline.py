@@ -43,21 +43,29 @@ VIDEO_HEIGHT = 1920
 QUALITY_THRESHOLD = 8  # gate: script must score >= this to be produced/uploaded
 MAX_SCRIPT_ATTEMPTS = 3  # in-run retries with feedback before giving up
 
-# Rotation of sub-topics within the "bite-sized facts/trivia" niche.
+# Rotation of sub-topics within the "psychology & mind tricks" niche - facts
+# about how the brain, memory and behavior work, framed as things that
+# happen to the viewer personally (not clinical/diagnostic claims).
 TOPIC_POOL = [
-    "deep sea creatures", "ancient Rome", "space exploration", "the human brain",
-    "extinct animals", "world's smallest countries", "famous inventions by accident",
-    "the Great Wall of China", "volcanoes", "ancient Egypt", "the human body",
-    "weird laws around the world", "the Amazon rainforest", "black holes",
-    "the history of chocolate", "unusual animal abilities", "the Titanic",
-    "ancient Greek myths", "the Sahara desert", "record-breaking buildings",
-    "the history of money", "polar animals", "the moon landing", "coral reefs",
-    "medieval castles", "the history of writing", "extreme weather",
-    "famous shipwrecks", "the solar system's planets", "camouflage in nature",
-    "ancient wonders of the world", "the history of the internet",
-    "bioluminescent creatures", "desert survival adaptations", "lost cities",
-    "the history of flight", "unusual food origins", "glaciers and ice ages",
-    "the human senses", "migratory animals", "underground cities",
+    "why we procrastinate", "the placebo effect", "why deja vu happens",
+    "how memory tricks you", "the bystander effect", "why we fall for scams",
+    "the psychology of first impressions", "how habits form in your brain",
+    "the Dunning-Kruger effect", "why we love scary movies",
+    "the mere exposure effect", "how color affects your mood",
+    "the psychology of nostalgia", "the confirmation bias",
+    "how sleep affects your brain", "the psychology of lying",
+    "why crowds make us act differently", "the halo effect",
+    "how music affects your emotions", "the psychology of fear",
+    "why we trust strangers online", "the Zeigarnik effect and unfinished tasks",
+    "how your brain processes trauma", "the psychology of habits and addiction",
+    "the spotlight effect", "how your brain's reward system works",
+    "the psychology of persuasion", "why we remember embarrassing moments",
+    "the paradox of choice", "how stress changes your brain",
+    "the psychology of dreams", "why we compare ourselves to others",
+    "the illusion of control", "optical illusions and how your brain is tricked",
+    "the psychology of humor", "why first impressions stick",
+    "how loneliness affects your brain", "the psychology of motivation",
+    "why we're drawn to gossip", "how your brain reacts to rejection",
 ]
 
 SESSION = requests.Session()
@@ -176,22 +184,32 @@ def generate_script(topic: str, feedback: str = "") -> dict:
             weakness, while still following every requirement below.
         """)
     prompt = textwrap.dedent(f"""
-        You are writing a 45-55 second YouTube Shorts script for a "bite-sized
-        facts/trivia" channel called MindByte. The topic is: "{topic}".
+        You are writing a 45-55 second YouTube Shorts script for a
+        "psychology & mind tricks" channel called MindByte - content about
+        how the viewer's own brain, memory and behavior secretly work. The
+        topic is: "{topic}".
         {feedback_block}
         Tone: this must feel like a fast-paced, energetic viral Shorts video,
         NOT a lecture or documentary voiceover. Write like you're talking
-        excitedly to a friend, not narrating a textbook.
+        excitedly to a friend, not narrating a textbook. Make it feel
+        personal - "this is happening to YOU right now", not a detached
+        explanation of a study.
 
         Requirements:
         - The narration must be ORIGINAL: your own wording, framing and
           selection of facts. Do not copy phrasing from any single source.
+        - Do NOT give clinical, diagnostic, or medical advice - this is
+          general-interest psychology content, not therapy or a diagnosis.
         - Hook the viewer HARD in the first sentence (a surprising claim,
           a question, or a "wait, what?" moment) - not a slow wind-up.
-        - 6-8 short, punchy sentences, each under 12 words. Every sentence
+        - 10-14 short, punchy sentences, each under 14 words. Every sentence
           should be a single vivid, self-contained beat - short fragments
           and exclamations are encouraged. Avoid long, explanatory,
           multi-clause sentences; they read as a lecture, not a Short.
+        - The full narration read aloud should fill approximately 45-55
+          seconds (roughly 130-160 words total) - include enough distinct
+          beats/facts to fill that time. Do not pad with filler, but do not
+          cut the script so short it runs under 30 seconds either.
         - Keep the energy high all the way through, not just the opener -
           use rhetorical questions, quick reveals, or "but here's the
           crazy part" style pivots between facts.
@@ -235,8 +253,8 @@ def generate_script(topic: str, feedback: str = "") -> dict:
 
 def score_quality(topic: str, script: dict) -> dict:
     prompt = textwrap.dedent(f"""
-        Rate the following YouTube Shorts script for a facts/trivia channel
-        on a scale of 1-10.
+        Rate the following YouTube Shorts script for a psychology & mind
+        tricks channel on a scale of 1-10.
 
         Calibration - read this first: this is a fast, punchy, 45-55 second
         VERTICAL SHORT made of short fragments and exclamations BY DESIGN.
@@ -244,14 +262,17 @@ def score_quality(topic: str, script: dict) -> dict:
         explanatory detail - that IS the correct style for this format, not
         a flaw. A script that nails a strong hook and energetic pacing
         should score 8-10 even though each individual sentence is short.
-        Judge it as a Short, not as an essay.
+        Judge it as a Short, not as an essay. Also do not penalize it purely
+        for being longer than a typical fact-of-the-day clip - 45-55 seconds
+        of content is the intended target length, not a maximum to undercut.
 
         Score primarily on:
-        - Hook strength: does the first sentence grab attention immediately?
+        - Hook strength: does the first sentence grab attention immediately,
+          and make it feel personal ("this is about YOUR brain")?
         - Energy/pacing: does it feel fast and exciting, not flat or
           lecture-like?
         - Fact interest: would a general viewer find these facts genuinely
-          surprising (not the most obvious trivia about the topic)?
+          surprising (not the most obvious psychology 101 trivia)?
         - Originality of phrasing: no generic filler like "did you know"
           or "stay tuned to find out".
 
@@ -389,11 +410,82 @@ def gather_clips(keywords: list, workdir: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Background music (Openverse - free, no API key, commercially-licensed)
+# ---------------------------------------------------------------------------
+
+OPENVERSE_AUDIO_URL = "https://api.openverse.org/v1/audio/"
+MUSIC_QUERIES = [
+    "mysterious ambient", "cinematic tension calm", "curious ambient piano",
+    "ambient technology", "dark ambient minimal", "inspiring ambient",
+]
+MIN_MUSIC_DURATION_MS = 30000  # skip very short stingers that can't cover a full clip
+MUSIC_VOLUME = 0.15  # ducked well under the narration
+
+
+def fetch_background_music(dest_path: str) -> dict | None:
+    """Best-effort fetch of a free, commercially-licensed instrumental track
+    from Openverse (aggregates Jamendo, Free Music Archive, etc. - no API
+    key needed). This is a nice-to-have: any failure (network, no results,
+    license mismatch) is swallowed and logged so a music-fetch problem never
+    aborts video production - the video is still fine without a music bed.
+    """
+    query = random.choice(MUSIC_QUERIES)
+    try:
+        resp = SESSION.get(
+            OPENVERSE_AUDIO_URL,
+            params={"q": query, "license_type": "commercial", "page_size": 10},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            print(f"[pipeline] music search failed: {resp.status_code} {resp.text[:200]}")
+            return None
+        results = resp.json().get("results", [])
+        candidates = [
+            r for r in results
+            if r.get("url") and (r.get("duration") or 0) >= MIN_MUSIC_DURATION_MS
+        ]
+        if not candidates:
+            print(f"[pipeline] no suitable music candidates for query '{query}'")
+            return None
+        track = random.choice(candidates)
+        download_file(track["url"], dest_path)
+        return {
+            "title": track.get("title") or "Untitled",
+            "creator": track.get("creator") or "Unknown artist",
+            "license": (track.get("license") or "unknown").lower(),
+        }
+    except Exception as e:  # noqa: BLE001 - deliberately broad, see docstring
+        print(f"[pipeline] music fetch failed, continuing without music: {e}")
+        return None
+
+
+def mix_background_music(voice_path: str, music_path: str, duration: float,
+                          dest_path: str) -> None:
+    """Loop the music bed to cover the narration, duck its volume well
+    under the voice, and mix the two into a single audio track."""
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", music_path,
+            "-i", voice_path,
+            "-filter_complex",
+            f"[0:a]atrim=0:{duration:.3f},volume={MUSIC_VOLUME}[music];"
+            f"[1:a]volume=1.0[voice];"
+            f"[music][voice]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
+            "-map", "[aout]", "-t", f"{duration:.3f}",
+            "-c:a", "libmp3lame", "-q:a", "4",
+            dest_path,
+        ],
+        check=True, capture_output=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Voiceover (edge-tts) + captions
 # ---------------------------------------------------------------------------
 
 async def _synthesize(text: str, dest_path: str, voice: str = "en-US-AriaNeural",
-                       rate: str = "+15%", pitch: str = "+3Hz") -> None:
+                       rate: str = "+10%", pitch: str = "+3Hz") -> None:
     import edge_tts
     # A faster rate and a slightly raised pitch push the narration away
     # from a flat, lecture-like delivery toward the punchier, higher-energy
@@ -604,6 +696,27 @@ def main() -> None:
         generate_voiceover(script["sentences"], audio_path)
         audio_duration = ffprobe_duration(audio_path)
 
+        # Background music is best-effort: fetch + mix under the narration,
+        # but fall back to the plain voiceover on any failure rather than
+        # aborting the run over a missing music track.
+        final_audio_path = audio_path
+        description = script["description"]
+        music_path = os.path.join(workdir, "music.mp3")
+        music_meta = fetch_background_music(music_path)
+        if music_meta:
+            mixed_path = os.path.join(workdir, "voiceover_mixed.mp3")
+            try:
+                mix_background_music(audio_path, music_path, audio_duration, mixed_path)
+                final_audio_path = mixed_path
+                print(f"[pipeline] music: '{music_meta['title']}' by {music_meta['creator']} ({music_meta['license']})")
+                if music_meta["license"] != "cc0":
+                    description += (
+                        f"\n\nMusic: \"{music_meta['title']}\" by "
+                        f"{music_meta['creator']} ({music_meta['license'].upper()})"
+                    )
+            except Exception as e:  # noqa: BLE001 - music mix must never abort the run
+                print(f"[pipeline] music mix failed, continuing without music: {e}")
+
         # Computed once and shared by captions + clip cuts, so a new clip
         # appears on screen at exactly the moment the caption changes.
         segment_durations = compute_segment_durations(script["sentences"], audio_duration)
@@ -612,11 +725,11 @@ def main() -> None:
         build_srt(script["sentences"], segment_durations, srt_path)
 
         output_path = os.path.join(workdir, "final.mp4")
-        assemble_video(clip_paths, segment_durations, audio_path, srt_path, output_path)
+        assemble_video(clip_paths, segment_durations, final_audio_path, srt_path, output_path)
 
         publish_at = datetime.now(timezone.utc) + timedelta(hours=PUBLISH_DELAY_HOURS)
         video_id = upload_to_youtube(
-            access_token, output_path, script["title"], script["description"],
+            access_token, output_path, script["title"], description,
             script["visual_keywords"], publish_at.isoformat(),
         )
         print(f"[pipeline] uploaded video id: {video_id}")
