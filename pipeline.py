@@ -43,29 +43,102 @@ VIDEO_HEIGHT = 1920
 QUALITY_THRESHOLD = 8  # gate: script must score >= this to be produced/uploaded
 MAX_SCRIPT_ATTEMPTS = 3  # in-run retries with feedback before giving up
 
-# Rotation of sub-topics within the "psychology & mind tricks" niche - facts
-# about how the brain, memory and behavior work, framed as things that
-# happen to the viewer personally (not clinical/diagnostic claims).
+# Content pillars for MindByte's positioning as a psychology documentary /
+# human-behavior storytelling channel (not a generic facts/listicle
+# channel) - each pillar carries a short "tone" description used to steer
+# generate_script()'s voice per topic, plus its own topic list. TOPIC_POOL
+# below is derived from this as a flat (topic, pillar_name) list so the
+# rest of the pipeline (pick_topic, mark_topic_used, sheet logging) keeps
+# working against a simple flat pool.
+CONTENT_PILLARS = {
+    "Relationship Psychology": {
+        "tone": "warm, emotionally intimate, a little vulnerable",
+        "topics": [
+            "why people lose interest in relationships",
+            "why someone becomes emotionally distant",
+            "the psychology of attraction",
+            "attachment styles and how they form",
+            "why people chase those who are unavailable",
+            "the psychology behind breakups",
+            "how real emotional connection forms",
+            "communication mistakes that quietly ruin relationships",
+            "why you can't stop thinking about someone",
+            "the psychology of love and rejection",
+        ],
+    },
+    "Human Behavior Psychology": {
+        "tone": "sharp, revealing, a little provocative",
+        "topics": [
+            "why people lie even when it's pointless",
+            "why humans crave validation",
+            "why we unconsciously copy other people",
+            "how power quietly changes a person's behavior",
+            "why overthinking happens",
+            "why we procrastinate on things we actually care about",
+            "why humans fear change",
+            "why people act differently in groups",
+            "the hidden psychology behind everyday habits",
+            "why people make irrational decisions",
+        ],
+    },
+    "Social Psychology": {
+        "tone": "confident, observational, socially savvy",
+        "topics": [
+            "the psychology of first impressions",
+            "what body language really reveals",
+            "the psychology of confidence",
+            "what actually makes someone charismatic",
+            "how social status shapes behavior",
+            "the psychology of influence",
+            "the science of persuasion",
+            "why people follow trends without realizing",
+            "how humans judge others in seconds",
+            "the psychology of group behavior",
+        ],
+    },
+    "Brain & Neuroscience": {
+        "tone": "clear, confident, science-grounded but accessible",
+        "topics": [
+            "how dopamine actually drives motivation",
+            "how habits form in the brain",
+            "how emotions quietly distort memory",
+            "the psychology of the fear response",
+            "how the brain really makes decisions",
+            "common brain biases that trick you daily",
+            "why anxiety happens without real danger",
+            "why we remember embarrassing moments forever",
+            "how emotions secretly control decisions",
+        ],
+    },
+    "Emotional Intelligence": {
+        "tone": "calm, supportive, growth-oriented",
+        "topics": [
+            "understanding your own emotions",
+            "the psychology of self-control",
+            "what emotional maturity actually looks like",
+            "how to handle rejection in a healthy way",
+            "the psychology of building real confidence",
+            "how to read other people's emotions",
+            "emotional skills that quietly improve relationships",
+        ],
+    },
+    "Psychology Experiments & Stories": {
+        "tone": "documentary, narrative, slightly suspenseful",
+        "topics": [
+            "the Milgram obedience experiment",
+            "the Stanford prison experiment",
+            "the bystander effect experiment",
+            "famous social psychology experiments",
+            "real psychological case studies",
+            "what classic experiments reveal about human nature",
+        ],
+    },
+}
+
 TOPIC_POOL = [
-    "why we procrastinate", "the placebo effect", "why deja vu happens",
-    "how memory tricks you", "the bystander effect", "why we fall for scams",
-    "the psychology of first impressions", "how habits form in your brain",
-    "the Dunning-Kruger effect", "why we love scary movies",
-    "the mere exposure effect", "how color affects your mood",
-    "the psychology of nostalgia", "the confirmation bias",
-    "how sleep affects your brain", "the psychology of lying",
-    "why crowds make us act differently", "the halo effect",
-    "how music affects your emotions", "the psychology of fear",
-    "why we trust strangers online", "the Zeigarnik effect and unfinished tasks",
-    "how your brain processes trauma", "the psychology of habits and addiction",
-    "the spotlight effect", "how your brain's reward system works",
-    "the psychology of persuasion", "why we remember embarrassing moments",
-    "the paradox of choice", "how stress changes your brain",
-    "the psychology of dreams", "why we compare ourselves to others",
-    "the illusion of control", "optical illusions and how your brain is tricked",
-    "the psychology of humor", "why first impressions stick",
-    "how loneliness affects your brain", "the psychology of motivation",
-    "why we're drawn to gossip", "how your brain reacts to rejection",
+    (topic, pillar)
+    for pillar, data in CONTENT_PILLARS.items()
+    for topic in data["topics"]
 ]
 
 SESSION = requests.Session()
@@ -128,16 +201,17 @@ def sheet_append(access_token: str, a1_range: str, row: list) -> None:
 # Topic selection
 # ---------------------------------------------------------------------------
 
-def pick_topic(access_token: str) -> str:
+def pick_topic(access_token: str) -> tuple:
+    """Return a (topic, pillar_name) pair not yet used, or a random one if
+    every topic in the pool has been used at least once already."""
     rows = sheet_get(access_token, "UsedTopics!A2:A")
     used = {r[0].strip().lower() for r in rows if r}
-    available = [t for t in TOPIC_POOL if t.lower() not in used]
+    available = [(t, p) for t, p in TOPIC_POOL if t.lower() not in used]
     if available:
         return random.choice(available)
     # Every topic has been used at least once - recycle randomly rather than
     # stalling the channel forever.
     return random.choice(TOPIC_POOL)
-
 
 def mark_topic_used(access_token: str, topic: str, video_id: str) -> None:
     sheet_append(
@@ -146,10 +220,74 @@ def mark_topic_used(access_token: str, topic: str, video_id: str) -> None:
         [topic, datetime.now(timezone.utc).isoformat(), video_id],
     )
 
+IDEA_SCORE_AVG_THRESHOLD = 7.0  # average across the 5 idea-appeal axes
+IDEA_SCORE_MIN_AXIS = 5  # no single axis allowed to be a big weak spot
+MAX_IDEA_ATTEMPTS = 5  # how many topics to try before settling for the best seen
 
-# ---------------------------------------------------------------------------
-# Groq: script generation + quality scoring
-# ---------------------------------------------------------------------------
+def score_topic_idea(topic: str, pillar: str) -> dict:
+    """Score a topic IDEA (before any script is written) on the five appeal
+    axes from the content strategy - curiosity, emotional impact, global
+    appeal, evergreen value, share potential - so a technically-fine but
+    forgettable topic doesn't quietly turn into an average video. This is
+    separate from score_quality(), which grades the finished script."""
+    prompt = textwrap.dedent(f"""
+        Rate this YouTube Short topic idea for MindByte, a channel about why
+        humans think, feel and behave the way they do (psychology
+        documentary / storytelling tone, not a generic facts channel).
+
+        Topic: "{topic}" (pillar: {pillar})
+
+        Score each on a 1-10 scale:
+        - curiosity: would this genuinely make someone stop scrolling?
+        - emotional_impact: does this touch something people actually feel?
+        - global_appeal: does this land with a general global audience, not
+          a narrow or culturally-specific one?
+        - evergreen_value: will this still be relevant and interesting in
+          years, not just this week?
+        - share_potential: would someone send this to a friend and say
+          "this is so me" or "I never realized this"?
+
+        Return ONLY valid JSON: {{"curiosity": <1-10>, "emotional_impact":
+        <1-10>, "global_appeal": <1-10>, "evergreen_value": <1-10>,
+        "share_potential": <1-10>, "notes": "<one sentence justification>"}}
+    """).strip()
+    raw = call_groq(prompt)
+    return json.loads(raw)
+
+def pick_topic_with_idea_score(access_token: str, max_attempts: int = MAX_IDEA_ATTEMPTS) -> tuple:
+    """Pick a topic and vet the IDEA itself against the five appeal axes
+    before committing to writing a full script for it - retrying with a
+    different topic if the pick scores weak, and falling back to the
+    best-scoring one seen within the attempt budget rather than stalling
+    the channel."""
+    tried = set()
+    best = None
+    for attempt in range(1, max_attempts + 1):
+        topic, pillar = pick_topic(access_token)
+        if (topic, pillar) in tried and len(tried) < len(TOPIC_POOL):
+            continue
+        tried.add((topic, pillar))
+        scores = score_topic_idea(topic, pillar)
+        axis_keys = (
+            "curiosity", "emotional_impact", "global_appeal",
+            "evergreen_value", "share_potential",
+        )
+        axis_values = [scores.get(k, 0) for k in axis_keys]
+        avg = sum(axis_values) / len(axis_values)
+        passes = avg >= IDEA_SCORE_AVG_THRESHOLD and min(axis_values) >= IDEA_SCORE_MIN_AXIS
+        print(
+            f"[pipeline] idea attempt {attempt}/{max_attempts}: '{topic}' "
+            f"({pillar}) - avg {avg:.1f} - {scores.get('notes', '')}"
+        )
+        if best is None or avg > best[2]:
+            best = (topic, pillar, avg)
+        if passes:
+            return topic, pillar
+    print(
+        f"[pipeline] no idea cleared the {IDEA_SCORE_AVG_THRESHOLD} bar in "
+        f"{max_attempts} attempts - using best seen: '{best[0]}'"
+    )
+    return best[0], best[1]
 
 def call_groq(prompt: str) -> str:
     resp = SESSION.post(
@@ -173,7 +311,7 @@ def call_groq(prompt: str) -> str:
     return data["choices"][0]["message"]["content"]
 
 
-def generate_script(topic: str, feedback: str = "") -> dict:
+def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
     feedback_block = ""
     if feedback:
         feedback_block = textwrap.dedent(f"""
@@ -183,70 +321,91 @@ def generate_script(topic: str, feedback: str = "") -> dict:
             Write a genuinely different draft that specifically fixes that
             weakness, while still following every requirement below.
         """)
+    tone = CONTENT_PILLARS[pillar]["tone"]
     prompt = textwrap.dedent(f"""
-        You are writing a 45-55 second YouTube Shorts script for a
-        "psychology & mind tricks" channel called MindByte - content about
-        how the viewer's own brain, memory and behavior secretly work. The
-        topic is: "{topic}".
+        You are the writer for MindByte, a YouTube channel about why humans
+        think, feel and behave the way they do. The channel must feel like a
+        psychology documentary crossed with a storytelling channel - NOT a
+        generic facts channel, NOT a listicle, NOT a low-effort AI content
+        farm.
+
+        You are writing a 30-60 second YouTube Short. The topic is:
+        "{topic}", from the "{pillar}" pillar. Tone for this pillar: {tone}.
         {feedback_block}
-        Tone: this must feel like a fast-paced, energetic viral Shorts video,
-        NOT a lecture or documentary voiceover. Write like you're talking
-        excitedly to a friend, not narrating a textbook. Make it feel
-        personal - "this is happening to YOU right now", not a detached
-        explanation of a study.
+        STRUCTURE - tell one small story, do not dump facts:
+        1. HOOK (first 1-3 seconds) - grab attention instantly.
+        2. Introduce a relatable human problem or moment tied to the topic.
+        3. Create a curiosity gap - make the viewer need the explanation.
+        4. Explain the actual psychological reason WHY this happens.
+        5. Ground it with a concrete example or situation.
+        6. End on one memorable, quotable insight - not "thanks for
+           watching."
+
+        HOOK RULES - the first sentence decides whether anyone stays:
+        Never start with "Welcome back", "Today we will discuss", "Did you
+        know", or any greeting or announcement. Instead open with a
+        surprising statement, a psychological question, an emotional
+        trigger, or a curiosity gap - in your own words, not copied from
+        anywhere. In style only (write your own, do not reuse these):
+        "Your brain does something strange when someone ignores you...",
+        "There's a psychological reason you can't stop thinking about
+        someone...", "The reason confident people seem attractive isn't
+        what you think...".
 
         Requirements:
-        - The narration must be ORIGINAL: your own wording, framing and
-          selection of facts. Do not copy phrasing from any single source.
-        - Do NOT give clinical, diagnostic, or medical advice - this is
-          general-interest psychology content, not therapy or a diagnosis.
-        - Hook the viewer HARD in the first sentence (a surprising claim,
-          a question, or a "wait, what?" moment) - not a slow wind-up.
-        - Write 15-19 short, punchy sentences. Each sentence must be
-          BETWEEN 9 AND 14 WORDS - not shorter. Do not write tiny 3-6 word
-          fragments; every sentence should be one complete, vivid, punchy
-          beat of at least 9 words. Also avoid long, explanatory,
-          multi-clause sentences; they read as a lecture, not a Short.
-        - HARD REQUIREMENT: the full narration must total at least 140
-          words and no more than 190 words, so it fills 45-55 seconds when
-          read aloud at a fast pace. Before you finalize your answer, add
-          up the words across all your sentences - if the total is under
-          140 words, add more sentences or lengthen existing ones (without
-          padding with filler) until it clears 140 words. A script under
-          140 words is a FAILED response and must not be returned.
-        - Keep the energy high all the way through, not just the opener -
-          use rhetorical questions, quick reveals, or "but here's the
-          crazy part" style pivots between facts.
-        - Pick genuinely surprising, lesser-known facts about the topic -
-          avoid the most obvious/commonly-known trivia, since that's what
-          reads as "generic" to viewers who've seen a hundred facts videos.
-        - End with a punchy, memorable closing line (not a generic "thanks
-          for watching").
-        - Also produce: a clickable title (under 90 characters, no
-          clickbait lies), a YouTube description (2-3 sentences plus 3
-          relevant hashtags).
+        - ORIGINAL wording throughout - your own framing, not copied
+          phrasing from any single source.
+        - No clinical, diagnostic, or medical advice - general-interest
+          psychology, not therapy or a diagnosis.
+        - Every sentence should feel like it is talking directly to the
+          viewer about THEIR own mind, not narrating a study from a
+          distance.
+        - Write 15-19 short, punchy sentences, each between 9 and 14 words -
+          vivid and complete, not tiny fragments, and not long multi-clause
+          lecture sentences either. Map the storytelling beats above across
+          these sentences: roughly 1 hook sentence, 2-3 for the relatable
+          problem, 2-3 building curiosity, 5-7 explaining the psychology,
+          3-4 for examples, 1-2 for the closing insight.
+        - HARD REQUIREMENT: total narration between 140 and 190 words.
+          Count before finalizing - under 140 words is a failed response.
+        - Keep the energy high throughout - rhetorical questions, quick
+          reveals, or "but here's the part that changes everything" style
+          pivots are welcome, but the throughline must still read as ONE
+          coherent story about a psychological reason, not a list of
+          disconnected facts.
+        - Choose a genuinely surprising, lesser-known psychological angle -
+          avoid the most obvious "psychology 101" trivia, which reads as
+          generic and low-effort.
+        - End with a punchy, quotable closing line the viewer would want to
+          screenshot or say to a friend - not "thanks for watching" or
+          "follow for more."
+        - Also produce a clickable title (under 90 characters) that creates
+          curiosity without being clickbait-false. Avoid formats like "5
+          psychology facts" - prefer something like "Why Your Brain Makes
+          You Miss Someone Who Hurt You" or "The Hidden Psychology Behind
+          Human Attraction".
+        - Also produce a YouTube description (2-3 sentences plus 3 relevant
+          hashtags).
         - Also produce "visual_keywords": an array with EXACTLY the same
           number of entries as "sentences", in the same order - one 2-3
-          word stock-video search phrase per sentence, describing footage
-          that visually matches THAT specific sentence (not the topic in
-          general). This is critical: each keyword will be used to cut to
-          a new clip exactly when that sentence is spoken, so it must be
-          distinct from its neighbors and concretely tied to that line.
+          word stock-video search phrase per sentence, for REAL,
+          human-centric, emotionally matching footage (facial expressions,
+          real-life situations, people in relatable moments). Avoid
+          abstract or generic queries like "brain neurons" unless the
+          sentence is literally about brain anatomy.
         - Also produce "tags": an array of 10-15 SEARCH TERMS a real viewer
-          would type into YouTube to find this content (NOT stock-footage
-          descriptions) - a mix of broad terms ("psychology facts", "mind
-          tricks", "brain facts", "self improvement"), topic-specific terms
-          drawn from "{topic}", and the channel name "MindByte". These are
-          used as the video's YouTube tags for discoverability, separate
-          from visual_keywords.
+          would type into YouTube (NOT stock-footage descriptions) - a mix
+          of broad terms ("psychology facts", "human behavior", "why
+          people", "self improvement"), terms specific to "{topic}", and
+          the channel name "MindByte".
 
         Return ONLY valid JSON with this exact shape:
         {{
-          "title": "...",
-          "description": "...",
-          "sentences": ["...", "..."],
-          "visual_keywords": ["...", "..."],
-          "tags": ["...", "..."]
+        "title": "...",
+        "description": "...",
+        "sentences": ["...", "..."],
+        "visual_keywords": ["...", "..."],
+        "tags": ["...", "..."]
         }}
     """).strip()
     raw = call_groq(prompt)
@@ -267,37 +426,38 @@ def generate_script(topic: str, feedback: str = "") -> dict:
         data["tags"] = keywords
     return data
 
-
-def score_quality(topic: str, script: dict) -> dict:
+def score_quality(topic: str, pillar: str, script: dict) -> dict:
     prompt = textwrap.dedent(f"""
-        Rate the following YouTube Shorts script for a psychology & mind
-        tricks channel on a scale of 1-10.
+        Rate this YouTube Shorts script for MindByte, a psychology /
+        human-behavior channel positioned as a documentary/storytelling
+        channel - NOT a generic facts channel, listicle, or low-effort AI
+        content farm.
 
-        Calibration - read this first: this is a fast, punchy, 45-55 second
-        VERTICAL SHORT made of short fragments and exclamations BY DESIGN.
-        Do NOT penalize brevity, simplicity, or the absence of long
-        explanatory detail - that IS the correct style for this format, not
-        a flaw. A script that nails a strong hook and energetic pacing
-        should score 8-10 even though each individual sentence is short.
-        Judge it as a Short, not as an essay. Also do not penalize it purely
-        for being longer than a typical fact-of-the-day clip - 45-55 seconds
-        of content is the intended target length, not a maximum to undercut.
+        This is a fast, punchy 30-60 second VERTICAL SHORT told as ONE
+        small story with short, energetic sentences BY DESIGN - do not
+        penalize short sentences or a fast pace, that is the correct
+        format for this channel. DO penalize it if it reads as a
+        disconnected list of facts rather than one coherent story
+        explaining WHY the behavior happens.
 
         Score primarily on:
-        - Hook strength: does the first sentence grab attention immediately,
-          and make it feel personal ("this is about YOUR brain")?
-        - Energy/pacing: does it feel fast and exciting, not flat or
-          lecture-like?
-        - Fact interest: would a general viewer find these facts genuinely
-          surprising (not the most obvious psychology 101 trivia)?
-        - Originality of phrasing: no generic filler like "did you know"
-          or "stay tuned to find out".
+        - Hook strength: does the first sentence grab attention
+          immediately, without a generic opener?
+        - Storytelling: does it read as one coherent narrative (relatable
+          problem -> curiosity -> psychological explanation -> example ->
+          insight), not a fact dump?
+        - Emotional pull: would a viewer think "that explains me" or "I
+          never realized this"?
+        - Originality: no generic filler like "did you know" or "stay
+          tuned to find out", and the psychological angle is not the most
+          obvious 101-level trivia.
+        - Shareability: is the closing line memorable or quotable enough
+          that someone would send this to a friend?
 
-        Only score below 6 if the script is genuinely boring, factually
-        weak, or reads like a generic template - not merely because it is
-        short or simple.
+        Only score below 6 if the script is genuinely boring, generic, or
+        reads like a facts-channel list rather than a story.
 
-        Topic: {topic}
+        Topic: {topic} (pillar: {pillar})
         Title: {script['title']}
         Script: {" ".join(script['sentences'])}
 
@@ -307,11 +467,10 @@ def score_quality(topic: str, script: dict) -> dict:
     raw = call_groq(prompt)
     return json.loads(raw)
 
-
 MIN_SCRIPT_WORDS = 130  # keeps narration filling the 45-55s target instead of drifting to ~30s
 
 
-def generate_and_score_script(topic: str, max_attempts: int = MAX_SCRIPT_ATTEMPTS) -> tuple:
+def generate_and_score_script(topic: str, pillar: str, max_attempts: int = MAX_SCRIPT_ATTEMPTS) -> tuple:
     """Generate + score a script, retrying with feedback if it falls short
     of the quality bar OR is too short to fill the target duration, so a
     single pipeline run gets multiple shots at clearing both bars instead
@@ -336,8 +495,8 @@ def generate_and_score_script(topic: str, max_attempts: int = MAX_SCRIPT_ATTEMPT
     )
     feedback = ""
     for attempt in range(1, max_attempts + 1):
-        script = generate_script(topic, feedback=feedback)
-        quality = score_quality(topic, script)
+        script = generate_script(topic, pillar, feedback=feedback)
+        quality = score_quality(topic, pillar, script)
         word_count = sum(len(s.split()) for s in script["sentences"])
         meets_bar = quality["score"] >= QUALITY_THRESHOLD and word_count >= MIN_SCRIPT_WORDS
         print(
@@ -345,12 +504,6 @@ def generate_and_score_script(topic: str, max_attempts: int = MAX_SCRIPT_ATTEMPT
             f"quality score {quality['score']} - {quality['notes']} "
             f"(word count: {word_count})"
         )
-        # Tie-break order: (1) meeting both bars beats not meeting them,
-        # (2) higher quality score wins, (3) if score is also tied, prefer
-        # whichever draft has MORE words - closer to the duration target -
-        # instead of arbitrarily keeping attempt 1. Without this third
-        # tiebreaker, three equally-scored-but-all-too-short attempts would
-        # keep the very first (often shortest) one.
         is_better = (
             (meets_bar and not best_meets_bar)
             or (meets_bar == best_meets_bar and quality["score"] > best_quality["score"])
@@ -380,7 +533,6 @@ def generate_and_score_script(topic: str, max_attempts: int = MAX_SCRIPT_ATTEMPT
             feedback = quality.get("notes", "")
     return best_script, best_quality
 
-
 def compliance_check(script: dict) -> dict:
     """Lightweight originality/licensing check.
 
@@ -394,6 +546,7 @@ def compliance_check(script: dict) -> dict:
     generic_phrases = [
         "did you know that", "in this video we will", "welcome back to my channel",
         "smash that like button", "don't forget to subscribe",
+        "today we will discuss", "in today's video", "stay tuned to find out",
     ]
     lowered = " ".join(script["sentences"]).lower()
     flags = [p for p in generic_phrases if p in lowered]
@@ -825,10 +978,10 @@ def upload_to_youtube(access_token: str, video_path: str, title: str, descriptio
 
 def main() -> None:
     access_token = get_access_token()
-    topic = pick_topic(access_token)
-    print(f"[pipeline] topic: {topic}")
+    topic, pillar = pick_topic_with_idea_score(access_token)
+    print(f"[pipeline] topic: {topic} (pillar: {pillar})")
 
-    script, quality = generate_and_score_script(topic)
+    script, quality = generate_and_score_script(topic, pillar)
     print(f"[pipeline] title: {script['title']}")
     print(f"[pipeline] final quality score: {quality['score']} - {quality['notes']}")
 
