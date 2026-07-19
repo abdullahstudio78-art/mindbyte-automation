@@ -325,12 +325,12 @@ def pick_topic_with_idea_score(access_token: str, max_attempts: int = MAX_IDEA_A
         if best is None or avg > best[2]:
             best = (topic, pillar, avg)
         if passes:
-            return topic, pillar
+            return topic, pillar, avg
     print(
         f"[pipeline] no idea cleared the {IDEA_SCORE_AVG_THRESHOLD} bar in "
         f"{max_attempts} attempts - using best seen: '{best[0]}'"
     )
-    return best[0], best[1]
+    return best[0], best[1], best[2]
 
 def call_groq(prompt: str) -> str:
     resp = SESSION.post(
@@ -1099,13 +1099,116 @@ def upload_to_youtube(access_token: str, video_path: str, title: str, descriptio
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: automated pre-publish quality checklist
+# ---------------------------------------------------------------------------
+
+FORBIDDEN_HOOK_OPENERS = [
+    "welcome back", "today we will discuss", "did you know",
+    "in this video", "hey guys", "hey everyone", "what's up guys",
+]
+MIN_VIDEO_DURATION_SEC = 40
+MAX_VIDEO_DURATION_SEC = 80
+REQUIRED_WIDTH = 1080
+REQUIRED_HEIGHT = 1920
+QUALITY_SHEET_TAB = "QualityChecklist!A:N"
+
+
+def ffprobe_video_info(path: str) -> dict:
+    """Technical sanity-check on the final assembled video: resolution,
+    duration, and whether an audio stream actually made it into the file.
+    This catches assembly-level breakage (e.g. a silent render, or a frame
+    size regression) that script/idea scoring alone can't see."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json",
+         "-show_format", "-show_streams", path],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(out.stdout)
+    duration = float(data.get("format", {}).get("duration", 0))
+    width = height = 0
+    has_audio = False
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video" and not width:
+            width = stream.get("width", 0)
+            height = stream.get("height", 0)
+        if stream.get("codec_type") == "audio":
+            has_audio = True
+    return {"duration": duration, "width": width, "height": height, "has_audio": has_audio}
+
+
+def run_prepublish_checklist(
+    topic: str, pillar: str, script: dict, quality: dict, compliance: dict,
+    idea_score_avg: float, video_path: str,
+) -> dict:
+    """Final automated gate mirroring the content-strategy doc's 'Quality
+    Control Before Publishing' checklist. Combines signals already computed
+    earlier in the run (idea score, script quality, compliance) with fresh
+    technical checks on the actual assembled video file, so a broken render
+    can't slip through even if the script itself scored well."""
+    checks = {}
+
+    hook = script["sentences"][0].strip().lower() if script.get("sentences") else ""
+    checks["hook_ok"] = not any(hook.startswith(p) for p in FORBIDDEN_HOOK_OPENERS)
+    checks["idea_score_ok"] = idea_score_avg >= IDEA_SCORE_AVG_THRESHOLD
+    checks["script_quality_ok"] = quality["score"] >= QUALITY_THRESHOLD
+    checks["compliance_ok"] = compliance["passed"]
+    checks["tags_ok"] = 5 <= len(script.get("tags", [])) <= 20
+
+    try:
+        info = ffprobe_video_info(video_path)
+    except Exception as e:  # noqa: BLE001 - never crash the checklist itself
+        info = {"duration": 0, "width": 0, "height": 0, "has_audio": False}
+        print(f"[pipeline] checklist: ffprobe failed, treating as fail: {e}")
+
+    checks["duration_ok"] = MIN_VIDEO_DURATION_SEC <= info["duration"] <= MAX_VIDEO_DURATION_SEC
+    checks["resolution_ok"] = info["width"] == REQUIRED_WIDTH and info["height"] == REQUIRED_HEIGHT
+    checks["audio_ok"] = info["has_audio"]
+
+    failed = [name for name, ok in checks.items() if not ok]
+    return {
+        "checks": checks,
+        "failed": failed,
+        "overall_pass": len(failed) == 0,
+        "duration": info["duration"],
+        "width": info["width"],
+        "height": info["height"],
+    }
+
+
+def log_quality_checklist(
+    access_token: str, topic: str, pillar: str, result: dict, video_id: str = "",
+) -> None:
+    """Writes one row per video to the 'QualityChecklist' Sheet tab so
+    pre-publish check results are visible at a glance instead of being a
+    silent pass/fail buried in the Actions run log."""
+    checks = result["checks"]
+    row = [
+        datetime.now(timezone.utc).isoformat(),
+        video_id,
+        topic,
+        pillar,
+        "PASS" if result["overall_pass"] else "FAIL",
+        "Y" if checks.get("hook_ok") else "N",
+        "Y" if checks.get("idea_score_ok") else "N",
+        "Y" if checks.get("script_quality_ok") else "N",
+        "Y" if checks.get("compliance_ok") else "N",
+        "Y" if checks.get("duration_ok") else "N",
+        "Y" if checks.get("resolution_ok") else "N",
+        "Y" if checks.get("audio_ok") else "N",
+        "Y" if checks.get("tags_ok") else "N",
+        ", ".join(result["failed"]) if result["failed"] else "",
+    ]
+    sheet_append(access_token, QUALITY_SHEET_TAB, row)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     access_token = get_access_token()
-    topic, pillar = pick_topic_with_idea_score(access_token)
-    print(f"[pipeline] topic: {topic} (pillar: {pillar})")
+    topic, pillar, idea_score_avg = pick_topic_with_idea_score(access_token)
+    print(f"[pipeline] topic: {topic} (pillar: {pillar}) - idea score avg {idea_score_avg:.1f}")
 
     script, quality = generate_and_score_script(topic, pillar)
     print(f"[pipeline] title: {script['title']}")
@@ -1171,6 +1274,18 @@ def main() -> None:
         output_path = os.path.join(workdir, "final.mp4")
         assemble_video(clip_paths, segment_durations, final_audio_path, ass_path, output_path)
 
+        checklist = run_prepublish_checklist(
+            topic, pillar, script, quality, compliance, idea_score_avg, output_path,
+        )
+        print(f"[pipeline] pre-publish checklist: {checklist['checks']}")
+        if not checklist["overall_pass"]:
+            sheet_row_base[3] = "Failed"
+            sheet_row_base[14] = f"Failed pre-publish checklist: {', '.join(checklist['failed'])}"
+            sheet_append(access_token, "Videos!A:O", sheet_row_base)
+            log_quality_checklist(access_token, topic, pillar, checklist)
+            print(f"[pipeline] rejected by pre-publish checklist: {checklist['failed']}")
+            return
+
         publish_at = datetime.now(timezone.utc) + timedelta(hours=PUBLISH_DELAY_HOURS)
         video_id = upload_to_youtube(
             access_token, output_path, script["title"], description,
@@ -1183,6 +1298,7 @@ def main() -> None:
     sheet_row_base[5] = publish_at.isoformat()
     sheet_row_base[13] = f"https://youtu.be/{video_id}"
     sheet_append(access_token, "Videos!A:O", sheet_row_base)
+    log_quality_checklist(access_token, topic, pillar, checklist, video_id)
     mark_topic_used(access_token, topic, video_id)
     print("[pipeline] done")
 
