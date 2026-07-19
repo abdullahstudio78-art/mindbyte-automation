@@ -1,10 +1,10 @@
 """
 MindByte Automation - main content pipeline.
 
-Runs end-to-end: pick a topic, generate a script with Gemini, source B-roll
-from Pexels, synthesize a voiceover, assemble the video with ffmpeg, score
-quality, run a compliance check, upload/schedule to YouTube, and log
-everything to the Google Sheet dashboard.
+Runs end-to-end: pick a topic, generate a script with Groq (Llama 3.3 70B),
+source B-roll from Pexels, synthesize a voiceover, assemble the video with
+ffmpeg, score quality, run a compliance check, upload/schedule to YouTube,
+and log everything to the Google Sheet dashboard.
 
 All secrets are read from environment variables (populated from GitHub
 Actions Secrets in CI).
@@ -26,18 +26,15 @@ import requests
 # Config
 # ---------------------------------------------------------------------------
 
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 PEXELS_API_KEY = os.environ["PEXELS_API_KEY"]
 OAUTH_CLIENT_ID = os.environ["OAUTH_CLIENT_ID"]
 OAUTH_CLIENT_SECRET = os.environ["OAUTH_CLIENT_SECRET"]
 OAUTH_REFRESH_TOKEN = os.environ["OAUTH_REFRESH_TOKEN"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-)
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 PUBLISH_DELAY_HOURS = 18  # rolling safety delay before a video goes public
 TARGET_CLIP_COUNT = 5
@@ -141,23 +138,29 @@ def mark_topic_used(access_token: str, topic: str, video_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gemini: script generation + quality scoring
+# Groq: script generation + quality scoring
 # ---------------------------------------------------------------------------
 
-def call_gemini(prompt: str) -> str:
+def call_groq(prompt: str) -> str:
     resp = SESSION.post(
-        GEMINI_URL,
+        GROQ_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
         json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.9, "responseMimeType": "application/json"},
+            "model": GROQ_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.9,
+            "response_format": {"type": "json_object"},
         },
         timeout=60,
     )
     if resp.status_code != 200:
-        print(f"[pipeline] Gemini call failed: {resp.status_code} {resp.text}")
+        print(f"[pipeline] Groq call failed: {resp.status_code} {resp.text}")
     resp.raise_for_status()
     data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    return data["choices"][0]["message"]["content"]
 
 
 def generate_script(topic: str) -> dict:
@@ -186,7 +189,7 @@ def generate_script(topic: str) -> dict:
           "visual_keywords": ["...", "..."]
         }}
     """).strip()
-    raw = call_gemini(prompt)
+    raw = call_groq(prompt)
     return json.loads(raw)
 
 
@@ -206,7 +209,7 @@ def score_quality(topic: str, script: dict) -> dict:
         Return ONLY valid JSON: {{"score": <integer 1-10>, "notes": "<one
         sentence justification>"}}
     """).strip()
-    raw = call_gemini(prompt)
+    raw = call_groq(prompt)
     return json.loads(raw)
 
 
