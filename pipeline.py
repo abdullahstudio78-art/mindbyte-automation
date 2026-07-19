@@ -22,6 +22,8 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
+import math
+from PIL import Image, ImageDraw, ImageFont
 
 # ---------------------------------------------------------------------------
 # Config
@@ -332,26 +334,44 @@ def pick_topic_with_idea_score(access_token: str, max_attempts: int = MAX_IDEA_A
     )
     return best[0], best[1], best[2]
 
-def call_groq(prompt: str) -> str:
-    resp = SESSION.post(
-        GROQ_URL,
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": GROQ_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.9,
-            "response_format": {"type": "json_object"},
-        },
-        timeout=60,
-    )
-    if resp.status_code != 200:
-        print(f"[pipeline] Groq call failed: {resp.status_code} {resp.text}")
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+def call_groq(prompt: str, _retries: int = 2) -> str:
+    """Same Groq call as before, now with retry-with-backoff on a 429
+    (added 2026-07-19 after long-form run #2: the free/on-demand tier's
+    tokens-per-minute ceiling got hit late in a long-form run's call
+    sequence, breaking the expansion top-up fallback right when it was
+    needed most). Groq's 429 response reports how long to wait ("Please
+    try again in Xs") - honor that (plus a small safety margin) instead
+    of giving up immediately. Any other error status still raises
+    right away, unchanged from before."""
+    for attempt in range(_retries + 1):
+        resp = SESSION.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.9,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=60,
+        )
+        if resp.status_code == 429 and attempt < _retries:
+            wait_s = 5.0
+            match = re.search(r"try again in ([\d.]+)s", resp.text)
+            if match:
+                wait_s = float(match.group(1)) + 1.0
+            print(f"[pipeline] Groq rate-limited (429) - waiting {wait_s:.1f}s and retrying "
+                  f"(attempt {attempt + 1}/{_retries})")
+            time.sleep(wait_s)
+            continue
+        if resp.status_code != 200:
+            print(f"[pipeline] Groq call failed: {resp.status_code} {resp.text}")
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
 
 
 def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
@@ -687,6 +707,142 @@ MUSIC_QUERIES = [
 MIN_MUSIC_DURATION_MS = 30000  # skip very short stingers that can't cover a full clip
 MUSIC_VOLUME = 0.22  # bumped up from 0.15 (2026-07-19) - user found music too quiet
 
+# ---------------------------------------------------------------------------
+# Visual branding (content-strategy branding pass, 2026-07-19) - a
+# consistent MindByte identity burned into every video: a branded title
+# card covering the first TITLE_CARD_SECONDS (replacing a cold open
+# straight onto generic stock footage), a small persistent corner
+# watermark for the whole video, and a subtle documentary-style color
+# grade applied to every clip. The original uploaded channel-art PNGs
+# (profile picture/banner) aren't files in this environment, so the logo
+# mark is recreated procedurally here from the same "dots and lines"
+# neuron-network motif, matching the deep indigo-to-violet brand
+# gradient already live on the channel.
+# ---------------------------------------------------------------------------
+BRAND_BG_TOP = (26, 18, 66)       # deep indigo
+BRAND_BG_BOTTOM = (91, 46, 143)   # violet
+BRAND_TEXT_COLOR = (255, 255, 255)
+BRAND_NAME = "MindByte"
+TITLE_CARD_SECONDS = 1.4
+WATERMARK_SIZE = 90
+
+# Per-pillar accent color for the title card's divider bar - kept as a
+# separate dict (rather than added into CONTENT_PILLARS) so the
+# existing, already-validated pillar structure doesn't need to change.
+PILLAR_ACCENT_COLORS = {
+    "Relationship Psychology": (224, 122, 149),
+    "Human Behavior Psychology": (122, 178, 224),
+    "Social Psychology": (240, 180, 90),
+    "Brain & Neuroscience": (110, 200, 200),
+    "Emotional Intelligence": (150, 200, 140),
+    "Psychology Experiments & Stories": (170, 130, 220),
+}
+
+def _brand_font(size: int):
+    """Loads a bold sans font for branding text, trying a couple of
+    common paths (both standard on GitHub Actions' ubuntu-latest
+    runners) before falling back to Pillow's basic default font so a
+    missing font file can never crash a run."""
+    for path in (
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ):
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+def _draw_logo_mark(draw, cx: float, cy: float, radius: float,
+                     color=(255, 255, 255)) -> None:
+    """Draws MindByte's small neuron-network mark - a center dot with
+    five connected satellite dots - procedurally, since the actual
+    uploaded logo PNG isn't a file in this environment. Reused for both
+    the title card and the small corner watermark."""
+    draw.ellipse(
+        [cx - radius * 0.28, cy - radius * 0.28, cx + radius * 0.28, cy + radius * 0.28],
+        fill=color,
+    )
+    for i in range(5):
+        angle = math.pi * 2 * i / 5 - math.pi / 2
+        sx, sy = cx + math.cos(angle) * radius, cy + math.sin(angle) * radius
+        draw.line([cx, cy, sx, sy], fill=color, width=max(2, int(radius * 0.05)))
+        dot_r = radius * 0.12
+        draw.ellipse([sx - dot_r, sy - dot_r, sx + dot_r, sy + dot_r], fill=color)
+
+def build_watermark_png(dest_path: str) -> None:
+    """Small persistent corner brand mark, generated once per run and
+    burned into every video for its full duration via an ffmpeg overlay
+    in assemble_video(). Kept small and placed top-left, clear of both
+    the caption zone (MarginV=420 from the bottom) and the Shorts UI's
+    own bottom title block + right-edge icon column."""
+    img = Image.new("RGBA", (WATERMARK_SIZE, WATERMARK_SIZE), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse(
+        [2, 2, WATERMARK_SIZE - 2, WATERMARK_SIZE - 2],
+        fill=(*BRAND_BG_TOP, 140),
+    )
+    _draw_logo_mark(draw, WATERMARK_SIZE / 2, WATERMARK_SIZE / 2, WATERMARK_SIZE * 0.32,
+                     color=(255, 255, 255, 230))
+    img.save(dest_path)
+
+def build_title_card(dest_path: str, title: str, pillar: str) -> None:
+    """Generates the branded intro frame shown for TITLE_CARD_SECONDS at
+    the start of every video (content-strategy branding pass,
+    2026-07-19), replacing a cold open straight onto generic stock
+    B-roll with a consistent, premium documentary-style title card: a
+    vertical brand-color gradient, the MindByte mark + wordmark, a thin
+    pillar-accent divider, and the episode's own title. Verified locally
+    with a synthetic render before this went live - see the branding
+    pass notes in the project doc."""
+    width, height = VIDEO_WIDTH, VIDEO_HEIGHT
+    img = Image.new("RGB", (width, height), BRAND_BG_TOP)
+    draw = ImageDraw.Draw(img)
+    for y in range(height):
+        t = y / height
+        r = int(BRAND_BG_TOP[0] + (BRAND_BG_BOTTOM[0] - BRAND_BG_TOP[0]) * t)
+        g = int(BRAND_BG_TOP[1] + (BRAND_BG_BOTTOM[1] - BRAND_BG_TOP[1]) * t)
+        b = int(BRAND_BG_TOP[2] + (BRAND_BG_BOTTOM[2] - BRAND_BG_TOP[2]) * t)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+    accent = PILLAR_ACCENT_COLORS.get(pillar, (255, 255, 255))
+    logo_cy = int(height * 0.30)
+    _draw_logo_mark(draw, width / 2, logo_cy, width * 0.07, color=(255, 255, 255))
+
+    wordmark_font = _brand_font(int(width * 0.075))
+    wm_bbox = draw.textbbox((0, 0), BRAND_NAME, font=wordmark_font)
+    wm_w = wm_bbox[2] - wm_bbox[0]
+    draw.text((width / 2 - wm_w / 2, logo_cy + width * 0.11), BRAND_NAME,
+              font=wordmark_font, fill=BRAND_TEXT_COLOR)
+
+    bar_y = int(height * 0.52)
+    bar_w = int(width * 0.22)
+    draw.rectangle([width / 2 - bar_w / 2, bar_y, width / 2 + bar_w / 2, bar_y + 6], fill=accent)
+
+    title_font = _brand_font(int(width * 0.062))
+    words = title.split()
+    lines, cur = [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if draw.textbbox((0, 0), trial, font=title_font)[2] > width * 0.82 and cur:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    lines = lines[:3]
+    line_h = int(width * 0.085)
+    ty = bar_y + 40
+    for line in lines:
+        lb = draw.textbbox((0, 0), line, font=title_font)
+        lw = lb[2] - lb[0]
+        draw.text((width / 2 - lw / 2, ty), line, font=title_font, fill=(255, 255, 255))
+        ty += line_h
+
+    img.save(dest_path)
+
 
 def fetch_background_music(dest_path: str, pillar: str) -> dict | None:
     """Best-effort fetch of a free, commercially-licensed instrumental track
@@ -747,6 +903,34 @@ def mix_background_music(voice_path: str, music_path: str, duration: float,
             f"[music][voice]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
             "-map", "[aout]", "-t", f"{duration:.3f}",
             "-c:a", "libmp3lame", "-q:a", "4",
+            dest_path,
+        ],
+        check=True, capture_output=True,
+    )
+
+def master_audio(src_path: str, dest_path: str, duration: float) -> None:
+    """Light mastering pass applied to the FINAL narration track (with
+    or without background music already mixed in) right before it's
+    muxed into the video - added 2026-07-19 after the user noticed
+    MindByte's audio sounded noticeably rougher than other channels'. A
+    highpass removes low-end rumble edge-tts sometimes leaves in, a
+    gentle compressor evens out loudness swings between louder/quieter
+    sentences, and a loudnorm pass brings the whole track to a
+    consistent, broadcast-standard loudness (YouTube's own -14 LUFS
+    target) instead of whatever level edge-tts/the mix happened to
+    produce - for a free-TTS pipeline, this one step tends to be the
+    single biggest lever toward sounding "produced" rather than raw.
+    Wrapped in try/except by the caller so a mastering failure can never
+    block a run - the unmastered track is still perfectly usable.
+    """
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", src_path, "-t", f"{duration:.3f}",
+            "-af",
+            "highpass=f=80,"
+            "acompressor=threshold=-18dB:ratio=2:attack=5:release=50,"
+            "loudnorm=I=-14:TP=-1.5:LRA=11",
+            "-c:a", "libmp3lame", "-q:a", "2",
             dest_path,
         ],
         check=True, capture_output=True,
@@ -988,7 +1172,8 @@ def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
         f.write("\n".join(lines) + "\n")
 
 def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
-                    ass_path: str, output_path: str) -> None:
+                    ass_path: str, output_path: str,
+                    title_card_path: str = None, watermark_path: str = None) -> None:
     # Each clip is trimmed to the real measured duration of the sentence it
     # illustrates (see generate_voiceover_segments), so cuts land exactly on
     # sentence boundaries instead of an even, content-blind split. zip()
@@ -1002,7 +1187,8 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
                 "ffmpeg", "-y", "-i", clip, "-t", f"{dur:.3f}",
                 "-vf",
                 f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
-                f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},fps=30,setsar=1",
+                f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},fps=30,setsar=1,"
+                f"eq=contrast=1.06:saturation=0.9:brightness=0.01",
                 "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                 "-pix_fmt", "yuv420p",
                 norm_path,
@@ -1044,11 +1230,40 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
         f"x=(w-text_w)/2:y=180:enable='gte(t\\,{follow_from:.3f})'"
     )
 
+    # Title card + watermark are added as extra overlay inputs on top of
+    # the existing subtitles/follow-cue chain (content-strategy branding
+    # pass, 2026-07-19). The title card clip is time-limited to
+    # TITLE_CARD_SECONDS with eof_action=pass, so once it ends the
+    # overlay simply stops covering the frame - no need to shift the
+    # audio/caption timeline at all. The watermark has no time limit and
+    # is bounded only by -shortest, so it persists for the whole video.
+    # Verified locally with a synthetic render (solid-color test clips +
+    # a sine-tone track) before this went live.
+    filter_stages = [f"[0:v]subtitles={ass_escaped},{follow_overlay}[capped]"]
+    extra_input_args = []
+    next_input_index = 2  # 0=silent_video, 1=audio_path
+    last_label = "capped"
+    if title_card_path:
+        extra_input_args += ["-loop", "1", "-t", f"{TITLE_CARD_SECONDS:.2f}", "-i", title_card_path]
+        filter_stages.append(
+            f"[{last_label}][{next_input_index}:v]overlay=0:0:eof_action=pass[titled]"
+        )
+        last_label = "titled"
+        next_input_index += 1
+    if watermark_path:
+        extra_input_args += ["-loop", "1", "-i", watermark_path]
+        filter_stages.append(
+            f"[{last_label}][{next_input_index}:v]overlay=40:40[branded]"
+        )
+        last_label = "branded"
+        next_input_index += 1
+    filter_complex = ";".join(filter_stages)
+
     subprocess.run(
         [
-            "ffmpeg", "-y", "-i", silent_video, "-i", audio_path,
-            "-vf", f"subtitles={ass_escaped},{follow_overlay}",
-            "-map", "0:v:0", "-map", "1:a:0",
+            "ffmpeg", "-y", "-i", silent_video, "-i", audio_path, *extra_input_args,
+            "-filter_complex", filter_complex,
+            "-map", f"[{last_label}]", "-map", "1:a:0",
             "-c:v", "libx264", "-preset", "medium", "-crf", "17",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             "-c:a", "aac", "-b:a", "192k", "-shortest",
@@ -1274,11 +1489,30 @@ def main() -> None:
             except Exception as e:  # noqa: BLE001 - music mix must never abort the run
                 print(f"[pipeline] music mix failed, continuing without music: {e}")
 
+        mastered_audio_path = os.path.join(workdir, "voiceover_mastered.mp3")
+        try:
+            master_audio(final_audio_path, mastered_audio_path, audio_duration)
+            final_audio_path = mastered_audio_path
+            print("[pipeline] audio mastering (loudness normalize + light compression) applied")
+        except Exception as e:  # noqa: BLE001 - mastering must never abort the run
+            print(f"[pipeline] audio mastering failed, continuing with unmastered audio: {e}")
+
+        title_card_path = os.path.join(workdir, "title_card.png")
+        watermark_path = os.path.join(workdir, "watermark.png")
+        try:
+            build_title_card(title_card_path, script["title"], pillar)
+            build_watermark_png(watermark_path)
+        except Exception as e:  # noqa: BLE001 - branding must never abort the run
+            print(f"[pipeline] branding assets failed, continuing without them: {e}")
+            title_card_path = None
+            watermark_path = None
+
         ass_path = os.path.join(workdir, "captions.ass")
         build_ass(script["sentences"], segment_durations, ass_path)
 
         output_path = os.path.join(workdir, "final.mp4")
-        assemble_video(clip_paths, segment_durations, final_audio_path, ass_path, output_path)
+        assemble_video(clip_paths, segment_durations, final_audio_path, ass_path, output_path,
+                        title_card_path=title_card_path, watermark_path=watermark_path)
 
         checklist = run_prepublish_checklist(
             topic, pillar, script, quality, compliance, idea_score_avg, output_path,
