@@ -94,8 +94,20 @@ LF_VIDEO_HEIGHT = 1080
 LF_MIN_WORDS = 1400          # ~8-9 min spoken at edge-tts's typical pace
 LF_TARGET_WORDS = 1700
 LF_MAX_WORDS = 2100          # ~13-15 min - keep a margin under the 15 min ceiling
-LF_MIN_PARAGRAPHS = 9
-LF_MAX_PARAGRAPHS = 15
+
+# Run #1 (2026-07-19, commit b85eae6) found that Groq (llama-3.3-70b) reliably
+# writes toward the LOW end of whatever paragraph-count range it's given, and
+# largely ignores an explicit "120-190 words per paragraph" instruction -
+# real observed output averaged ~87 words/paragraph across all 3 attempts,
+# producing 9, 10, and 10 paragraphs (all near the old floor of 9) and only
+# 784-877 total words - nowhere near the 1400 word floor, even after
+# corrective feedback asking for more words. Rather than fight the model's
+# demonstrated per-paragraph length, the floor here is raised to lean on the
+# lever it actually respects (paragraph COUNT), sized off that real ~87
+# words/paragraph average with a small buffer: 17 * 87 ~= 1480 (above the
+# word floor), 24 * 87 ~= 2090 (under the word ceiling).
+LF_MIN_PARAGRAPHS = 17
+LF_MAX_PARAGRAPHS = 24
 
 LF_MAX_SCRIPT_ATTEMPTS = 3
 LF_QUALITY_THRESHOLD = QUALITY_THRESHOLD  # same bar as Shorts (8/10) for now
@@ -182,12 +194,18 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "") -> dic
       from any single source.
     - No clinical, diagnostic, or medical advice - general-interest
       psychology, not therapy or a diagnosis.
-    - Produce between {LF_MIN_PARAGRAPHS} and {LF_MAX_PARAGRAPHS} paragraphs.
-      Each paragraph should be roughly 120-190 words - a real, developed
-      paragraph, not a one-liner and not a wall of unrelated facts.
+    - HARD REQUIREMENT: produce at LEAST {LF_MIN_PARAGRAPHS} paragraphs, and
+      up to {LF_MAX_PARAGRAPHS}. This is a real constraint, not a
+      suggestion - a script with fewer than {LF_MIN_PARAGRAPHS} paragraphs
+      is a failed response no matter how good each paragraph is. Err
+      toward MORE, shorter body paragraphs (each a real, developed
+      paragraph of roughly 80-150 words - not a one-liner) covering more
+      distinct angles, rather than fewer, longer ones.
     - HARD REQUIREMENT: total narration across all paragraphs combined
       must be between {LF_MIN_WORDS} and {LF_MAX_WORDS} words. Count
       before finalizing - under {LF_MIN_WORDS} words is a failed response.
+      If you're unsure whether you've written enough, add another body
+      paragraph exploring a fresh angle rather than stopping early.
     - Keep a documentary pace: confident, a little suspenseful in places,
       never robotic or list-like. The throughline must read as ONE
       coherent exploration of a psychological question, not disconnected
@@ -279,6 +297,73 @@ def score_longform_quality(topic: str, pillar: str, script: dict) -> dict:
     return json.loads(raw)
 
 
+def expand_longform_script(script: dict, topic: str, pillar: str, words_needed: int) -> dict:
+    """Last-resort top-up used when generate_and_score_longform_script()
+    still comes in under LF_MIN_WORDS after LF_MAX_SCRIPT_ATTEMPTS full
+    rerolls (run #1, 2026-07-19, hit exactly this - 3/3 attempts landed at
+    784-877 words against a 1400 floor). Re-rolling the WHOLE script again
+    already proved not to reliably fix a shortfall, so instead this asks
+    Groq to write additional body paragraphs that continue the existing,
+    already-scored piece, and splices them in before the closing paragraph
+    - preserving the opening hook and closing takeaway that already earned
+    their quality score, rather than gambling on a 4th full reroll.
+    """
+    tone = CONTENT_PILLARS[pillar]["tone"]
+    existing_paragraphs = script["paragraphs"]
+    # ~87 words/paragraph is the real observed average (see LF_MIN_PARAGRAPHS
+    # comment above) - size the ask off that, with a minimum of 2 paragraphs
+    # so a small shortfall still gets a meaningful topped-up angle. Capped so
+    # the merged script can't blow past LF_MAX_PARAGRAPHS and trip the
+    # pre-publish checklist's paragraph_count_ok check on the way to fixing
+    # duration_ok.
+    room_left = max(0, LF_MAX_PARAGRAPHS - len(existing_paragraphs))
+    if room_left == 0:
+        # Already at the paragraph ceiling - can't safely add any without
+        # tripping paragraph_count_ok. Nothing more we can do here; return
+        # the script unchanged rather than risk overshooting the cap.
+        print(
+            "[pipeline_longform] expansion skipped: already at "
+            f"LF_MAX_PARAGRAPHS ({LF_MAX_PARAGRAPHS}) paragraphs"
+        )
+        return script
+    extra_count = max(1, min(-(-words_needed // 87), room_left))
+    existing_text = "\n\n".join(p["text"] for p in existing_paragraphs)
+    prompt = textwrap.dedent(f"""
+    You are continuing a long-form YouTube documentary-essay script for
+    MindByte (topic: "{topic}", pillar: "{pillar}", tone: {tone}). The
+    script so far is:
+
+    {existing_text}
+
+    This script is currently too SHORT for an 8-15 minute video. Write
+    exactly {extra_count} ADDITIONAL body paragraphs (roughly 80-150 words
+    each, same documentary-essay tone) that explore genuinely NEW angles,
+    mechanisms, or examples not already covered above - do not repeat any
+    point already made. These will be inserted into the middle of the
+    script, between the existing opening and closing paragraphs, so do not
+    write a new hook or a new closing/subscribe line.
+
+    Each paragraph object must include "visual_keywords": an array of 3-4
+    short (2-3 word) stock-video search phrases for real, human-centric
+    footage matching that paragraph.
+
+    Return ONLY valid JSON: {{"paragraphs": [{{"text": "...", "visual_keywords": ["...", "..."]}}]}}
+    """).strip()
+    raw = call_groq(prompt)
+    data = json.loads(raw)
+    new_paragraphs = data.get("paragraphs", [])
+    for p in new_paragraphs:
+        if not p.get("visual_keywords"):
+            p["visual_keywords"] = [script.get("title", "people talking")]
+
+    # Insert before the closing paragraph so the quotable takeaway +
+    # channel mention still lands last.
+    merged_paragraphs = existing_paragraphs[:-1] + new_paragraphs + existing_paragraphs[-1:]
+    expanded = dict(script)
+    expanded["paragraphs"] = merged_paragraphs
+    return expanded
+
+
 def generate_and_score_longform_script(topic: str, pillar: str,
                                         max_attempts: int = LF_MAX_SCRIPT_ATTEMPTS) -> tuple:
     """Mirrors pipeline.py's generate_and_score_script(), but the retry
@@ -318,11 +403,15 @@ def generate_and_score_longform_script(topic: str, pillar: str,
             break
         if quality["score"] >= LF_QUALITY_THRESHOLD:
             if word_count < LF_MIN_WORDS:
+                para_count = len(script["paragraphs"])
                 feedback = (
-                    f"the script scored well but was only {word_count} words - "
-                    f"too short for an 8-15 minute video. Add 1-2 more body "
-                    f"paragraphs exploring a fresh angle, at least "
-                    f"{LF_MIN_WORDS} words total."
+                    f"the script scored well but had only {para_count} "
+                    f"paragraphs and {word_count} words total - both too low "
+                    f"for an 8-15 minute video. This time, write AT LEAST "
+                    f"{LF_MIN_PARAGRAPHS} paragraphs (you wrote {para_count} "
+                    f"last time - that is not enough), covering more distinct "
+                    f"angles and examples, to reach at least {LF_MIN_WORDS} "
+                    f"words total."
                 )
             else:
                 feedback = (
@@ -332,6 +421,36 @@ def generate_and_score_longform_script(topic: str, pillar: str,
                 )
         else:
             feedback = quality.get("notes", "")
+
+    if not best_meets_bar and best_word_count < LF_MIN_WORDS:
+        print(
+            f"[pipeline_longform] still short after {max_attempts} full "
+            f"attempts ({best_word_count} words) - topping up the best "
+            f"draft with additional paragraphs instead of rerolling again"
+        )
+        try:
+            expanded = expand_longform_script(
+                best_script, topic, pillar, LF_MIN_WORDS - best_word_count,
+            )
+            expanded_word_count = sum(len(p["text"].split()) for p in expanded["paragraphs"])
+            expanded_quality = score_longform_quality(topic, pillar, expanded)
+            expanded_in_band = LF_MIN_WORDS <= expanded_word_count <= LF_MAX_WORDS
+            print(
+                f"[pipeline_longform] expanded draft: quality score "
+                f"{expanded_quality['score']} - {expanded_quality['notes']} "
+                f"(word count: {expanded_word_count}, paragraphs: "
+                f"{len(expanded['paragraphs'])})"
+            )
+            if expanded_in_band and expanded_quality["score"] >= LF_QUALITY_THRESHOLD:
+                best_script, best_quality = expanded, expanded_quality
+            else:
+                print(
+                    "[pipeline_longform] expanded draft still didn't clear "
+                    "the bar - continuing with the original best draft"
+                )
+        except Exception as e:  # noqa: BLE001 - expansion is a bonus, never abort the run
+            print(f"[pipeline_longform] expansion attempt failed, continuing with best draft as-is: {e}")
+
     return best_script, best_quality
 
 
