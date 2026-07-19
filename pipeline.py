@@ -202,14 +202,18 @@ def generate_script(topic: str, feedback: str = "") -> dict:
           general-interest psychology content, not therapy or a diagnosis.
         - Hook the viewer HARD in the first sentence (a surprising claim,
           a question, or a "wait, what?" moment) - not a slow wind-up.
-        - 10-14 short, punchy sentences, each under 14 words. Every sentence
-          should be a single vivid, self-contained beat - short fragments
-          and exclamations are encouraged. Avoid long, explanatory,
+        - Write 15-19 short, punchy sentences. Each sentence must be
+          BETWEEN 9 AND 14 WORDS - not shorter. Do not write tiny 3-6 word
+          fragments; every sentence should be one complete, vivid, punchy
+          beat of at least 9 words. Also avoid long, explanatory,
           multi-clause sentences; they read as a lecture, not a Short.
-        - The full narration read aloud should fill approximately 45-55
-          seconds (roughly 130-160 words total) - include enough distinct
-          beats/facts to fill that time. Do not pad with filler, but do not
-          cut the script so short it runs under 30 seconds either.
+        - HARD REQUIREMENT: the full narration must total at least 140
+          words and no more than 190 words, so it fills 45-55 seconds when
+          read aloud at a fast pace. Before you finalize your answer, add
+          up the words across all your sentences - if the total is under
+          140 words, add more sentences or lengthen existing ones (without
+          padding with filler) until it clears 140 words. A script under
+          140 words is a FAILED response and must not be returned.
         - Keep the energy high all the way through, not just the opener -
           use rhetorical questions, quick reveals, or "but here's the
           crazy part" style pivots between facts.
@@ -324,7 +328,12 @@ def generate_and_score_script(topic: str, max_attempts: int = MAX_SCRIPT_ATTEMPT
     Returns the (script, quality) pair that best satisfies both bars, or
     the best-scoring one seen if no attempt clears both within the budget.
     """
-    best_script, best_quality, best_meets_bar = None, {"score": -1, "notes": ""}, False
+    best_script, best_quality, best_meets_bar, best_word_count = (
+        None,
+        {"score": -1, "notes": ""},
+        False,
+        -1,
+    )
     feedback = ""
     for attempt in range(1, max_attempts + 1):
         script = generate_script(topic, feedback=feedback)
@@ -336,11 +345,28 @@ def generate_and_score_script(topic: str, max_attempts: int = MAX_SCRIPT_ATTEMPT
             f"quality score {quality['score']} - {quality['notes']} "
             f"(word count: {word_count})"
         )
-        is_better = (meets_bar and not best_meets_bar) or (
-            meets_bar == best_meets_bar and quality["score"] > best_quality["score"]
+        # Tie-break order: (1) meeting both bars beats not meeting them,
+        # (2) higher quality score wins, (3) if score is also tied, prefer
+        # whichever draft has MORE words - closer to the duration target -
+        # instead of arbitrarily keeping attempt 1. Without this third
+        # tiebreaker, three equally-scored-but-all-too-short attempts would
+        # keep the very first (often shortest) one.
+        is_better = (
+            (meets_bar and not best_meets_bar)
+            or (meets_bar == best_meets_bar and quality["score"] > best_quality["score"])
+            or (
+                meets_bar == best_meets_bar
+                and quality["score"] == best_quality["score"]
+                and word_count > best_word_count
+            )
         )
         if best_script is None or is_better:
-            best_script, best_quality, best_meets_bar = script, quality, meets_bar
+            best_script, best_quality, best_meets_bar, best_word_count = (
+                script,
+                quality,
+                meets_bar,
+                word_count,
+            )
         if meets_bar:
             break
         if quality["score"] >= QUALITY_THRESHOLD:
