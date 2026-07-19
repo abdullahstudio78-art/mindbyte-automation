@@ -495,6 +495,41 @@ async def _synthesize(text: str, dest_path: str, voice: str = "en-US-AriaNeural"
     await communicate.save(dest_path)
 
 
+def _sentence_prosody(sentence: str, index: int, total: int) -> tuple:
+    """Pick a rate/pitch for THIS sentence instead of reusing the same
+    fixed +10%/+3Hz for every line.
+
+    Even after splitting narration into per-sentence clips (which fixed
+    the choppy pacing), every clip still used the exact same rate and
+    pitch - so the voice itself still sounded like one flat, robotic
+    read-through (user feedback: "audio still not right"). Real speech
+    changes pace and pitch depending on what's being said: a hook opens
+    slower and lower to pull you in, questions lift up, and a punchline
+    or final line lands faster and higher for energy. This function
+    fakes that by picking a different rate/pitch per sentence based on
+    its role (first line, question, last line, middle line) plus a
+    small random jitter so back-to-back "normal" sentences don't sound
+    identical either.
+    """
+    base_rate, base_pitch = 10, 3  # matches the old fixed values
+
+    if index == 0:
+        # The hook: pull back slightly, land it more deliberately.
+        rate, pitch = base_rate - 5, base_pitch - 2
+    elif index == total - 1:
+        # The payoff/last line: push forward with more energy.
+        rate, pitch = base_rate + 7, base_pitch + 5
+    elif sentence.strip().endswith("?"):
+        # Questions lift in pitch and ease off pace slightly.
+        rate, pitch = base_rate - 2, base_pitch + 4
+    else:
+        rate, pitch = base_rate, base_pitch
+
+    rate += random.randint(-3, 3)
+    pitch += random.randint(-2, 2)
+    return f"{rate:+d}%", f"{pitch:+d}Hz"
+
+
 SENTENCE_GAP_MS = 220  # brief pause between beats
 
 
@@ -532,7 +567,8 @@ def generate_voiceover_segments(sentences: list, workdir: str) -> tuple:
     clip_paths = []
     for i, sentence in enumerate(sentences):
         clip_path = os.path.join(workdir, f"voice_{i}.mp3")
-        asyncio.run(_synthesize(sentence, clip_path))
+        rate, pitch = _sentence_prosody(sentence, i, len(sentences))
+        asyncio.run(_synthesize(sentence, clip_path, rate=rate, pitch=pitch))
         clip_paths.append(clip_path)
 
     gap_seconds = SENTENCE_GAP_MS / 1000
