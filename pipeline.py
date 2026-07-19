@@ -14,6 +14,7 @@ import os
 import io
 import json
 import random
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -53,6 +54,13 @@ MAX_SCRIPT_ATTEMPTS = 3  # in-run retries with feedback before giving up
 CONTENT_PILLARS = {
     "Relationship Psychology": {
         "tone": "warm, emotionally intimate, a little vulnerable",
+        "voice": "en-US-JennyNeural",
+        "base_rate": 5,
+        "base_pitch": 6,
+        "music_queries": [
+            "emotional piano", "soft cinematic piano",
+            "melancholy piano ambient", "tender emotional strings",
+        ],
         "topics": [
             "why people lose interest in relationships",
             "why someone becomes emotionally distant",
@@ -68,6 +76,13 @@ CONTENT_PILLARS = {
     },
     "Human Behavior Psychology": {
         "tone": "sharp, revealing, a little provocative",
+        "voice": "en-US-AriaNeural",
+        "base_rate": 10,
+        "base_pitch": 3,
+        "music_queries": [
+            "mysterious ambient", "curious ambient piano",
+            "dark ambient minimal", "cinematic tension calm",
+        ],
         "topics": [
             "why people lie even when it's pointless",
             "why humans crave validation",
@@ -83,6 +98,13 @@ CONTENT_PILLARS = {
     },
     "Social Psychology": {
         "tone": "confident, observational, socially savvy",
+        "voice": "en-US-GuyNeural",
+        "base_rate": 12,
+        "base_pitch": 2,
+        "music_queries": [
+            "confident cinematic ambient", "modern ambient upbeat",
+            "sleek ambient electronic", "inspiring ambient",
+        ],
         "topics": [
             "the psychology of first impressions",
             "what body language really reveals",
@@ -98,6 +120,13 @@ CONTENT_PILLARS = {
     },
     "Brain & Neuroscience": {
         "tone": "clear, confident, science-grounded but accessible",
+        "voice": "en-GB-RyanNeural",
+        "base_rate": 8,
+        "base_pitch": 0,
+        "music_queries": [
+            "futuristic ambient", "ambient technology",
+            "sci-fi atmospheric ambient", "electronic ambient minimal",
+        ],
         "topics": [
             "how dopamine actually drives motivation",
             "how habits form in the brain",
@@ -112,6 +141,13 @@ CONTENT_PILLARS = {
     },
     "Emotional Intelligence": {
         "tone": "calm, supportive, growth-oriented",
+        "voice": "en-GB-SoniaNeural",
+        "base_rate": 2,
+        "base_pitch": 4,
+        "music_queries": [
+            "calm ambient piano", "warm ambient acoustic",
+            "peaceful ambient reflective", "soft inspiring ambient",
+        ],
         "topics": [
             "understanding your own emotions",
             "the psychology of self-control",
@@ -124,6 +160,13 @@ CONTENT_PILLARS = {
     },
     "Psychology Experiments & Stories": {
         "tone": "documentary, narrative, slightly suspenseful",
+        "voice": "en-US-DavisNeural",
+        "base_rate": -3,
+        "base_pitch": -4,
+        "music_queries": [
+            "suspense ambient tension", "dark documentary ambient",
+            "subtle tension cinematic", "mysterious cinematic score",
+        ],
         "topics": [
             "the Milgram obedience experiment",
             "the Stanford prison experiment",
@@ -635,6 +678,9 @@ def gather_clips(keywords: list, workdir: str) -> list:
 
 OPENVERSE_AUDIO_URL = "https://api.openverse.org/v1/audio/"
 MUSIC_QUERIES = [
+    # Generic fallback used only if a pillar has no music_queries or all of
+    # its queries come up empty on Openverse (content-strategy phase 2,
+    # 2026-07-19) - normal picks now come from CONTENT_PILLARS[pillar]["music_queries"].
     "mysterious ambient", "cinematic tension calm", "curious ambient piano",
     "ambient technology", "dark ambient minimal", "inspiring ambient",
 ]
@@ -642,14 +688,22 @@ MIN_MUSIC_DURATION_MS = 30000  # skip very short stingers that can't cover a ful
 MUSIC_VOLUME = 0.15  # ducked well under the narration
 
 
-def fetch_background_music(dest_path: str) -> dict | None:
+def fetch_background_music(dest_path: str, pillar: str) -> dict | None:
     """Best-effort fetch of a free, commercially-licensed instrumental track
     from Openverse (aggregates Jamendo, Free Music Archive, etc. - no API
     key needed). This is a nice-to-have: any failure (network, no results,
     license mismatch) is swallowed and logged so a music-fetch problem never
     aborts video production - the video is still fine without a music bed.
+
+    Query is now picked from CONTENT_PILLARS[pillar]["music_queries"]
+    (content-strategy phase 2, 2026-07-19) so the mood matches the
+    content - emotional piano for Relationship Psychology, futuristic
+    ambient for Brain & Neuroscience, subtle tension for Psychology
+    Experiments & Stories, etc. - falling back to the generic
+    MUSIC_QUERIES list if the pillar has none or nothing is found.
     """
-    query = random.choice(MUSIC_QUERIES)
+    queries = CONTENT_PILLARS.get(pillar, {}).get("music_queries") or MUSIC_QUERIES
+    query = random.choice(queries)
     try:
         resp = SESSION.get(
             OPENVERSE_AUDIO_URL,
@@ -677,7 +731,6 @@ def fetch_background_music(dest_path: str) -> dict | None:
     except Exception as e:  # noqa: BLE001 - deliberately broad, see docstring
         print(f"[pipeline] music fetch failed, continuing without music: {e}")
         return None
-
 
 def mix_background_music(voice_path: str, music_path: str, duration: float,
                           dest_path: str) -> None:
@@ -715,9 +768,10 @@ async def _synthesize(text: str, dest_path: str, voice: str = "en-US-AriaNeural"
     await communicate.save(dest_path)
 
 
-def _sentence_prosody(sentence: str, index: int, total: int) -> tuple:
+def _sentence_prosody(sentence: str, index: int, total: int,
+                       base_rate: int = 10, base_pitch: int = 3) -> tuple:
     """Pick a rate/pitch for THIS sentence instead of reusing the same
-    fixed +10%/+3Hz for every line.
+    fixed rate/pitch for every line.
 
     Even after splitting narration into per-sentence clips (which fixed
     the choppy pacing), every clip still used the exact same rate and
@@ -730,9 +784,14 @@ def _sentence_prosody(sentence: str, index: int, total: int) -> tuple:
     its role (first line, question, last line, middle line) plus a
     small random jitter so back-to-back "normal" sentences don't sound
     identical either.
-    """
-    base_rate, base_pitch = 10, 3  # matches the old fixed values
 
+    base_rate/base_pitch (2026-07-19, content-strategy phase 2) let the
+    caller shift the WHOLE sentence's baseline per pillar - e.g. a
+    Relationship Psychology script reads a little warmer/slower, a
+    Psychology Experiments & Stories script reads a little deeper and
+    more deliberate - while this function's existing per-sentence-role
+    logic still layers hook/question/closing-line variation on top.
+    """
     if index == 0:
         # The hook: pull back slightly, land it more deliberately.
         rate, pitch = base_rate - 5, base_pitch - 2
@@ -749,7 +808,6 @@ def _sentence_prosody(sentence: str, index: int, total: int) -> tuple:
     pitch += random.randint(-2, 2)
     return f"{rate:+d}%", f"{pitch:+d}Hz"
 
-
 SENTENCE_GAP_MS = 220  # brief pause between beats
 
 
@@ -762,7 +820,7 @@ def ffprobe_duration(path: str) -> float:
     return float(out.stdout.strip())
 
 
-def generate_voiceover_segments(sentences: list, workdir: str) -> tuple:
+def generate_voiceover_segments(sentences: list, workdir: str, pillar: str) -> tuple:
     """Synthesize each sentence as its OWN edge-tts clip and splice them
     together with a short silence gap, instead of one Communicate() call
     over the whole script joined into a paragraph.
@@ -778,17 +836,29 @@ def generate_voiceover_segments(sentences: list, workdir: str) -> tuple:
     of each sentence's audio instead of a word-count estimate, which is
     more accurate than the previous compute_segment_durations() approach.
 
+    The voice itself, and the baseline rate/pitch _sentence_prosody()
+    varies around, both now come from CONTENT_PILLARS[pillar]
+    (content-strategy phase 2, 2026-07-19) so a Relationship Psychology
+    script sounds warmer, a Psychology Experiments & Stories script
+    sounds deeper/more documentary, etc., instead of every topic using
+    the same fixed voice.
+
     Returns (combined_audio_path, segment_durations) where
     segment_durations[i] is the real duration (seconds, including the
     trailing gap) of sentences[i]'s audio.
     """
     import asyncio
 
+    preset = CONTENT_PILLARS.get(pillar, {})
+    voice = preset.get("voice", "en-US-AriaNeural")
+    base_rate = preset.get("base_rate", 10)
+    base_pitch = preset.get("base_pitch", 3)
+
     clip_paths = []
     for i, sentence in enumerate(sentences):
         clip_path = os.path.join(workdir, f"voice_{i}.mp3")
-        rate, pitch = _sentence_prosody(sentence, i, len(sentences))
-        asyncio.run(_synthesize(sentence, clip_path, rate=rate, pitch=pitch))
+        rate, pitch = _sentence_prosody(sentence, i, len(sentences), base_rate, base_pitch)
+        asyncio.run(_synthesize(sentence, clip_path, voice=voice, rate=rate, pitch=pitch))
         clip_paths.append(clip_path)
 
     gap_seconds = SENTENCE_GAP_MS / 1000
@@ -824,35 +894,101 @@ def generate_voiceover_segments(sentences: list, workdir: str) -> tuple:
     )
     return combined_path, segment_durations
 
+# Emotionally-loaded words to visually highlight in burned-in captions
+# (content-strategy phase 2, 2026-07-19: "Highlight important emotional
+# words" - e.g. LOVE, FEAR, REJECTION, BRAIN, CONTROL, ATTRACTION - the
+# strategy's example list plus a broader set covering all 6 pillars, not
+# just relationship topics). Matching is case-insensitive against the
+# word with punctuation stripped.
+HIGHLIGHT_KEYWORDS = {
+    "love", "fear", "rejection", "brain", "control", "attraction",
+    "anxiety", "dopamine", "jealousy", "trust", "betrayal", "validation",
+    "power", "obsession", "trauma", "insecurity", "connection", "lonely",
+    "loneliness", "confidence", "manipulation", "attachment", "heartbreak",
+    "desire", "shame", "guilt", "anger", "empathy", "memory", "habit",
+    "addiction", "instinct", "subconscious", "willpower", "courage",
+    "vulnerable", "vulnerability", "intimacy", "distrust", "denial",
+    "overthinking", "procrastinate", "procrastination", "influence",
+    "persuasion", "charisma", "status", "bias", "irrational", "avoid",
+    "ignore", "trigger", "crave", "obsess", "manipulate", "reject",
+    "chase", "hurt", "betray", "overwhelm", "distract", "seduce",
+    "judge", "conform", "dominance", "insecure", "belonging",
+}
 
-def build_srt(sentences: list, segment_durations: list, dest_path: str) -> None:
-    t = 0.0
+# ASS override-tag colors for the highlight (BGR hex, no alpha) - a warm
+# amber/gold against the base white caption color, so highlighted words
+# visually pop without changing the overall caption style.
+HIGHLIGHT_ASS_COLOR = "07C1FF"  # amber/gold
+BASE_ASS_COLOR = "FFFFFF"  # matches the Style line's PrimaryColour (white)
 
+def _highlight_ass_text(sentence: str) -> str:
+    """Uppercase and color any HIGHLIGHT_KEYWORDS word within a caption
+    line using inline ASS override tags, e.g. "people often avoid
+    difficult conversations" becomes "people often {\\c&H07C1FF&}AVOID{\\c&HFFFFFF&}
+    difficult conversations" if "avoid" is on the list. A plain SRT file
+    can't do this (force_style only applies one uniform style to the
+    whole line) - this is why captions moved to .ass in phase 2."""
+    def repl(match):
+        word = match.group(0)
+        core = re.sub(r"[^A-Za-z']", "", word).lower()
+        if core in HIGHLIGHT_KEYWORDS:
+            return (
+                r"{\c&H" + HIGHLIGHT_ASS_COLOR + r"&}"
+                + word.upper()
+                + r"{\c&H" + BASE_ASS_COLOR + r"&}"
+            )
+        return word
+    return re.sub(r"\S+", repl, sentence)
+
+def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
+    """Build an .ass (Advanced SubStation Alpha) caption file instead of a
+    plain .srt, so specific emotionally-loaded words can be visually
+    highlighted (capitalized + colored) inline within a line via ASS
+    override tags (content-strategy phase 2, 2026-07-19) - something a
+    plain SRT + ffmpeg force_style can't do, since force_style only
+    applies one uniform style to all burned-in text on the whole video.
+
+    The embedded Style line carries forward the exact positioning
+    validated for the caption-overlap fix (MarginV=420, MarginL/R=60,
+    Alignment=2, PlayResX/Y matching the real output) so captions stay
+    clear of the YouTube Shorts mobile UI overlay - see the MarginV
+    history elsewhere in this file for why those specific numbers were
+    chosen.
+    """
     def fmt(ts: float) -> str:
-        ms = int(round(ts * 1000))
-        h, ms = divmod(ms, 3600000)
-        m, ms = divmod(ms, 60000)
-        s, ms = divmod(ms, 1000)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+        cs = int(round(ts * 100))
+        h, cs = divmod(cs, 360000)
+        m, cs = divmod(cs, 6000)
+        s, cs = divmod(cs, 100)
+        return f"{h:01d}:{m:02d}:{s:02d}.{cs:02d}"
 
-    lines = []
-    for i, (sentence, dur) in enumerate(zip(sentences, segment_durations), start=1):
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {VIDEO_WIDTH}\n"
+        f"PlayResY: {VIDEO_HEIGHT}\n"
+        "WrapStyle: 0\n"
+        "ScaledBorderAndShadow: yes\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Caption,Arial,68,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,3,1,2,60,60,420,1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+    lines = [header]
+    t = 0.0
+    for sentence, dur in zip(sentences, segment_durations):
         start, end = t, t + dur
         t = end
-        lines.append(str(i))
-        lines.append(f"{fmt(start)} --> {fmt(end)}")
-        lines.append(sentence.strip())
-        lines.append("")
+        text = _highlight_ass_text(sentence.strip())
+        lines.append(f"Dialogue: 0,{fmt(start)},{fmt(end)},Caption,,0,0,0,,{text}")
     with open(dest_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-
-# ---------------------------------------------------------------------------
-# ffmpeg assembly
-# ---------------------------------------------------------------------------
+        f.write("\n".join(lines) + "\n")
 
 def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
-                    srt_path: str, output_path: str) -> None:
+                    ass_path: str, output_path: str) -> None:
     # Each clip is trimmed to the real measured duration of the sentence it
     # illustrates (see generate_voiceover_segments), so cuts land exactly on
     # sentence boundaries instead of an even, content-blind split. zip()
@@ -887,18 +1023,13 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
         check=True, capture_output=True,
     )
 
-    srt_escaped = srt_path.replace(":", r"\:")
-    # PlayResX/PlayResY are set explicitly because without them libass has
-    # to guess the script resolution, which previously made captions render
-    # far from where FontSize/MarginV intended (reported as captions
-    # appearing in the middle of the screen instead of the lower third).
-    # FontSize is sized relative to the real 1080x1920 output (13 was a
-    # leftover from an unscaled default and was nearly invisible/mispositioned). MarginV raised 220->420 and MarginL/MarginR=60 added 2026-07-19: on a real phone, YouTube Shorts' own title/channel-name/view-count overlay covers roughly the bottom 300px, so captions at 220 sat underneath it (user-reported via screenshot).
-    subtitle_style = (
-        f"FontName=Arial,Bold=1,FontSize=68,PrimaryColour=&H00FFFFFF,"
-        f"OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,"
-        f"Alignment=2,MarginV=420,MarginL=60,MarginR=60,PlayResX={VIDEO_WIDTH},PlayResY={VIDEO_HEIGHT}"
-    )
+    # The .ass file (built by build_ass()) carries its own Style line -
+    # positioning (MarginV=420 etc., see caption-overlap fix history) and
+    # per-word highlight colors are both embedded there now, so no
+    # force_style override is needed here (content-strategy phase 2,
+    # 2026-07-19 - previously this used a plain .srt + force_style, which
+    # can't do the per-word highlighting an .ass file's override tags can).
+    ass_escaped = ass_path.replace(":", r"\:")
 
     # Small "Follow MindByte for more" cue burned in for the last ~1.8s of
     # the video, positioned near the TOP of the frame (captions own the
@@ -916,7 +1047,7 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", silent_video, "-i", audio_path,
-            "-vf", f"subtitles={srt_escaped}:force_style='{subtitle_style}',{follow_overlay}",
+            "-vf", f"subtitles={ass_escaped},{follow_overlay}",
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "libx264", "-preset", "medium", "-crf", "17",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
@@ -925,11 +1056,6 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
         ],
         check=True, capture_output=True,
     )
-
-
-# ---------------------------------------------------------------------------
-# YouTube upload
-# ---------------------------------------------------------------------------
 
 def upload_to_youtube(access_token: str, video_path: str, title: str, description: str,
                        tags: list, publish_at_iso: str) -> str:
@@ -1015,7 +1141,7 @@ def main() -> None:
         # a flat, run-on read - see generate_voiceover_segments() docstring.
         # segment_durations here are REAL measured per-sentence durations,
         # not a word-count estimate, so captions/cuts land exactly on them.
-        audio_path, segment_durations = generate_voiceover_segments(script["sentences"], workdir)
+        audio_path, segment_durations = generate_voiceover_segments(script["sentences"], workdir, pillar)
         audio_duration = ffprobe_duration(audio_path)
 
         # Background music is best-effort: fetch + mix under the narration,
@@ -1024,7 +1150,7 @@ def main() -> None:
         final_audio_path = audio_path
         description = script["description"]
         music_path = os.path.join(workdir, "music.mp3")
-        music_meta = fetch_background_music(music_path)
+        music_meta = fetch_background_music(music_path, pillar)
         if music_meta:
             mixed_path = os.path.join(workdir, "voiceover_mixed.mp3")
             try:
@@ -1039,11 +1165,11 @@ def main() -> None:
             except Exception as e:  # noqa: BLE001 - music mix must never abort the run
                 print(f"[pipeline] music mix failed, continuing without music: {e}")
 
-        srt_path = os.path.join(workdir, "captions.srt")
-        build_srt(script["sentences"], segment_durations, srt_path)
+        ass_path = os.path.join(workdir, "captions.ass")
+        build_ass(script["sentences"], segment_durations, ass_path)
 
         output_path = os.path.join(workdir, "final.mp4")
-        assemble_video(clip_paths, segment_durations, final_audio_path, srt_path, output_path)
+        assemble_video(clip_paths, segment_durations, final_audio_path, ass_path, output_path)
 
         publish_at = datetime.now(timezone.utc) + timedelta(hours=PUBLISH_DELAY_HOURS)
         video_id = upload_to_youtube(
