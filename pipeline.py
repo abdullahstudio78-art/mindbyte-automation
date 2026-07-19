@@ -40,6 +40,9 @@ PUBLISH_DELAY_HOURS = 18  # rolling safety delay before a video goes public
 VIDEO_WIDTH = 1080
 VIDEO_HEIGHT = 1920
 
+QUALITY_THRESHOLD = 8  # gate: script must score >= this to be produced/uploaded
+MAX_SCRIPT_ATTEMPTS = 3  # in-run retries with feedback before giving up
+
 # Rotation of sub-topics within the "bite-sized facts/trivia" niche.
 TOPIC_POOL = [
     "deep sea creatures", "ancient Rome", "space exploration", "the human brain",
@@ -162,11 +165,20 @@ def call_groq(prompt: str) -> str:
     return data["choices"][0]["message"]["content"]
 
 
-def generate_script(topic: str) -> dict:
+def generate_script(topic: str, feedback: str = "") -> dict:
+    feedback_block = ""
+    if feedback:
+        feedback_block = textwrap.dedent(f"""
+
+            IMPORTANT - a previous draft on this exact topic was reviewed and
+            scored too low because: "{feedback}"
+            Write a genuinely different draft that specifically fixes that
+            weakness, while still following every requirement below.
+        """)
     prompt = textwrap.dedent(f"""
         You are writing a 45-55 second YouTube Shorts script for a "bite-sized
         facts/trivia" channel called MindByte. The topic is: "{topic}".
-
+        {feedback_block}
         Tone: this must feel like a fast-paced, energetic viral Shorts video,
         NOT a lecture or documentary voiceover. Write like you're talking
         excitedly to a friend, not narrating a textbook.
@@ -183,6 +195,9 @@ def generate_script(topic: str) -> dict:
         - Keep the energy high all the way through, not just the opener -
           use rhetorical questions, quick reveals, or "but here's the
           crazy part" style pivots between facts.
+        - Pick genuinely surprising, lesser-known facts about the topic -
+          avoid the most obvious/commonly-known trivia, since that's what
+          reads as "generic" to viewers who've seen a hundred facts videos.
         - End with a punchy, memorable closing line (not a generic "thanks
           for watching").
         - Also produce: a clickable title (under 90 characters, no
@@ -221,11 +236,28 @@ def generate_script(topic: str) -> dict:
 def score_quality(topic: str, script: dict) -> dict:
     prompt = textwrap.dedent(f"""
         Rate the following YouTube Shorts script for a facts/trivia channel
-        on a scale of 1-10 against these criteria: hook strength in the
-        first sentence, pacing/conciseness, factual interest, originality
-        of phrasing, and how well it fits a 45-55 second short. Also flag
-        if it reads as generic/templated rather than a genuinely distinct
-        piece of writing.
+        on a scale of 1-10.
+
+        Calibration - read this first: this is a fast, punchy, 45-55 second
+        VERTICAL SHORT made of short fragments and exclamations BY DESIGN.
+        Do NOT penalize brevity, simplicity, or the absence of long
+        explanatory detail - that IS the correct style for this format, not
+        a flaw. A script that nails a strong hook and energetic pacing
+        should score 8-10 even though each individual sentence is short.
+        Judge it as a Short, not as an essay.
+
+        Score primarily on:
+        - Hook strength: does the first sentence grab attention immediately?
+        - Energy/pacing: does it feel fast and exciting, not flat or
+          lecture-like?
+        - Fact interest: would a general viewer find these facts genuinely
+          surprising (not the most obvious trivia about the topic)?
+        - Originality of phrasing: no generic filler like "did you know"
+          or "stay tuned to find out".
+
+        Only score below 6 if the script is genuinely boring, factually
+        weak, or reads like a generic template - not merely because it is
+        short or simple.
 
         Topic: {topic}
         Title: {script['title']}
@@ -236,6 +268,29 @@ def score_quality(topic: str, script: dict) -> dict:
     """).strip()
     raw = call_groq(prompt)
     return json.loads(raw)
+
+
+def generate_and_score_script(topic: str, max_attempts: int = MAX_SCRIPT_ATTEMPTS) -> tuple:
+    """Generate + score a script, retrying with feedback if it falls short
+    of the quality bar, so a single pipeline run gets multiple shots at
+    clearing the gate instead of failing outright on one weak first draft.
+    Returns the (script, quality) pair with the highest score seen.
+    """
+    best_script, best_quality = None, {"score": -1, "notes": ""}
+    feedback = ""
+    for attempt in range(1, max_attempts + 1):
+        script = generate_script(topic, feedback=feedback)
+        quality = score_quality(topic, script)
+        print(
+            f"[pipeline] attempt {attempt}/{max_attempts}: "
+            f"quality score {quality['score']} - {quality['notes']}"
+        )
+        if quality["score"] > best_quality["score"]:
+            best_script, best_quality = script, quality
+        if quality["score"] >= QUALITY_THRESHOLD:
+            break
+        feedback = quality.get("notes", "")
+    return best_script, best_quality
 
 
 def compliance_check(script: dict) -> dict:
@@ -516,11 +571,9 @@ def main() -> None:
     topic = pick_topic(access_token)
     print(f"[pipeline] topic: {topic}")
 
-    script = generate_script(topic)
+    script, quality = generate_and_score_script(topic)
     print(f"[pipeline] title: {script['title']}")
-
-    quality = score_quality(topic, script)
-    print(f"[pipeline] quality score: {quality['score']} - {quality['notes']}")
+    print(f"[pipeline] final quality score: {quality['score']} - {quality['notes']}")
 
     compliance = compliance_check(script)
     print(f"[pipeline] compliance: {compliance}")
@@ -531,7 +584,7 @@ def main() -> None:
         quality["score"], compliance["notes"], 0, 0, 0, 0, "", "", "",
     ]
 
-    if quality["score"] < 8 or not compliance["passed"]:
+    if quality["score"] < QUALITY_THRESHOLD or not compliance["passed"]:
         sheet_row_base[3] = "Rejected"
         sheet_row_base[14] = "Skipped upload: failed quality/compliance gate"
         sheet_append(access_token, "Videos!A:O", sheet_row_base)
