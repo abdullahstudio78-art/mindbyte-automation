@@ -33,7 +33,7 @@ OAUTH_CLIENT_SECRET = os.environ["OAUTH_CLIENT_SECRET"]
 OAUTH_REFRESH_TOKEN = os.environ["OAUTH_REFRESH_TOKEN"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-3.5-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
