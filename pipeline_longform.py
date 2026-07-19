@@ -689,9 +689,22 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
     workdir = os.path.dirname(output_path)
     normalized = []
     idx = 0
+    last_good_clip = None
     for clips, dur in zip(clip_groups, segment_durations):
         if not clips:
-            continue
+            # A paragraph with zero B-roll clips used to be silently
+            # dropped from the video track here, while its narration
+            # stayed in the full audio track - the final ffmpeg merge
+            # uses -shortest, so a dropped paragraph shortened the whole
+            # video (this is the diagnosed cause of run #3's duration_ok
+            # failure despite the script clearing the word-count floor).
+            # Reuse the previous paragraph's clip instead so this
+            # paragraph's runtime is still represented on the video track.
+            if last_good_clip is None:
+                print("[pipeline_longform] warning: a paragraph has zero B-roll clips and there is no earlier clip yet to reuse - its runtime will be missing from the final video")
+                continue
+            print("[pipeline_longform] warning: a paragraph has zero B-roll clips - reusing the previous paragraph's clip so its runtime isn't dropped")
+            clips = [last_good_clip]
         n = len(clips)
         # Never cut a slice shorter than LF_MIN_CLIP_SLICE_SEC - if the
         # even split would go below that floor, reduce how many of this
@@ -716,6 +729,7 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
             )
             normalized.append(norm_path)
             idx += 1
+        last_good_clip = clips[-1]
 
     concat_list = os.path.join(workdir, "concat_lf.txt")
     with open(concat_list, "w") as f:
@@ -918,7 +932,7 @@ def main() -> None:
         checklist = run_prepublish_checklist_longform(
             topic, pillar, script, quality, compliance, idea_score_avg, output_path,
         )
-        print(f"[pipeline_longform] pre-publish checklist: {checklist['checks']}")
+        print(f"[pipeline_longform] pre-publish checklist: {checklist['checks']} (measured duration={checklist['duration']:.1f}s, target range={LF_MIN_VIDEO_DURATION_SEC}-{LF_MAX_VIDEO_DURATION_SEC}s, width={checklist['width']}, height={checklist['height']})")
         sheet_row_base[8] = round(checklist["duration"], 1)
         if not checklist["overall_pass"]:
             sheet_row_base[3] = "Failed"
