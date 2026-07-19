@@ -374,7 +374,7 @@ def generate_and_score_longform_script(topic: str, pillar: str,
     best_script, best_quality, best_meets_bar, best_word_count = (
         None, {"score": -1, "notes": ""}, False, -1,
     )
-    
+    attempts = []
     feedback = ""
     for attempt in range(1, max_attempts + 1):
         script = generate_longform_script(topic, pillar, feedback=feedback)
