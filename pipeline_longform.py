@@ -374,6 +374,7 @@ def generate_and_score_longform_script(topic: str, pillar: str,
     best_script, best_quality, best_meets_bar, best_word_count = (
         None, {"score": -1, "notes": ""}, False, -1,
     )
+    
     feedback = ""
     for attempt in range(1, max_attempts + 1):
         script = generate_longform_script(topic, pillar, feedback=feedback)
@@ -385,6 +386,9 @@ def generate_and_score_longform_script(topic: str, pillar: str,
             f"[pipeline_longform] attempt {attempt}/{max_attempts}: "
             f"quality score {quality['score']} - {quality['notes']} "
             f"(word count: {word_count}, paragraphs: {len(script['paragraphs'])})"
+        )
+        attempts.append(
+            {"script": script, "quality": quality, "word_count": word_count, "meets_bar": meets_bar}
         )
         is_better = (
             (meets_bar and not best_meets_bar)
@@ -402,11 +406,10 @@ def generate_and_score_longform_script(topic: str, pillar: str,
         if meets_bar:
             break
         if quality["score"] >= LF_QUALITY_THRESHOLD:
+            para_count = len(script["paragraphs"])
             if word_count < LF_MIN_WORDS:
-                para_count = len(script["paragraphs"])
                 feedback = (
-                    f"the script scored well but had only {para_count} "
-                    f"paragraphs and {word_count} words total - both too low "
+                    f"the script scored well but was only {word_count} words - too short "
                     f"for an 8-15 minute video. This time, write AT LEAST "
                     f"{LF_MIN_PARAGRAPHS} paragraphs (you wrote {para_count} "
                     f"last time - that is not enough), covering more distinct "
@@ -441,7 +444,12 @@ def generate_and_score_longform_script(topic: str, pillar: str,
                 f"(word count: {expanded_word_count}, paragraphs: "
                 f"{len(expanded['paragraphs'])})"
             )
-            if expanded_in_band and expanded_quality["score"] >= LF_QUALITY_THRESHOLD:
+            expanded_meets_bar = expanded_in_band and expanded_quality["score"] >= LF_QUALITY_THRESHOLD
+            attempts.append(
+                {"script": expanded, "quality": expanded_quality,
+                 "word_count": expanded_word_count, "meets_bar": expanded_meets_bar}
+            )
+            if expanded_meets_bar:
                 best_script, best_quality = expanded, expanded_quality
             else:
                 print(
@@ -451,8 +459,32 @@ def generate_and_score_longform_script(topic: str, pillar: str,
         except Exception as e:  # noqa: BLE001 - expansion is a bonus, never abort the run
             print(f"[pipeline_longform] expansion attempt failed, continuing with best draft as-is: {e}")
 
-    return best_script, best_quality
+        # None of the attempts (including the expansion, if it ran) cleared
+        # the word-count floor. Previously this fell through to whichever
+        # draft scored highest on quality - which could be the SHORTEST
+        # draft generated all run, discarding a longer-but-slightly-lower-
+        # quality candidate (like the expansion) that was actually closer to
+        # a real 8+ minute video. Prefer word count among any candidate that
+        # still clears the quality bar, since a too-short video fails the
+        # pre-publish checklist outright while a slightly-lower (but still
+        # acceptable) quality score does not.
+        if not any(a["meets_bar"] for a in attempts):
+            qualified = [a for a in attempts if a["quality"]["score"] >= LF_QUALITY_THRESHOLD]
+            pool = qualified or attempts
+            longest = max(pool, key=lambda a: a["word_count"])
+            if longest["word_count"] > best_word_count:
+                print(
+                    f"[pipeline_longform] switching to the longest acceptable-quality "
+                    f"draft ({longest['word_count']} words, quality "
+                    f"{longest['quality']['score']}) instead of the highest-quality "
+                    f"but shorter draft ({best_word_count} words, quality "
+                    f"{best_quality['score']})"
+                )
+                best_script, best_quality, best_word_count = (
+                    longest["script"], longest["quality"], longest["word_count"],
+                )
 
+    return best_script, best_quality
 
 def compliance_check_longform(script: dict) -> dict:
     """Same lightweight originality/policy sanity check as pipeline.py's
