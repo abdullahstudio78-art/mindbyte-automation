@@ -1,11 +1,13 @@
 name: Publish Video
 
 on:
-  # Daily auto-schedule is disabled for now, at the user's request, while the
-  # first videos are reviewed manually. Re-enable the schedule block below
-  # once the channel owner approves the output quality:
-  #   schedule:
-  #     - cron: '0 14 * * *'
+  # Daily auto-schedule enabled 2026-07-19 - user approved quality after runs
+  # #22 and #23 passed the full pipeline (idea-scoring, storytelling script,
+  # pillar-matched voice/music, pre-publish checklist) and were reviewed and
+  # published by the user. Starting at 1/day per the posting-frequency
+  # research; re-evaluate after 2-3 weeks before considering 2/day.
+  schedule:
+    - cron: '0 14 * * *'
   workflow_dispatch: {}
 
 jobs:
