@@ -1198,7 +1198,13 @@ def log_quality_checklist(
         "Y" if checks.get("tags_ok") else "N",
         ", ".join(result["failed"]) if result["failed"] else "",
     ]
-    sheet_append(access_token, QUALITY_SHEET_TAB, row)
+    try:
+        sheet_append(access_token, QUALITY_SHEET_TAB, row)
+    except Exception as e:  # noqa: BLE001 - logging must never abort the run
+        print(
+            f"[pipeline] could not log to QualityChecklist tab (does it exist "
+            f"in the Sheet yet?): {e}"
+        )
 
 
 # ---------------------------------------------------------------------------
