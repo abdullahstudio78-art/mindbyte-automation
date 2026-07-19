@@ -37,7 +37,6 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 PUBLISH_DELAY_HOURS = 18  # rolling safety delay before a video goes public
-TARGET_CLIP_COUNT = 5
 VIDEO_WIDTH = 1080
 VIDEO_HEIGHT = 1920
 
@@ -168,18 +167,34 @@ def generate_script(topic: str) -> dict:
         You are writing a 45-55 second YouTube Shorts script for a "bite-sized
         facts/trivia" channel called MindByte. The topic is: "{topic}".
 
+        Tone: this must feel like a fast-paced, energetic viral Shorts video,
+        NOT a lecture or documentary voiceover. Write like you're talking
+        excitedly to a friend, not narrating a textbook.
+
         Requirements:
         - The narration must be ORIGINAL: your own wording, framing and
           selection of facts. Do not copy phrasing from any single source.
-        - Hook the viewer in the first sentence.
-        - 5-7 short, punchy sentences suitable for on-screen captions.
-        - End with a memorable closing line (not a generic "thanks for
-          watching").
+        - Hook the viewer HARD in the first sentence (a surprising claim,
+          a question, or a "wait, what?" moment) - not a slow wind-up.
+        - 6-8 short, punchy sentences, each under 12 words. Every sentence
+          should be a single vivid, self-contained beat - short fragments
+          and exclamations are encouraged. Avoid long, explanatory,
+          multi-clause sentences; they read as a lecture, not a Short.
+        - Keep the energy high all the way through, not just the opener -
+          use rhetorical questions, quick reveals, or "but here's the
+          crazy part" style pivots between facts.
+        - End with a punchy, memorable closing line (not a generic "thanks
+          for watching").
         - Also produce: a clickable title (under 90 characters, no
           clickbait lies), a YouTube description (2-3 sentences plus 3
-          relevant hashtags), and 6 short search keywords (2-3 words each)
-          that describe visuals that would pair well with each sentence,
-          suitable for searching a stock video library.
+          relevant hashtags).
+        - Also produce "visual_keywords": an array with EXACTLY the same
+          number of entries as "sentences", in the same order - one 2-3
+          word stock-video search phrase per sentence, describing footage
+          that visually matches THAT specific sentence (not the topic in
+          general). This is critical: each keyword will be used to cut to
+          a new clip exactly when that sentence is spoken, so it must be
+          distinct from its neighbors and concretely tied to that line.
 
         Return ONLY valid JSON with this exact shape:
         {{
@@ -190,7 +205,17 @@ def generate_script(topic: str) -> dict:
         }}
     """).strip()
     raw = call_groq(prompt)
-    return json.loads(raw)
+    data = json.loads(raw)
+    # Defensive: guarantee 1:1 sentence/keyword pairing even if the model
+    # drifts from the requested shape, since assembly depends on it.
+    sentences = data.get("sentences", [])
+    keywords = data.get("visual_keywords", [])
+    if len(keywords) < len(sentences):
+        keywords = keywords + [data.get("title", "")] * (len(sentences) - len(keywords))
+    elif len(keywords) > len(sentences):
+        keywords = keywords[: len(sentences)]
+    data["visual_keywords"] = keywords
+    return data
 
 
 def score_quality(topic: str, script: dict) -> dict:
@@ -275,14 +300,31 @@ def download_file(url: str, dest_path: str) -> None:
             f.write(chunk)
 
 
+FALLBACK_QUERIES = [
+    "nature", "abstract background", "city timelapse", "clouds timelapse",
+    "ocean waves", "forest aerial", "starry sky",
+]
+
+
 def gather_clips(keywords: list, workdir: str) -> list:
+    """Download exactly one clip per keyword, in order.
+
+    A strict 1:1, order-preserving mapping between sentences and clips is
+    required so assemble_video can cut to a new clip exactly when each
+    sentence is spoken, instead of cutting on an unrelated fixed timer.
+    If a specific keyword yields nothing on Pexels, fall back through a
+    rotation of generic queries for that slot rather than skipping it, so
+    the clip count never drifts out of sync with the sentence count.
+    """
     used_ids: set = set()
     clip_paths = []
-    queries = list(keywords) + ["nature", "abstract background", "city timelapse"]
-    for i, query in enumerate(queries):
-        if len(clip_paths) >= TARGET_CLIP_COUNT:
-            break
-        clip = search_pexels_clip(query, used_ids)
+    for i, keyword in enumerate(keywords):
+        clip = search_pexels_clip(keyword, used_ids)
+        if not clip:
+            for fb in FALLBACK_QUERIES:
+                clip = search_pexels_clip(fb, used_ids)
+                if clip:
+                    break
         if not clip:
             continue
         dest = os.path.join(workdir, f"clip_{i}.mp4")
@@ -295,9 +337,14 @@ def gather_clips(keywords: list, workdir: str) -> list:
 # Voiceover (edge-tts) + captions
 # ---------------------------------------------------------------------------
 
-async def _synthesize(text: str, dest_path: str, voice: str = "en-US-AriaNeural") -> None:
+async def _synthesize(text: str, dest_path: str, voice: str = "en-US-AriaNeural",
+                       rate: str = "+15%", pitch: str = "+3Hz") -> None:
     import edge_tts
-    communicate = edge_tts.Communicate(text, voice)
+    # A faster rate and a slightly raised pitch push the narration away
+    # from a flat, lecture-like delivery toward the punchier, higher-energy
+    # pace typical of Shorts (user feedback: first cut "sounded like a
+    # lecture"). Paired with the punchier/shorter script prompt above.
+    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
     await communicate.save(dest_path)
 
 
@@ -316,9 +363,20 @@ def ffprobe_duration(path: str) -> float:
     return float(out.stdout.strip())
 
 
-def build_srt(sentences: list, total_duration: float, dest_path: str) -> None:
+def compute_segment_durations(sentences: list, total_duration: float) -> list:
+    """Split total narration duration across sentences by word-count share.
+
+    Used for BOTH the caption timing and the video-clip cut timing, so a
+    new clip appears on screen at exactly the moment the caption changes -
+    this is what makes cuts feel intentional and paced with the narration
+    instead of landing on an arbitrary fixed timer.
+    """
     word_counts = [max(len(s.split()), 1) for s in sentences]
     total_words = sum(word_counts)
+    return [total_duration * (wc / total_words) for wc in word_counts]
+
+
+def build_srt(sentences: list, segment_durations: list, dest_path: str) -> None:
     t = 0.0
 
     def fmt(ts: float) -> str:
@@ -329,8 +387,7 @@ def build_srt(sentences: list, total_duration: float, dest_path: str) -> None:
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
     lines = []
-    for i, (sentence, wc) in enumerate(zip(sentences, word_counts), start=1):
-        dur = total_duration * (wc / total_words)
+    for i, (sentence, dur) in enumerate(zip(sentences, segment_durations), start=1):
         start, end = t, t + dur
         t = end
         lines.append(str(i))
@@ -345,17 +402,19 @@ def build_srt(sentences: list, total_duration: float, dest_path: str) -> None:
 # ffmpeg assembly
 # ---------------------------------------------------------------------------
 
-def assemble_video(clip_paths: list, audio_path: str, srt_path: str, output_path: str) -> None:
-    audio_duration = ffprobe_duration(audio_path)
-    per_clip = audio_duration / len(clip_paths)
-
+def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
+                    srt_path: str, output_path: str) -> None:
+    # Each clip is trimmed to the duration of the sentence it illustrates
+    # (see compute_segment_durations), so cuts land exactly on sentence
+    # boundaries instead of an even, content-blind split. zip() naturally
+    # trims to the shorter list in the rare case a clip slot was unfilled.
     workdir = os.path.dirname(output_path)
     normalized = []
-    for i, clip in enumerate(clip_paths):
+    for i, (clip, dur) in enumerate(zip(clip_paths, segment_durations)):
         norm_path = os.path.join(workdir, f"norm_{i}.mp4")
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", clip, "-t", f"{per_clip:.3f}",
+                "ffmpeg", "-y", "-i", clip, "-t", f"{dur:.3f}",
                 "-vf",
                 f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
                 f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},fps=30,setsar=1",
@@ -379,10 +438,16 @@ def assemble_video(clip_paths: list, audio_path: str, srt_path: str, output_path
     )
 
     srt_escaped = srt_path.replace(":", r"\:")
+    # PlayResX/PlayResY are set explicitly because without them libass has
+    # to guess the script resolution, which previously made captions render
+    # far from where FontSize/MarginV intended (reported as captions
+    # appearing in the middle of the screen instead of the lower third).
+    # FontSize is sized relative to the real 1080x1920 output (13 was a
+    # leftover from an unscaled default and was nearly invisible/mispositioned).
     subtitle_style = (
-        "FontName=Arial,FontSize=13,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BorderStyle=1,Outline=2,"
-        "Alignment=2,MarginV=120"
+        f"FontName=Arial,Bold=1,FontSize=68,PrimaryColour=&H00FFFFFF,"
+        f"OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,"
+        f"Alignment=2,MarginV=220,PlayResX={VIDEO_WIDTH},PlayResY={VIDEO_HEIGHT}"
     )
     subprocess.run(
         [
@@ -486,11 +551,15 @@ def main() -> None:
         generate_voiceover(script["sentences"], audio_path)
         audio_duration = ffprobe_duration(audio_path)
 
+        # Computed once and shared by captions + clip cuts, so a new clip
+        # appears on screen at exactly the moment the caption changes.
+        segment_durations = compute_segment_durations(script["sentences"], audio_duration)
+
         srt_path = os.path.join(workdir, "captions.srt")
-        build_srt(script["sentences"], audio_duration, srt_path)
+        build_srt(script["sentences"], segment_durations, srt_path)
 
         output_path = os.path.join(workdir, "final.mp4")
-        assemble_video(clip_paths, audio_path, srt_path, output_path)
+        assemble_video(clip_paths, segment_durations, audio_path, srt_path, output_path)
 
         publish_at = datetime.now(timezone.utc) + timedelta(hours=PUBLISH_DELAY_HOURS)
         video_id = upload_to_youtube(
