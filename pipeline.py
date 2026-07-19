@@ -844,6 +844,79 @@ def build_title_card(dest_path: str, title: str, pillar: str) -> None:
     img.save(dest_path)
 
 
+def build_thumbnail(dest_path: str, title: str, pillar: str) -> None:
+    """Generates a custom branded thumbnail/cover frame for the Short,
+    uploaded after the video goes live via set_youtube_thumbnail().
+    Distinct from build_title_card() (a brief in-video intro) - weighted
+    toward a large, bold curiosity-driving title plus a simple pointing
+    accent device. Borrowed as a PRINCIPLE only (never a copy) from the
+    competitor research: TED-Ed's consistent color-block thumbnail
+    template and Kurzgesagt's pointing-arrow device. A missing custom
+    thumbnail/cover treatment was flagged as the single biggest, most
+    obvious first-frame gap versus the researched competitor channels -
+    this is the phase-3 follow-up fix for that gap."""
+    width, height = VIDEO_WIDTH, VIDEO_HEIGHT
+    img = Image.new("RGB", (width, height), BRAND_BG_TOP)
+    draw = ImageDraw.Draw(img)
+    for y in range(height):
+        f = y / height
+        r = int(BRAND_BG_TOP[0] + (BRAND_BG_BOTTOM[0] - BRAND_BG_TOP[0]) * f)
+        g = int(BRAND_BG_TOP[1] + (BRAND_BG_BOTTOM[1] - BRAND_BG_TOP[1]) * f)
+        b = int(BRAND_BG_TOP[2] + (BRAND_BG_BOTTOM[2] - BRAND_BG_TOP[2]) * f)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+    accent = PILLAR_ACCENT_COLORS.get(pillar, (255, 255, 255))
+
+    title_font = _brand_font(int(width * 0.11))
+    words = title.split()
+    lines, cur = [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if draw.textbbox((0, 0), trial, font=title_font)[2] > width * 0.86 and cur:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    lines = lines[:3]
+
+    line_h = int(width * 0.135)
+    block_h = line_h * len(lines)
+    ty = int(height * 0.40) - block_h // 2
+    for line in lines:
+        lb = draw.textbbox((0, 0), line, font=title_font)
+        lw = lb[2] - lb[0]
+        draw.text((width / 2 - lw / 2, ty), line, font=title_font, fill=(255, 255, 255))
+        ty += line_h
+
+    bar_y = ty + 10
+    bar_w = int(width * 0.30)
+    draw.rectangle([width / 2 - bar_w / 2, bar_y, width / 2 + bar_w / 2, bar_y + 8], fill=accent)
+
+    ax = int(width * 0.5)
+    ay = bar_y + int(height * 0.05)
+    arrow_size = int(width * 0.05)
+    draw.polygon(
+        [
+            (ax - arrow_size, ay),
+            (ax + arrow_size, ay),
+            (ax, ay + int(arrow_size * 1.3)),
+        ],
+        fill=accent,
+    )
+
+    logo_cy = int(height * 0.88)
+    logo_cx = int(width * 0.40)
+    logo_r = width * 0.035
+    _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
+    small_font = _brand_font(int(width * 0.045))
+    draw.text((logo_cx + logo_r + 14, logo_cy - int(width * 0.028)), BRAND_NAME,
+              font=small_font, fill=BRAND_TEXT_COLOR)
+
+    img.save(dest_path)
+
+
 def fetch_background_music(dest_path: str, pillar: str) -> dict | None:
     """Best-effort fetch of a free, commercially-licensed instrumental track
     from Openverse (aggregates Jamendo, Free Music Archive, etc. - no API
@@ -1146,6 +1219,7 @@ def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
         "Style: Caption,Liberation Sans,74,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,3,2,2,60,60,420,1\n"
+        "Style: Hook,Liberation Sans,92,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,1,0,0,0,100,100,0,0,1,4,3,2,50,50,420,1\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -1176,6 +1250,7 @@ def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
 
     events = []
     cursor = 0.0
+    is_first_chunk_overall = True
     for sentence, duration in zip(sentences, segment_durations):
         words = sentence.split()
         if not words:
@@ -1187,14 +1262,22 @@ def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
         t = cursor
         for chunk, clen in zip(chunks, chunk_lens):
             chunk_dur = duration * (clen / total_len) if total_len else duration / len(chunks)
-            chunk_dur = max(chunk_dur, 0.28)
+            # The opening hook chunk gets a bigger, bolder "Hook" style and
+            # a slightly longer minimum hold than the rest of the chunked
+            # captions, so the curiosity-driving first words land clearly
+            # as a real visual hook cue instead of flashing by identically
+            # to every other caption chunk (phase-3 review follow-up).
+            style_name = "Hook" if is_first_chunk_overall else "Caption"
+            min_dur = 0.45 if is_first_chunk_overall else 0.28
+            chunk_dur = max(chunk_dur, min_dur)
             start = t
             end = min(t + chunk_dur, cursor + duration)
             text = _highlight_ass_text(" ".join(chunk))
             events.append(
-                f"Dialogue: 0,{_fmt_time(start)},{_fmt_time(end)},Caption,,0,0,0,,{text}"
+                f"Dialogue: 0,{_fmt_time(start)},{_fmt_time(end)},{style_name},,0,0,0,,{text}"
             )
             t = end
+            is_first_chunk_overall = False
         cursor += duration
 
     with open(dest_path, "w", encoding="utf-8") as f:
@@ -1359,6 +1442,27 @@ REQUIRED_HEIGHT = 1920
 QUALITY_SHEET_TAB = "QualityChecklist!A:N"
 
 
+def set_youtube_thumbnail(access_token: str, video_id: str, thumbnail_path: str) -> None:
+    """Uploads a custom branded thumbnail for the given video via
+    YouTube's thumbnails.set endpoint. Called only after the video
+    itself has already uploaded successfully - any failure here (a
+    transient API error, or custom-thumbnail eligibility not fully
+    propagated on the channel yet) is caught by the caller in main()
+    and must never be treated as a reason the whole run failed."""
+    with open(thumbnail_path, "rb") as f:
+        image_bytes = f.read()
+    headers = google_headers(access_token)
+    headers["Content-Type"] = "image/png"
+    resp = SESSION.post(
+        "https://www.googleapis.com/upload/youtube/v3/thumbnails/set",
+        params={"videoId": video_id},
+        headers=headers,
+        data=image_bytes,
+        timeout=60,
+    )
+    resp.raise_for_status()
+
+
 def ffprobe_video_info(path: str) -> dict:
     """Technical sanity-check on the final assembled video: resolution,
     duration, and whether an audio stream actually made it into the file.
@@ -1421,6 +1525,27 @@ def run_prepublish_checklist(
     }
 
 
+def ensure_sheet_tab(access_token: str, tab_name: str, header_row: list) -> bool:
+    """Best-effort self-heal: creates the named Sheet tab (plus a header
+    row) if it doesn't exist yet, so a logging function that hits a 400
+    doesn't just print the same warning forever - it can fix the gap the
+    first time it's hit. Returns True if the tab now exists (freshly
+    created), False if creation itself failed, in which case the caller
+    falls back to its original warning."""
+    try:
+        resp = SESSION.post(
+            f"{SHEETS_BASE}:batchUpdate",
+            headers=google_headers(access_token),
+            json={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return False
+        sheet_append(access_token, f"{tab_name}!A:Z", header_row)
+        return True
+    except Exception:
+        return False
+
 def log_quality_checklist(
     access_token: str, topic: str, pillar: str, result: dict, video_id: str = "",
 ) -> None:
@@ -1447,10 +1572,23 @@ def log_quality_checklist(
     try:
         sheet_append(access_token, QUALITY_SHEET_TAB, row)
     except Exception as e:  # noqa: BLE001 - logging must never abort the run
-        print(
-            f"[pipeline] could not log to QualityChecklist tab (does it exist "
-            f"in the Sheet yet?): {e}"
-        )
+        header = [
+            "Timestamp", "VideoID", "Topic", "Pillar", "OverallResult",
+            "HookOK", "IdeaScoreOK", "ScriptQualityOK", "ComplianceOK",
+            "DurationOK", "ResolutionOK", "AudioOK", "TagsOK", "FailedChecks",
+        ]
+        healed = False
+        try:
+            healed = ensure_sheet_tab(access_token, "QualityChecklist", header)
+            if healed:
+                sheet_append(access_token, QUALITY_SHEET_TAB, row)
+        except Exception:
+            healed = False
+        if not healed:
+            print(
+                f"[pipeline] could not log to QualityChecklist tab (does it exist "
+                f"in the Sheet yet?): {e}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1538,6 +1676,13 @@ def main() -> None:
             title_card_path = None
             watermark_path = None
 
+        thumbnail_path = os.path.join(workdir, "thumbnail.png")
+        try:
+            build_thumbnail(thumbnail_path, script["title"], pillar)
+        except Exception as e:  # noqa: BLE001 - thumbnail must never abort the run
+            print(f"[pipeline] thumbnail generation failed, continuing without a custom thumbnail: {e}")
+            thumbnail_path = None
+
         ass_path = os.path.join(workdir, "captions.ass")
         build_ass(script["sentences"], segment_durations, ass_path)
 
@@ -1563,6 +1708,13 @@ def main() -> None:
             script["tags"], publish_at.isoformat(),
         )
         print(f"[pipeline] uploaded video id: {video_id}")
+
+        if thumbnail_path:
+            try:
+                set_youtube_thumbnail(access_token, video_id, thumbnail_path)
+                print("[pipeline] custom branded thumbnail set")
+            except Exception as e:  # noqa: BLE001 - thumbnail upload must never abort the run
+                print(f"[pipeline] could not set custom thumbnail: {e}")
 
     sheet_row_base[0] = video_id
     sheet_row_base[3] = "Scheduled"
