@@ -48,6 +48,8 @@ import tempfile
 import textwrap
 from datetime import datetime, timedelta, timezone
 
+from PIL import Image, ImageDraw
+
 from pipeline import (
     # Config / shared session
     PEXELS_API_KEY,
@@ -82,6 +84,18 @@ from pipeline import (
     # YouTube upload + technical video probing (format-agnostic)
     upload_to_youtube,
     ffprobe_video_info,
+    set_youtube_thumbnail,
+    # Branding (Phase 4 polish pass, 2026-07-20) - landscape title
+    # card/thumbnail built locally in this module, but the shared
+    # low-level drawing helpers and brand constants are reused as-is
+    PILLAR_ACCENT_COLORS,
+    BRAND_BG_TOP,
+    BRAND_BG_BOTTOM,
+    BRAND_TEXT_COLOR,
+    BRAND_NAME,
+    _brand_font,
+    _draw_logo_mark,
+    build_watermark_png,
 )
 
 # ---------------------------------------------------------------------------
@@ -126,6 +140,10 @@ LF_REQUIRED_HEIGHT = LF_VIDEO_HEIGHT
 LF_VIDEOS_SHEET_TAB = "LongformVideos!A:N"
 LF_CHECKLIST_SHEET_TAB = "LongformChecklist!A:O"
 
+# Phase 4 polish pass (2026-07-20): a beat longer than Shorts' 1.1s title
+# card, proportionate to an 8+ minute video instead of a 60s Short.
+LF_TITLE_CARD_SECONDS = 2.2
+
 FORBIDDEN_HOOK_OPENERS = [
     "welcome back", "today we will discuss", "did you know",
     "in this video", "hey guys", "hey everyone", "what's up guys",
@@ -145,6 +163,20 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "") -> dic
     """Generate a long-form (8-15 min) documentary-style script as a list of
     PARAGRAPHS rather than individual sentences (see module docstring for
     why - this drives paragraph-level TTS/B-roll chunking downstream).
+
+    Rewritten 2026-07-20 (Phase 4 polish pass) after the first real upload
+    ("Why Embarrassing Moments Last") was watched end to end and critiqued:
+    the script cleared every quality/word-count gate but still read as a
+    flat explainer essay rather than a story - it never built tension
+    paragraph to paragraph, and the closing paragraph was a generic
+    "in conclusion, X is a multifaceted phenomenon influenced by a range of
+    psychological, social, and emotional factors" sentence that didn't
+    resolve anything or call back to the opening hook. This version adds an
+    explicit STORY ARC requirement and a much stricter closing-paragraph
+    spec, plus tighter visual_keywords guidance after the same review found
+    several B-roll mismatches (a crying-emoji cartoon, an abstract
+    kaleidoscope, a yoga class) that read as loose keyword matches rather
+    than deliberate choices.
     """
     feedback_block = ""
     if feedback:
@@ -161,27 +193,35 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "") -> dic
     You are the writer for MindByte, a YouTube channel about why humans
     think, feel and behave the way they do. This is a LONG-FORM video
     (8-15 minutes), not a Short - it should feel like a psychology
-    documentary essay: one throughline topic explored in real depth, with
-    multiple angles, examples, and a satisfying arc - NOT a padded-out
-    Short, NOT a listicle, NOT a low-effort AI content farm.
+    documentary essay, positioned as a documentary essay channel - NOT a
+    generic facts channel, listicle, or low-effort AI content farm.
 
-    Topic: "{topic}", from the "{pillar}" pillar. Tone for this pillar: {tone}.
-    {feedback_block}
-    STRUCTURE - write this as a sequence of PARAGRAPHS (a documentary essay,
-    not a bullet list):
-    1. OPENING paragraph - a strong hook, then frame the human question
-       this video will actually answer.
-    2. Several BODY paragraphs (the bulk of the video) - each one should
-       explore a distinct facet, mechanism, example, or turn in the story:
-       start with the relatable problem, build curiosity, explain the
-       psychological "why" with real depth, ground it in a concrete
-       example or scenario. Vary the angle paragraph to paragraph so no
-       two paragraphs just restate the same point.
-    3. A closing paragraph with one memorable, quotable takeaway, and a
-       brief, natural mention of the channel name "MindByte" inviting the
-       viewer to keep watching/subscribe if the channel resonates with
-       them - phrased originally, never a generic "smash that like
-       button" / "don't forget to subscribe" line.
+    STORY ARC - this is the most important structural requirement. Do not
+    write a list of separate facts about the topic. Write ONE continuous
+    story with a real shape:
+    1. An OPENING paragraph (the hook) that raises a specific, concrete
+       question or tension the rest of the video will resolve.
+    2. Several BODY paragraphs that ESCALATE - each one should go deeper
+       or raise the stakes/curiosity higher than the one before it (a
+       surprising mechanism, then a sharper example, then a twist or a
+       counter-intuitive angle), building toward a turning point roughly
+       three-quarters of the way through, rather than presenting
+       disconnected facts in any order. Vary the angle paragraph to
+       paragraph so no two paragraphs just restate the same point.
+    3. A CLOSING paragraph that resolves the opening hook - it must
+       explicitly call back to the specific question or tension raised in
+       paragraph 1 and land on ONE concrete, memorable final image, line,
+       or insight the viewer will remember. This is a hard requirement:
+       do NOT end on a generic academic-summary sentence. Never use
+       phrasing like "multifaceted phenomenon", "influenced by a range
+       of", "in conclusion", "to sum up", "in summary", or any sentence
+       that could be pasted onto a completely different topic without
+       changing the meaning - if the closing sentence would still make
+       sense with the topic swapped out, it is too generic and must be
+       rewritten. Include a brief, natural mention of the channel name
+       "MindByte" inviting the viewer to keep watching/subscribe if the
+       channel resonates with them - phrased originally, never a generic
+       "smash that like button" / "don't forget to subscribe" line.
 
     HOOK RULES - the opening paragraph's first sentence decides whether
     anyone stays: never start with "Welcome back", "Today we will
@@ -206,10 +246,12 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "") -> dic
       before finalizing - under {LF_MIN_WORDS} words is a failed response.
       If you're unsure whether you've written enough, add another body
       paragraph exploring a fresh angle rather than stopping early.
-    - Keep a documentary pace: confident, a little suspenseful in places,
-      never robotic or list-like. The throughline must read as ONE
-      coherent exploration of a psychological question, not disconnected
-      facts stitched together.
+    - Keep a documentary pace: confident, and increasingly tense or
+      suspenseful as the story builds toward its turning point - never
+      robotic, never list-like, and never the same flat energy from the
+      first paragraph to the last. The throughline must read as ONE
+      coherent story with rising stakes, not disconnected facts stitched
+      together.
     - Choose genuinely interesting angles and, where natural, reference
       real, well-known psychological concepts or classic findings (in
       your own words - do not quote any source verbatim).
@@ -223,10 +265,22 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "") -> dic
       the channel name "MindByte").
     - Each paragraph object must include "visual_keywords": an array of
       3-4 short (2-3 word) stock-video search phrases for REAL,
-      human-centric, emotionally matching footage that fits THAT
-      paragraph specifically (facial expressions, real-life situations,
-      people in relatable moments - avoid abstract queries like "brain
-      neurons" unless the paragraph is literally about brain anatomy).
+      human-centric, LITERAL footage that matches what THAT paragraph is
+      actually describing (a specific person doing a specific relatable
+      action, a real setting, a real object) - never a cartoon, emoji,
+      illustration, clip-art, kaleidoscope, or other abstract/symbolic
+      motion-graphic query, and never a generic mood word on its own
+      (like just "embarrassment" or "loop") that could return an
+      unrelated abstract clip. If a paragraph is about a feeling or
+      mechanism rather than a literal scene, describe a concrete everyday
+      moment that captures it instead (e.g. for a paragraph about a
+      mental loop, search for someone replaying a memory/pacing/lost in
+      thought - not an abstract pattern).
+
+    {tone}
+    {feedback_block}
+
+    Topic: {topic} (pillar: {pillar})
 
     Return ONLY valid JSON with this exact shape:
     {{
@@ -255,9 +309,10 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "") -> dic
         # Fall back to a flattened set of visual keywords rather than
         # crashing upload on a missing "tags" field.
         flat_kw = [kw for p in paragraphs for kw in p.get("visual_keywords", [])]
-        data["tags"] = flat_kw[:15] or [topic]
+        data["tags"] = flat_kw[:15] if flat_kw else [topic, "MindByte", "psychology"]
 
     return data
+
 
 
 def score_longform_quality(topic: str, pillar: str, script: dict) -> dict:
@@ -710,19 +765,158 @@ def build_ass_longform(paragraphs: list, segment_durations: list, dest_path: str
 # Video assembly - landscape, multiple clips per paragraph
 # ---------------------------------------------------------------------------
 
+def build_title_card_longform(dest_path: str, title: str, pillar: str) -> None:
+    """Landscape (1920x1080) counterpart to pipeline.py's build_title_card()
+    (which is sized for a portrait Short) - same brand gradient/logo/
+    wordmark treatment, laid out for a wide frame instead of a tall one.
+    Added in the Phase 4 polish pass (2026-07-20): the long-form pipeline's
+    first real upload ("Why Embarrassing Moments Last") had zero opening
+    branding at all, unlike every Shorts upload - this closes that gap."""
+    width, height = LF_VIDEO_WIDTH, LF_VIDEO_HEIGHT
+    img = Image.new("RGB", (width, height), BRAND_BG_TOP)
+    draw = ImageDraw.Draw(img)
+    for y in range(height):
+        t = y / height
+        r = int(BRAND_BG_TOP[0] + (BRAND_BG_BOTTOM[0] - BRAND_BG_TOP[0]) * t)
+        g = int(BRAND_BG_TOP[1] + (BRAND_BG_BOTTOM[1] - BRAND_BG_TOP[1]) * t)
+        b = int(BRAND_BG_TOP[2] + (BRAND_BG_BOTTOM[2] - BRAND_BG_TOP[2]) * t)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+    accent = PILLAR_ACCENT_COLORS.get(pillar, (255, 255, 255))
+    logo_cy = int(height * 0.26)
+    logo_r = height * 0.11
+    _draw_logo_mark(draw, width / 2, logo_cy, logo_r, color=(255, 255, 255))
+
+    wordmark_font = _brand_font(int(height * 0.095))
+    wm_bbox = draw.textbbox((0, 0), BRAND_NAME, font=wordmark_font)
+    wm_w = wm_bbox[2] - wm_bbox[0]
+    draw.text((width / 2 - wm_w / 2, logo_cy + logo_r + int(height * 0.03)), BRAND_NAME,
+              font=wordmark_font, fill=BRAND_TEXT_COLOR)
+
+    bar_y = int(height * 0.60)
+    bar_w = int(width * 0.14)
+    draw.rectangle([width / 2 - bar_w / 2, bar_y, width / 2 + bar_w / 2, bar_y + 6], fill=accent)
+
+    title_font = _brand_font(int(height * 0.075))
+    words = title.split()
+    lines, cur = [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if draw.textbbox((0, 0), trial, font=title_font)[2] > width * 0.72 and cur:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    lines = lines[:2]
+    line_h = int(height * 0.10)
+    ty = bar_y + 30
+    for line in lines:
+        lb = draw.textbbox((0, 0), line, font=title_font)
+        lw = lb[2] - lb[0]
+        draw.text((width / 2 - lw / 2, ty), line, font=title_font, fill=(255, 255, 255))
+        ty += line_h
+
+    img.save(dest_path)
+
+
+def build_thumbnail_longform(dest_path: str, title: str, pillar: str) -> None:
+    """Landscape (1920x1080) counterpart to pipeline.py's build_thumbnail().
+    Long-form had NO custom thumbnail at all before this pass - YouTube was
+    auto-picking a random mid-video frame with illegible baked-in caption
+    text as the cover image, the single biggest gap flagged when the first
+    real long-form upload was reviewed."""
+    width, height = LF_VIDEO_WIDTH, LF_VIDEO_HEIGHT
+    img = Image.new("RGB", (width, height), BRAND_BG_TOP)
+    draw = ImageDraw.Draw(img)
+    for y in range(height):
+        f = y / height
+        r = int(BRAND_BG_TOP[0] + (BRAND_BG_BOTTOM[0] - BRAND_BG_TOP[0]) * f)
+        g = int(BRAND_BG_TOP[1] + (BRAND_BG_BOTTOM[1] - BRAND_BG_TOP[1]) * f)
+        b = int(BRAND_BG_TOP[2] + (BRAND_BG_BOTTOM[2] - BRAND_BG_TOP[2]) * f)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+    accent = PILLAR_ACCENT_COLORS.get(pillar, (255, 255, 255))
+
+    title_font = _brand_font(int(height * 0.16))
+    words = title.split()
+    lines, cur = [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if draw.textbbox((0, 0), trial, font=title_font)[2] > width * 0.86 and cur:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    lines = lines[:3]
+
+    line_h = int(height * 0.185)
+    block_h = line_h * len(lines)
+    ty = int(height * 0.42) - block_h // 2
+    for line in lines:
+        lb = draw.textbbox((0, 0), line, font=title_font)
+        lw = lb[2] - lb[0]
+        draw.text((width / 2 - lw / 2, ty), line, font=title_font, fill=(255, 255, 255))
+        ty += line_h
+
+    bar_y = ty + 14
+    bar_w = int(width * 0.22)
+    draw.rectangle([width / 2 - bar_w / 2, bar_y, width / 2 + bar_w / 2, bar_y + 8], fill=accent)
+
+    ax = int(width * 0.5)
+    ay = bar_y + int(height * 0.05)
+    arrow_size = int(width * 0.028)
+    draw.polygon(
+        [
+            (ax - arrow_size, ay),
+            (ax + arrow_size, ay),
+            (ax, ay + int(arrow_size * 1.3)),
+        ],
+        fill=accent,
+    )
+
+    logo_cy = int(height * 0.90)
+    logo_cx = int(width * 0.42)
+    logo_r = width * 0.02
+    _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
+    small_font = _brand_font(int(height * 0.05))
+    draw.text((logo_cx + logo_r + 14, logo_cy - int(height * 0.028)), BRAND_NAME,
+              font=small_font, fill=BRAND_TEXT_COLOR)
+
+    img.save(dest_path)
+
+
 def assemble_video_longform(clip_groups: list, segment_durations: list, audio_path: str,
-                             ass_path: str, output_path: str) -> None:
+                             ass_path: str, output_path: str,
+                             title_card_path: str = None, watermark_path: str = None) -> None:
     """Each paragraph's real measured audio duration is divided evenly
     across that paragraph's B-roll clips (clip_groups[i]), so a paragraph
     with 3 clips gets 3 roughly-equal slices covering its exact duration,
     instead of one clip stretched or looped awkwardly to fill a much
     longer paragraph than a single Pexels clip typically runs.
+
+    Updated 2026-07-20 (Phase 4 polish pass): accepts an optional branded
+    title_card_path/watermark_path (composited via ffmpeg overlay, same
+    technique as pipeline.py's assemble_video() - verified locally first
+    with a synthetic render before this went live: the title card image is
+    fed in as a short, non-looped -t-bounded input so overlay(eof_action=
+    pass) stops applying it once its own duration ends, and the watermark
+    image is looped for the whole output so it persists throughout; total
+    output duration is unaffected either way, confirmed via ffprobe on the
+    test render). Also varies the per-paragraph B-roll cut rate (shorter,
+    more frequent slices in the back half of the video than the front
+    half) - a direct response to user feedback that a full episode felt
+    monotone at one flat pace throughout.
     """
     workdir = os.path.dirname(output_path)
     normalized = []
     idx = 0
     last_good_clip = None
-    for clips, dur in zip(clip_groups, segment_durations):
+    total_paragraphs = len(clip_groups)
+    for para_idx, (clips, dur) in enumerate(zip(clip_groups, segment_durations)):
         if not clips:
             # A paragraph with zero B-roll clips used to be silently
             # dropped from the video track here, while its narration
@@ -738,10 +932,18 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
             print("[pipeline_longform] warning: a paragraph has zero B-roll clips - reusing the previous paragraph's clip so its runtime isn't dropped")
             clips = [last_good_clip]
         n = len(clips)
-        # Never cut a slice shorter than LF_MIN_CLIP_SLICE_SEC - if the
-        # even split would go below that floor, reduce how many of this
-        # paragraph's clips actually get used instead.
-        max_slices = max(1, int(dur // LF_MIN_CLIP_SLICE_SEC))
+        # Pacing variation: bias toward more, shorter cuts in the back half
+        # of the video than the front half, instead of one flat, even
+        # rhythm for the whole runtime - front-loaded paragraphs (setup)
+        # get slightly longer holds, later paragraphs (rising tension
+        # toward the turning point) get cut faster.
+        position = para_idx / max(1, total_paragraphs - 1)
+        slice_floor = LF_MIN_CLIP_SLICE_SEC * (1.25 - 0.5 * position)
+        slice_floor = max(2.2, slice_floor)
+        # Never cut a slice shorter than slice_floor - if the even split
+        # would go below that floor, reduce how many of this paragraph's
+        # clips actually get used instead.
+        max_slices = max(1, int(dur // slice_floor))
         n = min(n, max_slices)
         clips = clips[:n]
         slice_dur = dur / n
@@ -783,19 +985,42 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
         "font=Arial:box=1:boxcolor=black@0.45:boxborderw=14:"
         f"x=(w-text_w)/2:y=60:enable='gte(t\\,{follow_from:.3f})'"
     )
+    base_filter = f"subtitles={ass_escaped},{follow_overlay}"
 
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", silent_video, "-i", audio_path,
-            "-vf", f"subtitles={ass_escaped},{follow_overlay}",
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            "-c:a", "aac", "-b:a", "192k", "-shortest",
-            output_path,
-        ],
-        check=True, capture_output=True,
-    )
+    cmd = ["ffmpeg", "-y", "-i", silent_video, "-i", audio_path]
+    if title_card_path and watermark_path:
+        cmd += ["-loop", "1", "-t", f"{LF_TITLE_CARD_SECONDS}", "-i", title_card_path,
+                "-loop", "1", "-i", watermark_path]
+        filter_complex = (
+            f"[0:v]{base_filter}[capped];"
+            "[capped][2:v]overlay=eof_action=pass[withtitle];"
+            "[withtitle][3:v]overlay=x=40:y=40[outv]"
+        )
+        cmd += ["-filter_complex", filter_complex, "-map", "[outv]", "-map", "1:a:0"]
+    elif title_card_path:
+        cmd += ["-loop", "1", "-t", f"{LF_TITLE_CARD_SECONDS}", "-i", title_card_path]
+        filter_complex = (
+            f"[0:v]{base_filter}[capped];"
+            "[capped][2:v]overlay=eof_action=pass[outv]"
+        )
+        cmd += ["-filter_complex", filter_complex, "-map", "[outv]", "-map", "1:a:0"]
+    elif watermark_path:
+        cmd += ["-loop", "1", "-i", watermark_path]
+        filter_complex = (
+            f"[0:v]{base_filter}[capped];"
+            "[capped][2:v]overlay=x=40:y=40[outv]"
+        )
+        cmd += ["-filter_complex", filter_complex, "-map", "[outv]", "-map", "1:a:0"]
+    else:
+        cmd += ["-vf", base_filter, "-map", "0:v:0", "-map", "1:a:0"]
+
+    cmd += [
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-c:a", "aac", "-b:a", "192k", "-shortest",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
 
 
 # ---------------------------------------------------------------------------
@@ -958,8 +1183,27 @@ def main() -> None:
         ass_path = os.path.join(workdir, "captions_lf.ass")
         build_ass_longform(script["paragraphs"], segment_durations, ass_path)
 
+        # Phase 4 polish pass (2026-07-20): branded title card + persistent
+        # watermark, ported from the Shorts pipeline - the first real
+        # long-form upload had neither. Best-effort: any failure here
+        # must never abort the run, same pattern as pipeline.py's main().
+        title_card_path = None
+        watermark_path = None
+        try:
+            title_card_path = os.path.join(workdir, "title_card_lf.png")
+            build_title_card_longform(title_card_path, script["title"], pillar)
+            watermark_path = os.path.join(workdir, "watermark_lf.png")
+            build_watermark_png(watermark_path)
+        except Exception as e:  # noqa: BLE001 - branding is a bonus, never abort the run
+            print(f"[pipeline_longform] branding overlay generation failed, continuing without it: {e}")
+            title_card_path = None
+            watermark_path = None
+
         output_path = os.path.join(workdir, "final_lf.mp4")
-        assemble_video_longform(clip_groups, segment_durations, final_audio_path, ass_path, output_path)
+        assemble_video_longform(
+            clip_groups, segment_durations, final_audio_path, ass_path, output_path,
+            title_card_path=title_card_path, watermark_path=watermark_path,
+        )
 
         checklist = run_prepublish_checklist_longform(
             topic, pillar, script, quality, compliance, idea_score_avg, output_path,
@@ -980,6 +1224,17 @@ def main() -> None:
             script["tags"], publish_at.isoformat(),
         )
         print(f"[pipeline_longform] uploaded video id: {video_id}")
+
+        # Phase 4 polish pass (2026-07-20): custom branded thumbnail,
+        # ported from the Shorts pipeline - long-form had none before this
+        # and was relying on a random auto-picked video frame as its cover.
+        try:
+            thumb_path = os.path.join(workdir, "thumbnail_lf.png")
+            build_thumbnail_longform(thumb_path, script["title"], pillar)
+            set_youtube_thumbnail(access_token, video_id, thumb_path)
+            print("[pipeline_longform] custom branded thumbnail set")
+        except Exception as e:  # noqa: BLE001 - thumbnail is a bonus, never abort the run
+            print(f"[pipeline_longform] custom thumbnail upload failed, continuing: {e}")
 
         sheet_row_base[0] = video_id
         sheet_row_base[3] = "Scheduled"
