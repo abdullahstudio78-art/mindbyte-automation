@@ -131,6 +131,7 @@ PARAGRAPH_GAP_MS = 550        # a bigger beat than Shorts' 220ms SENTENCE_GAP_MS
 
 LF_MAX_CLIPS_PER_PARAGRAPH = 4  # caps Pexels calls/video - see module docstring
 LF_MIN_CLIP_SLICE_SEC = 3.5     # never cut a B-roll slice shorter than this
+LF_CAPTION_WORDS_PER_CHUNK = 3  # modern word-chunk captions (2026-07-21 restyle)
 
 LF_MIN_VIDEO_DURATION_SEC = 480   # 8 minutes
 LF_MAX_VIDEO_DURATION_SEC = 920   # ~15.3 minutes (small margin over 15:00)
@@ -759,7 +760,7 @@ def build_ass_longform(paragraphs: list, segment_durations: list, dest_path: str
         "\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Caption,Arial,58,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,3,1,2,120,120,90,1\n"
+                "Style: Caption,Arial,78,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,1,0,1,4,1,2,120,120,96,1\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -775,10 +776,20 @@ def build_ass_longform(paragraphs: list, segment_durations: list, dest_path: str
         cursor = p_start
         for sentence, wc in zip(sentences, word_counts):
             share = dur * (wc / total_words)
-            start, end = cursor, min(cursor + share, p_end)
-            cursor = end
-            text = _highlight_ass_text(sentence.strip())
-            lines.append(f"Dialogue: 0,{fmt(start)},{fmt(end)},Caption,,0,0,0,,{text}")
+            s_start, s_end = cursor, min(cursor + share, p_end)
+            cursor = s_end
+            words = sentence.strip().split() or [sentence.strip()]
+            n = LF_CAPTION_WORDS_PER_CHUNK
+            chunks = [words[k:k + n] for k in range(0, len(words), n)]
+            c_cursor = s_start
+            for chunk in chunks:
+                c_share = (s_end - s_start) * (len(chunk) / len(words))
+                c_start, c_end = c_cursor, min(c_cursor + c_share, s_end)
+                c_cursor = c_end
+                emphasis = chunk.index(max(chunk, key=len))
+                parts = [("{\\c&H00FFFF&}" + w.upper() + "{\\c&HFFFFFF&}") if k2 == emphasis else w.upper() for k2, w in enumerate(chunk)]
+                pop = "{\\fad(40,20)\\fscx82\\fscy82\\t(0,110,\\fscx100\\fscy100)}"
+                lines.append(f"Dialogue: 0,{fmt(c_start)},{fmt(c_end)},Caption,,0,0,0,,{pop}{' '.join(parts)}")
         t = p_end
     with open(dest_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
