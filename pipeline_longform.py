@@ -208,6 +208,13 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "") -> dic
        three-quarters of the way through, rather than presenting
        disconnected facts in any order. Vary the angle paragraph to
        paragraph so no two paragraphs just restate the same point.
+       IMPORTANT: the "turning point" is a twist or reveal in the IDEAS,
+       not a wrap-up - no BODY paragraph may mention the channel name,
+       subscribing, following, or invite the viewer to "join this
+       journey"; that language is reserved for the single true final
+       paragraph only (rule 3 below). A body paragraph that reads like a
+       conclusion or a subscribe-style call to action is wrong even if it
+       lands near the three-quarters mark.
     3. A CLOSING paragraph that resolves the opening hook - it must
        explicitly call back to the specific question or tension raised in
        paragraph 1 and land on ONE concrete, memorable final image, line,
@@ -222,6 +229,10 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "") -> dic
        "MindByte" inviting the viewer to keep watching/subscribe if the
        channel resonates with them - phrased originally, never a generic
        "smash that like button" / "don't forget to subscribe" line.
+       This is the ONLY paragraph allowed to mention the channel name,
+       subscribing, or following - if any earlier paragraph does this
+       too, the script is wrong and must be rewritten before returning
+       it.
 
     HOOK RULES - the opening paragraph's first sentence decides whether
     anyone stays: never start with "Welcome back", "Today we will
@@ -605,16 +616,28 @@ def gather_clips_for_paragraph(keywords: list, workdir: str, paragraph_index: in
         dest = os.path.join(workdir, f"p{paragraph_index}_clip_{i}.mp4")
         download_file(clip["url"], dest)
         clip_paths.append(dest)
-    if not clip_paths:
+        if not clip_paths:
         # Last resort: guarantee at least one clip per paragraph so
         # assembly never has to skip a whole segment of the video.
+        # Updated 2026-07-20: collect up to LF_MAX_CLIPS_PER_PARAGRAPH
+        # clips here instead of stopping at the first hit. A paragraph
+        # that reaches this branch is usually a LATER paragraph in the
+        # video - used_ids has grown large by then, so FALLBACK_QUERIES'
+        # shared pool is more likely already tapped out for its first few
+        # terms - and previously the first successful fallback would
+        # `break` immediately, leaving assemble_video_longform() with
+        # only one clip to stretch statically across the paragraph's
+        # entire duration. That is what produced the long static B-roll
+        # hold observed near the end of the first real long-form upload.
         for fb in FALLBACK_QUERIES:
-            clip = search_pexels_clip_longform(fb, used_ids)
-            if clip:
-                dest = os.path.join(workdir, f"p{paragraph_index}_clip_fallback.mp4")
-                download_file(clip["url"], dest)
-                clip_paths.append(dest)
-                break
+        clip = search_pexels_clip_longform(fb, used_ids)
+        if clip:
+        fb_idx = len(clip_paths)
+        dest = os.path.join(workdir, f"p{paragraph_index}_clip_fallback{fb_idx}.mp4")
+        download_file(clip["url"], dest)
+        clip_paths.append(dest)
+      if len(clip_paths) >= LF_MAX_CLIPS_PER_PARAGRAPH:
+      break
     return clip_paths
 
 
