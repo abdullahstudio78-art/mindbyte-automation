@@ -617,7 +617,7 @@ def gather_clips_for_paragraph(keywords: list, workdir: str, paragraph_index: in
         dest = os.path.join(workdir, f"p{paragraph_index}_clip_{i}.mp4")
         download_file(clip["url"], dest)
         clip_paths.append(dest)
-        if not clip_paths:
+    if not clip_paths:
         # Last resort: guarantee at least one clip per paragraph so
         # assembly never has to skip a whole segment of the video.
         # Updated 2026-07-20: collect up to LF_MAX_CLIPS_PER_PARAGRAPH
@@ -631,14 +631,14 @@ def gather_clips_for_paragraph(keywords: list, workdir: str, paragraph_index: in
         # entire duration. That is what produced the long static B-roll
         # hold observed near the end of the first real long-form upload.
         for fb in FALLBACK_QUERIES:
-        clip = search_pexels_clip_longform(fb, used_ids)
-        if clip:
-        fb_idx = len(clip_paths)
-        dest = os.path.join(workdir, f"p{paragraph_index}_clip_fallback{fb_idx}.mp4")
-        download_file(clip["url"], dest)
-        clip_paths.append(dest)
-      if len(clip_paths) >= LF_MAX_CLIPS_PER_PARAGRAPH:
-      break
+            clip = search_pexels_clip_longform(fb, used_ids)
+            if clip:
+                fb_idx = len(clip_paths)
+                dest = os.path.join(workdir, f"p{paragraph_index}_clip_fallback{fb_idx}.mp4")
+                download_file(clip["url"], dest)
+                clip_paths.append(dest)
+            if len(clip_paths) >= LF_MAX_CLIPS_PER_PARAGRAPH:
+                break
     return clip_paths
 
 
