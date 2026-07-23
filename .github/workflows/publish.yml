@@ -36,4 +36,11 @@ jobs:
           OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
           YOUTUBE_CHANNEL_ID: ${{ secrets.YOUTUBE_CHANNEL_ID }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          # TikTok cross-post (added 2026-07-23) - tiktok_publish.py no-ops
+          # cleanly if these aren't set yet (app registration/audit still
+          # pending), so this is safe to leave in place before setup finishes.
+          TIKTOK_CLIENT_KEY: ${{ secrets.TIKTOK_CLIENT_KEY }}
+          TIKTOK_CLIENT_SECRET: ${{ secrets.TIKTOK_CLIENT_SECRET }}
+          TIKTOK_REFRESH_TOKEN: ${{ secrets.TIKTOK_REFRESH_TOKEN }}
+          TIKTOK_PRIVACY_LEVEL: ${{ secrets.TIKTOK_PRIVACY_LEVEL }}
         run: python pipeline.py
