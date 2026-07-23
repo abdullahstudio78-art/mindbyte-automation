@@ -950,7 +950,11 @@ MUSIC_QUERIES = [
     "ambient technology", "dark ambient minimal", "inspiring ambient",
 ]
 MIN_MUSIC_DURATION_MS = 30000  # skip very short stingers that can't cover a full clip
-MUSIC_VOLUME = 0.22  # bumped up from 0.15 (2026-07-19) - user found music too quiet
+MUSIC_VOLUME = 0.14  # lowered from 0.22 (2026-07-23) - user found the louder bed
+# distracting under narration; 0.14 keeps a felt-but-not-noticed ambient bed.
+# (History: was 0.15 originally, bumped to 0.22 on 2026-07-19 because music was
+# too quiet, now brought back down because loud enough to distract - the goal
+# is present-but-unobtrusive, not loud.)
 
 # ---------------------------------------------------------------------------
 # Visual branding (content-strategy branding pass, 2026-07-19) - a
@@ -1175,48 +1179,85 @@ def fetch_background_music(dest_path: str, pillar: str) -> dict | None:
     ambient for Brain & Neuroscience, subtle tension for Psychology
     Experiments & Stories, etc. - falling back to the generic
     MUSIC_QUERIES list if the pillar has none or nothing is found.
+
+    IMPORTANT (fixed 2026-07-23): previously this tried exactly ONE
+    randomly-chosen query and gave up entirely - returning None - the
+    moment that single query had no results, which is why run #37
+    published with no music at all even though Openverse almost
+    certainly had SOMETHING usable under a different query. Now it
+    tries every pillar query, then every generic fallback query (in a
+    shuffled, deduplicated order), and only gives up after all of them
+    come up empty - music should be the exception-not-the-rule case,
+    not "first query fails -> silent video."
     """
-    queries = CONTENT_PILLARS.get(pillar, {}).get("music_queries") or MUSIC_QUERIES
-    query = random.choice(queries)
-    try:
-        resp = SESSION.get(
-            OPENVERSE_AUDIO_URL,
-            params={"q": query, "license_type": "commercial", "page_size": 10},
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            print(f"[pipeline] music search failed: {resp.status_code} {resp.text[:200]}")
-            return None
-        results = resp.json().get("results", [])
-        candidates = [
-            r for r in results
-            if r.get("url") and (r.get("duration") or 0) >= MIN_MUSIC_DURATION_MS
-        ]
-        if not candidates:
-            print(f"[pipeline] no suitable music candidates for query '{query}'")
-            return None
-        track = random.choice(candidates)
-        download_file(track["url"], dest_path)
-        return {
-            "title": track.get("title") or "Untitled",
-            "creator": track.get("creator") or "Unknown artist",
-            "license": (track.get("license") or "unknown").lower(),
-        }
-    except Exception as e:  # noqa: BLE001 - deliberately broad, see docstring
-        print(f"[pipeline] music fetch failed, continuing without music: {e}")
-        return None
+    pillar_queries = CONTENT_PILLARS.get(pillar, {}).get("music_queries") or []
+    # Try the pillar's own mood-matched queries first, then fall back to the
+    # generic list - dedup while preserving order, then shuffle each group
+    # independently so repeated runs don't always hammer the same query first.
+    seen = set()
+    ordered_queries = []
+    for group in (pillar_queries, MUSIC_QUERIES):
+        group = list(group)
+        random.shuffle(group)
+        for q in group:
+            if q not in seen:
+                seen.add(q)
+                ordered_queries.append(q)
+
+    for query in ordered_queries:
+        try:
+            resp = SESSION.get(
+                OPENVERSE_AUDIO_URL,
+                params={"q": query, "license_type": "commercial", "page_size": 10},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                print(f"[pipeline] music search failed for '{query}': {resp.status_code} {resp.text[:200]}")
+                continue
+            results = resp.json().get("results", [])
+            candidates = [
+                r for r in results
+                if r.get("url") and (r.get("duration") or 0) >= MIN_MUSIC_DURATION_MS
+            ]
+            if not candidates:
+                print(f"[pipeline] no suitable music candidates for query '{query}', trying next query")
+                continue
+            track = random.choice(candidates)
+            download_file(track["url"], dest_path)
+            return {
+                "title": track.get("title") or "Untitled",
+                "creator": track.get("creator") or "Unknown artist",
+                "license": (track.get("license") or "unknown").lower(),
+            }
+        except Exception as e:  # noqa: BLE001 - deliberately broad, see docstring
+            print(f"[pipeline] music fetch failed for '{query}', trying next query: {e}")
+            continue
+
+    print(f"[pipeline] no suitable music found across {len(ordered_queries)} queries - continuing without music")
+    return None
 
 def mix_background_music(voice_path: str, music_path: str, duration: float,
                           dest_path: str) -> None:
     """Loop the music bed to cover the narration, duck its volume well
-    under the voice, and mix the two into a single audio track."""
+    under the voice, and mix the two into a single audio track.
+
+    On top of the low MUSIC_VOLUME, the music bed is gently EQ'd (highpass
+    to drop rumble, lowpass to tame bright/percussive transients that
+    otherwise poke through under the voice) and lightly compressed so it
+    reads as a soft ambient texture rather than a competing second layer -
+    "present but unobtrusive" per user feedback that the previous mix was
+    distracting under narration.
+    """
     subprocess.run(
         [
             "ffmpeg", "-y",
             "-stream_loop", "-1", "-i", music_path,
             "-i", voice_path,
             "-filter_complex",
-            f"[0:a]atrim=0:{duration:.3f},volume={MUSIC_VOLUME}[music];"
+            f"[0:a]atrim=0:{duration:.3f},"
+            "highpass=f=150,lowpass=f=6000,"
+            f"volume={MUSIC_VOLUME},"
+            "acompressor=threshold=0.1:ratio=4:attack=20:release=250[music];"
             f"[1:a]volume=1.0[voice];"
             f"[music][voice]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
             "-map", "[aout]", "-t", f"{duration:.3f}",
