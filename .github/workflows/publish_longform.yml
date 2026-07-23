@@ -1,11 +1,17 @@
 name: Publish Long-Form Video
 
 on:
-  # Phase 4 (long-form, 8-15 min landscape videos) - manual trigger ONLY.
-  # This must NOT be added to a schedule: cron until a human has reviewed
-  # at least one full end-to-end test run of pipeline_longform.py, exactly
-  # how the Shorts pipeline (publish.yml) was validated across runs #22/#23
-  # before its daily schedule was turned on (2026-07-19).
+  # Weekly auto-schedule enabled 2026-07-23 - user reviewed run #9 (the
+  # first run using the new footage-only cinematic pipeline + real-frame
+  # thumbnail, commit 3d6f3cf) and approved: real human B-roll matching the
+  # storyboard, clean cinematic thumbnail ("Silent Ruin", 8:21, quality
+  # score 9), pre-publish checklist passed. Long-form is weekly (not
+  # daily, per the "daily Shorts + weekly long-form" plan) - Sundays,
+  # a few hours after the Weekly Content Review (12:00 UTC) and outside
+  # the daily Shorts publish window (14:00 UTC), so it doesn't compete for
+  # GitHub Actions runners with either.
+  schedule:
+    - cron: '0 16 * * 0'
   workflow_dispatch: {}
 
 jobs:
