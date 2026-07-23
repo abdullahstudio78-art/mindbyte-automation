@@ -2269,6 +2269,23 @@ def main() -> None:
             except Exception as e:  # noqa: BLE001 - thumbnail upload must never abort the run
                 print(f"[pipeline] could not set custom thumbnail: {e}")
 
+        # TikTok cross-post - best-effort, must run before the temp dir
+        # (and output_path) is cleaned up. tiktok_publish.py never raises;
+        # it returns a status dict so a not-yet-configured app or a failed
+        # audit just logs and moves on rather than affecting the YouTube
+        # upload that already succeeded above.
+        try:
+            from tiktok_publish import post_short_to_tiktok
+            tiktok_result = post_short_to_tiktok(output_path, script["title"], description)
+            if tiktok_result["status"] == "skipped":
+                print(f"[pipeline] TikTok: skipped ({tiktok_result['reason']})")
+            elif tiktok_result["posted"]:
+                print(f"[pipeline] TikTok: posted (publish_id={tiktok_result['publish_id']})")
+            else:
+                print(f"[pipeline] TikTok: not posted - status={tiktok_result['status']} reason={tiktok_result['reason']}")
+        except Exception as e:  # noqa: BLE001 - TikTok posting must never abort the run
+            print(f"[pipeline] TikTok posting failed unexpectedly, continuing: {e}")
+
     sheet_row_base[0] = video_id
     sheet_row_base[3] = "Scheduled"
     sheet_row_base[5] = publish_at.isoformat()
