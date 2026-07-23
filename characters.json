@@ -1,0 +1,49 @@
+{
+  "_comment": "Character manifest for the illustrated B-roll system (character_assets.py). Additive: this only supplements the existing Pexels stock-footage path, never replaces it. To add a new character later: add an entry here + drop matching image files under ASSETS_ROOT/Characters/<folder_name>/{Expressions,Poses,Reference,Scenes}/ - zero code changes required.",
+
+  "_available_assets_note": "available_assets below is a STATIC declared list of the asset subfolders/kinds each character is expected to have (not a scan of the real folder contents). Tradeoff: static keeps the manifest human-editable and diffable in code review, and lets select_character_asset() know what kinds of assets *should* exist without touching disk just to answer 'does this character have poses'. The actual filename picked for a given beat is still resolved at runtime by scanning ASSETS_ROOT/Characters/<folder_name>/<asset_type>/ on disk (see character_assets.py), so this list never goes stale in a way that breaks anything - it's just a hint, not a cache.",
+
+  "characters": [
+    {
+      "name": "Byte",
+      "folder_name": "Byte",
+      "signature_color": "crimson red (hoodie accent)",
+      "voice_profile": "en-US-GuyNeural",
+      "personality_keywords": [
+        "narrator", "host", "intro", "welcome", "today", "let's talk",
+        "confidence", "charisma", "social", "explain", "breakdown",
+        "here's why", "psychology of", "did you know",
+        "understanding", "realize", "realization", "insight", "notice",
+        "mind", "brain", "thinking", "question", "curious", "wonder",
+        "pattern", "behavior", "decide", "decision"
+      ],
+      "available_assets": ["Expressions", "Poses", "Reference", "Scenes"]
+    },
+    {
+      "name": "Maya",
+      "folder_name": "Maya",
+      "signature_color": "teal (scarf)",
+      "voice_profile": "en-GB-SoniaNeural",
+      "personality_keywords": [
+        "emotion", "emotional", "feelings", "empathy", "self-control",
+        "rejection", "healing", "growth", "support", "comfort",
+        "relationship", "connection", "attachment", "heartbreak",
+        "vulnerable", "calm", "reflection"
+      ],
+      "available_assets": ["Expressions", "Poses", "Reference", "Scenes"]
+    },
+    {
+      "name": "Alex",
+      "folder_name": "Alex",
+      "signature_color": "gray-blue sweater + glasses",
+      "voice_profile": "en-US-AriaNeural",
+      "personality_keywords": [
+        "overthinking", "overthink", "anxious", "anxiety", "worry",
+        "spiral", "rumination", "second-guessing", "stress",
+        "can't stop thinking", "racing thoughts", "doubt", "overanalyze",
+        "insomnia", "bedroom", "phone at night"
+      ],
+      "available_assets": ["Expressions", "Poses", "Reference", "Scenes"]
+    }
+  ]
+}

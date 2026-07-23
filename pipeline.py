@@ -25,6 +25,18 @@ import requests
 import math
 from PIL import Image, ImageDraw, ImageFont
 
+# --- Character asset system (new) ---
+# Additive illustrated-character B-roll supplement to the Pexels flow
+# below. See character_assets.py for details. Never removes/disables the
+# Pexels path - gather_clips() tries a character asset first per slot and
+# falls back to search_pexels_clip() exactly as before if none is found.
+from character_assets import (
+    load_characters_manifest,
+    select_character_asset,
+)
+CHARACTERS_MANIFEST = load_characters_manifest()
+# --- end character asset system (new) ---
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -665,7 +677,44 @@ FALLBACK_QUERIES = [
 ]
 
 
-def gather_clips(keywords: list, workdir: str) -> list:
+# --- Character asset system (new) ---
+def _character_image_to_clip(image_path: str, dest_path: str, duration: float = 3.0) -> bool:
+    """Convert a still character illustration into a short silent mp4 clip
+    so it can slot into clip_paths exactly like a downloaded Pexels clip
+    (assemble_video() trims every clip_paths[i] to segment_durations[i] via
+    plain -i/-t, which needs a looped image source, not a single frame).
+    Returns True on success, False on any ffmpeg failure (caller should
+    treat that the same as "no asset found" and fall back to Pexels)."""
+    try:
+        frames = max(1, int(duration * 30))
+        # Slow, subtle Ken Burns zoom (1.0 -> ~1.08x over the clip) so a
+        # held illustration reads as a deliberate cinematic shot rather
+        # than a static slideshow image - directly addresses the standing
+        # "must not feel like a slideshow" requirement for illustrated
+        # character beats, same as real B-roll clips already have motion.
+        # Source character art comes in mixed aspect ratios (portrait
+        # reference shots, landscape scene shots), so scale-to-cover +
+        # center-crop to the target 1080x1920 frame before zoompan, rather
+        # than a plain scale that can leave one dimension too small for
+        # zoompan/crop to work with.
+        zoompan = (
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,"
+            f"zoompan=z='min(zoom+0.0015,1.08)':d={frames}:s=1080x1920:fps=30"
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", image_path,
+             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+             "-pix_fmt", "yuv420p", "-vf", zoompan, dest_path],
+            check=True, capture_output=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
+# --- end character asset system (new) ---
+
+
+def gather_clips(keywords: list, workdir: str, sentences: list = None) -> list:
     """Download exactly one clip per keyword, in order.
 
     A strict 1:1, order-preserving mapping between sentences and clips is
@@ -674,10 +723,34 @@ def gather_clips(keywords: list, workdir: str) -> list:
     If a specific keyword yields nothing on Pexels, fall back through a
     rotation of generic queries for that slot rather than skipping it, so
     the clip count never drifts out of sync with the sentence count.
+
+    `sentences`, if provided, is the full spoken-line text for each slot
+    (same length/order as `keywords`). It's used ONLY for the character-
+    asset match below, since a 2-3 word stock-footage search phrase
+    ("person thinking bedroom") almost never contains a character's
+    narrator-style personality_keywords ("here's why", "explain") the way
+    the actual spoken sentence does - matching against keyword text alone
+    made this feature effectively dead code. Pexels search itself still
+    uses only `keyword`, unchanged.
     """
     used_ids: set = set()
     clip_paths = []
     for i, keyword in enumerate(keywords):
+        # --- Character asset system (new) ---
+        # Try an illustrated-character asset for this slot before touching
+        # Pexels at all. select_character_asset() returns None whenever no
+        # character/asset matches (or assets aren't present on disk yet),
+        # in which case we fall through to the existing Pexels logic below
+        # completely unchanged.
+        sentence_text = sentences[i] if sentences and i < len(sentences) else ""
+        match_text = f"{keyword} {sentence_text}".strip()
+        char_asset = select_character_asset(match_text, CHARACTERS_MANIFEST)
+        if char_asset:
+            dest = os.path.join(workdir, f"clip_{i}.mp4")
+            if _character_image_to_clip(char_asset["path"], dest):
+                clip_paths.append(dest)
+                continue
+        # --- end character asset system (new) ---
         clip = search_pexels_clip(keyword, used_ids)
         if not clip:
             for fb in FALLBACK_QUERIES:
@@ -1621,7 +1694,7 @@ def main() -> None:
         return
 
     with tempfile.TemporaryDirectory() as workdir:
-        clip_paths = gather_clips(script["visual_keywords"], workdir)
+        clip_paths = gather_clips(script["visual_keywords"], workdir, sentences=script.get("sentences"))
         if not clip_paths:
             sheet_row_base[3] = "Failed"
             sheet_row_base[14] = "No usable Pexels clips found"
