@@ -1,0 +1,32 @@
+name: Weekly Content Review
+
+on:
+  # Sundays at 12:00 UTC - after a full week of daily analytics_sync.py runs
+  # have kept view/like/comment/share counts current, so this has a full
+  # week of real data to judge against before generating next week's plan.
+  schedule:
+    - cron: '0 12 * * 0'
+  workflow_dispatch: {}
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run weekly content review
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python weekly_review.py

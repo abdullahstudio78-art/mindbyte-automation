@@ -15,3 +15,20 @@ prototype/frames/
 # character-cutout compositing. Test clip delivered directly to the user;
 # not pipeline input/output, so not tracked.
 prototype2/
+
+# Third round of scratch (2026-07-23) - iterating the pre-composed-scene
+# technique on a second image (Alex, bedroom/phone) to test lighting,
+# depth cues, and camera motion per the "prove visual quality before
+# scaling" request. Test clips delivered directly to the user; not
+# pipeline input/output, so not tracked.
+prototype3/
+
+# Fourth round of scratch (2026-07-23) - first full end-to-end test video
+# ("Why You Smile When You Don't Mean It") built from Byte's real
+# essential-tier asset library, to prove the full-footage Lucifer-style
+# cut (scene sequencing, camera motion, captions, title card/watermark)
+# before any of this is wired into the live daily pipeline. Delivered
+# directly to the user via chat for review; not pipeline input/output,
+# so not tracked. (Voiceover/music are placeholders this round - no
+# network access to edge-tts/music sources in this sandbox session.)
+full_test/
