@@ -555,11 +555,20 @@ def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
           hashtags).
         - Also produce "visual_keywords": an array with EXACTLY the same
           number of entries as "sentences", in the same order - one 2-3
-          word stock-video search phrase per sentence, for REAL,
-          human-centric, emotionally matching footage (facial expressions,
-          real-life situations, people in relatable moments). Avoid
-          abstract or generic queries like "brain neurons" unless the
-          sentence is literally about brain anatomy.
+          word stock-video search phrase per sentence, for CINEMATIC,
+          PEOPLE-FREE B-roll that fits an anime/illustrated-character
+          channel: technology and futuristic machinery, robots, abstract
+          particles/light, neural-network-style visuals, nature (ocean,
+          forest, sky, weather), architecture and cityscapes shot WITHOUT
+          pedestrians or faces in frame, close-ups of objects, clocks,
+          screens, or environments. Byte (our illustrated narrator)
+          appears as the "human" presence in this channel - real human
+          faces/bodies in the stock footage visually clash with his
+          anime style, so NEVER request queries centered on people, faces,
+          hands, or human activity ("person thinking", "couple talking",
+          "handshake", etc.). Prefer mood/metaphor over literal
+          illustration - e.g. for a sentence about overthinking, prefer
+          "tangled wires" or "spinning gears" over "person worrying".
         - Also produce "tags": an array of 10-15 SEARCH TERMS a real viewer
           would type into YouTube (NOT stock-footage descriptions) - a mix
           of broad terms ("psychology facts", "human behavior", "why
@@ -764,8 +773,16 @@ def download_file(url: str, dest_path: str) -> None:
 
 
 FALLBACK_QUERIES = [
-    "nature", "abstract background", "city timelapse", "clouds timelapse",
-    "ocean waves", "forest aerial", "starry sky",
+    # People-free, cinematic B-roll only (2026-07-23 direction: the channel's
+    # only "human" presence should be Byte's illustrated character - real
+    # people in stock clips visually clash with his anime style). Kept to
+    # nature/tech/abstract/architecture themes, deliberately excluding any
+    # query that tends to surface pedestrians, hands, or faces.
+    "nature", "abstract background", "city timelapse (no people)",
+    "clouds timelapse", "ocean waves", "forest aerial", "starry sky",
+    "futuristic technology", "robot machinery", "neural network abstract",
+    "circuit board macro", "particles light abstract", "gears machinery",
+    "empty architecture", "rain window", "clock close up",
 ]
 
 
