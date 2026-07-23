@@ -117,48 +117,61 @@ def _detect_tone(script_beat_text: str) -> str | None:
     return None
 
 
-def _pick_asset_file(assets_root: str, folder_name: str, script_beat_text: str) -> tuple | None:
+def _pick_asset_file(assets_root: str, folder_name: str, script_beat_text: str,
+                      exclude_files: set = None) -> tuple | None:
     """Pick the best-matching asset file for a character given the beat text.
 
     Preference order:
-      1. A file whose name contains a detected tone keyword.
-      2. Any file at all (first available), so a character with assets but
-         no tone match still gets *something* rather than falling through
-         to Pexels unnecessarily.
+      1. A file whose name contains a detected tone keyword (skipped if
+         already used this run, per exclude_files, unless it's the only
+         match available).
+      2. A rotating pick from Expressions+Poses that hasn't been used yet
+         this run, so a video with several untagged/generic Byte beats gets
+         visible variety instead of the same still repeating - this was a
+         real bug reported after the first test video: nearly every beat
+         fell through to the same "neutral" default and the video visibly
+         repeated one photo over and over.
+      3. Only once every candidate has been used at least once, reuse is
+         allowed again (better than falling back to Pexels or erroring).
     Returns (asset_type, full_path, filename) or None if the character has
     no asset files on disk at all.
     """
     files = _list_asset_files(assets_root, folder_name)
     if not files:
         return None
+    exclude_files = exclude_files or set()
 
     tone = _detect_tone(script_beat_text)
-    if tone:
-        for asset_type, full_path, filename in files:
-            if tone in filename.lower():
-                return asset_type, full_path, filename
+    if tone and tone != "scene":
+        tone_matches = [f for f in files if tone in f[2].lower()]
+        if tone_matches:
+            fresh = [f for f in tone_matches if f[2] not in exclude_files]
+            return (fresh or tone_matches)[0]
 
-    # No tone match (or no tone detected) - fall back to any available
-    # asset, preferring "Scenes" if the beat text hints at a scene, then
-    # a neutral-looking default, then "Expressions"/"Poses" as a last
-    # resort. Falling straight to files[0] (alphabetically first) was a
-    # real bug in practice: for Byte that happened to be an "angry"
-    # expression, so every untagged sentence silently got an angry face -
-    # a visibly wrong default for a calm/neutral line.
     if tone == "scene":
-        for asset_type, full_path, filename in files:
-            if asset_type == "Scenes":
-                return asset_type, full_path, filename
+        scene_matches = [f for f in files if f[0] == "Scenes"]
+        if scene_matches:
+            fresh = [f for f in scene_matches if f[2] not in exclude_files]
+            return (fresh or scene_matches)[0]
 
-    for asset_type, full_path, filename in files:
-        if "neutral" in filename.lower():
-            return asset_type, full_path, filename
+    # No tone match - rotate through Expressions+Poses (talking-head/body
+    # shots suitable for a generic line) rather than always landing on the
+    # same neutral default. Reference/Scenes are excluded from this
+    # generic pool: Reference shots are turnaround/model-sheet material,
+    # not natural mid-sentence cutaways, and Scenes are handled above.
+    generic_pool = [f for f in files if f[0] in ("Expressions", "Poses")] or files
+    fresh = [f for f in generic_pool if f[2] not in exclude_files]
+    if fresh:
+        return fresh[0]
 
-    return files[0]
+    # Every candidate has been used at least once this run - cycle back to
+    # reuse rather than erroring or silently falling back to Pexels for the
+    # rest of the video.
+    return generic_pool[0]
 
 
 def select_character_asset(script_beat_text: str, characters_manifest: list,
-                            assets_root: str = None) -> dict | None:
+                            assets_root: str = None, exclude_files: set = None) -> dict | None:
     """Select a character illustration for one beat of script text.
 
     Args:
@@ -167,6 +180,11 @@ def select_character_asset(script_beat_text: str, characters_manifest: list,
             load_characters_manifest().
         assets_root: root directory containing Characters/<name>/... .
             Defaults to ASSETS_ROOT env var / "./character_assets".
+        exclude_files: set of bare filenames already used earlier in this
+            same video, so consecutive/nearby Byte beats don't repeat the
+            same still. Caller should add the returned "filename" to this
+            set after each call. Optional - omitting it just disables the
+            rotation (falls back to the tone-only match).
 
     Returns:
         None if no character matches, or the matched character has no
@@ -187,7 +205,10 @@ def select_character_asset(script_beat_text: str, characters_manifest: list,
     if character is None:
         return None
 
-    picked = _pick_asset_file(assets_root, character.get("folder_name", character.get("name")), script_beat_text)
+    picked = _pick_asset_file(
+        assets_root, character.get("folder_name", character.get("name")),
+        script_beat_text, exclude_files=exclude_files,
+    )
     if picked is None:
         return None
 

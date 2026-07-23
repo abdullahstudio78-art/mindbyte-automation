@@ -740,6 +740,7 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None) -> list:
     uses only `keyword`, unchanged.
     """
     used_ids: set = set()
+    used_character_files: set = set()
     clip_paths = []
     for i, keyword in enumerate(keywords):
         # --- Character asset system (new) ---
@@ -750,11 +751,12 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None) -> list:
         # completely unchanged.
         sentence_text = sentences[i] if sentences and i < len(sentences) else ""
         match_text = f"{keyword} {sentence_text}".strip()
-        char_asset = select_character_asset(match_text, CHARACTERS_MANIFEST)
+        char_asset = select_character_asset(match_text, CHARACTERS_MANIFEST, exclude_files=used_character_files)
         if char_asset:
             dest = os.path.join(workdir, f"clip_{i}.mp4")
             if _character_image_to_clip(char_asset["path"], dest):
                 clip_paths.append(dest)
+                used_character_files.add(char_asset["filename"])
                 continue
         # --- end character asset system (new) ---
         clip = search_pexels_clip(keyword, used_ids)
