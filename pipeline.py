@@ -40,24 +40,22 @@ from character_assets import (
 from no_human_filter import clip_contains_person
 CHARACTERS_MANIFEST = load_characters_manifest()
 
-# --- Interim stopgap (2026-07-24), per explicit user direction ---
-# The illustrated-character-in-scene system (Lucifer-Talk-style) needs a
-# real generated/illustrated scene library to look right - a runtime cutout
-# composited onto a generic background reads as broken (e.g. a character
-# "walking on a table"), and there's no free stock source for anime-style
-# footage. Until that real asset pipeline is built, the user asked to keep
-# the daily Shorts cadence unbroken with the channel's ORIGINAL plain-stock
-# look (real human stock footage allowed, no Byte/character compositing)
-# rather than have publishing gaps while that work is in progress.
+# --- PERMANENT decision (2026-07-23), per explicit user direction ---
+# MindByte is now a footage-only cinematic psychology channel - custom AI
+# characters (Byte/Maya/Alex) are dropped for good, not paused pending a
+# better asset pipeline. The channel's visual identity now comes from real
+# human emotional B-roll, shot selection, pacing, and color grading, not a
+# recognizable illustrated mascot. See MINDBYTE_CINEMATIC_PIPELINE_V2_SPEC.md
+# for the full redesign this decision is part of.
 #
-# Both flags below are OFF for that reason. This is a toggle, not a
-# revert/deletion - the character system and no-human-footage filter code
-# all still exist, tested, and working (see run #41 verification) - once
-# the real illustrated-scene asset library exists, flip these back to True
-# to re-enable them. Do not delete the gated code paths.
+# Both flags below stay OFF permanently. This is a toggle, not a deletion -
+# the character system and no-human-footage filter code all still exist,
+# tested, and working, kept only as a disabled reference path in case a
+# future channel wants them. Do not delete the gated code paths, and do not
+# flip these back to True for MindByte.
 CHARACTER_SYSTEM_ENABLED = False
 NO_HUMAN_FILTER_ENABLED = False
-# --- end character asset system (new) ---
+# --- end character asset system (disabled, permanent) ---
 
 # ---------------------------------------------------------------------------
 # Config
@@ -516,14 +514,10 @@ MIN_BYTE_CATEGORY_SLOTS = 3
 
 
 def ensure_minimum_byte_coverage(categories: list) -> list:
-    """Force at least MIN_BYTE_CATEGORY_SLOTS entries to "B" if the
-    classifier didn't already produce enough B/C slots on its own, so Byte
-    (our recurring narrator) is guaranteed to appear multiple times in every
-    video regardless of any single classifier call's quirks. Only ever
-    converts "A" (or None) slots to "B" - never touches existing B/C calls.
-    Evenly spaces the forced slots across the video rather than clustering
-    them at the start. No-ops on an empty list.
-    """
+    """DEPRECATED (2026-07-23): Byte no longer exists on this channel - the
+    footage-only cinematic-psychology pipeline uses generate_storyboard()
+    below instead. Kept only because it's harmless dead code if ever called
+    with an empty/None categories list; not invoked from main() anymore."""
     if not categories:
         return categories
     categories = list(categories)
@@ -540,6 +534,79 @@ def ensure_minimum_byte_coverage(categories: list) -> list:
     for i in chosen:
         categories[i] = "B"
     return categories
+
+
+# ---------------------------------------------------------------------------
+# Automatic Scene Breakdown / Storyboard (new, 2026-07-23 footage-only
+# cinematic-psychology pipeline - see MINDBYTE_CINEMATIC_PIPELINE_V2_SPEC.md
+# section 3). Replaces classify_scene_categories()'s crude A/B/C routing
+# (a Byte-vs-stock decision that no longer applies with no characters) with
+# a full per-scene storyboard: emotion, story purpose, footage query,
+# environment, camera style, atmosphere, and transition-in. This is the
+# single source of truth gather_clips() searches against now.
+# ---------------------------------------------------------------------------
+
+STORYBOARD_SCHEMA_KEYS = (
+    "emotion", "story_purpose", "footage_query", "environment",
+    "camera_style", "atmosphere", "transition_in",
+)
+
+
+def generate_storyboard(sentences: list) -> list:
+    """Turns each script sentence into a full cinematic storyboard beat.
+    Returns a list the same length as `sentences`; on ANY failure (Groq
+    outage, malformed JSON, count mismatch) returns a list of minimal
+    fallback beats derived directly from the sentence text, so a run never
+    aborts just because the storyboard call failed - gather_clips() always
+    gets a usable footage_query per slot either way."""
+    if not sentences:
+        return []
+    numbered = "\n".join(f"{i}: {s}" for i, s in enumerate(sentences))
+    prompt = (
+        "You are the visual director for MindByte, a footage-only cinematic "
+        "psychology documentary channel (no illustrated characters - real "
+        "human emotional B-roll only). For each numbered script sentence "
+        "below, produce ONE storyboard beat describing the shot that should "
+        "play while that sentence is spoken. Every beat must be something a "
+        "real camera could film - a person alone at night, someone looking "
+        "out a window, a city street, a mirror, rain on glass, a clock - "
+        "never an abstract tech/particle visual and never literal-illustration "
+        "of the words. Every visual should support the emotional truth of the "
+        "line, not just its literal content.\n\n"
+        "Example - for the sentence \"Your brain remembers embarrassing "
+        "moments because it wants to protect you,\" a good beat is: emotion "
+        "'shame', story_purpose 'show the involuntary replay of the memory', "
+        "footage_query 'person awake at night ceiling', environment "
+        "'bedroom at night', camera_style 'slow static close-up', "
+        "atmosphere 'dim cool light', transition_in 'hard cut on the "
+        "internal beat'.\n\n"
+        f"Sentences:\n{numbered}\n\n"
+        "Respond ONLY with JSON: "
+        '{"beats": [{"emotion": "...", "story_purpose": "...", '
+        '"footage_query": "...", "environment": "...", "camera_style": "...", '
+        '"atmosphere": "...", "transition_in": "..."}, ...]} '
+        "- exactly one beat per sentence, same order, same count."
+    )
+    try:
+        raw = call_groq(prompt)
+        data = json.loads(raw)
+        beats = data.get("beats", [])
+        if len(beats) != len(sentences):
+            raise ValueError(f"beat count mismatch ({len(beats)} vs {len(sentences)})")
+        cleaned = []
+        for beat in beats:
+            cleaned.append({k: str(beat.get(k, "")).strip() for k in STORYBOARD_SCHEMA_KEYS})
+        return cleaned
+    except Exception as e:  # noqa: BLE001 - storyboard must never abort a run
+        print(f"[pipeline] storyboard generation failed, falling back to plain sentence-based beats: {e}")
+        return [
+            {
+                "emotion": "", "story_purpose": "",
+                "footage_query": s[:60], "environment": "", "camera_style": "",
+                "atmosphere": "", "transition_in": "",
+            }
+            for s in sentences
+        ]
 
 
 def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
@@ -620,19 +687,18 @@ def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
         - Also produce "visual_keywords": an array with EXACTLY the same
           number of entries as "sentences", in the same order - one 2-3
           word stock-video search phrase per sentence, for CINEMATIC,
-          PEOPLE-FREE B-roll that fits an anime/illustrated-character
-          channel: technology and futuristic machinery, robots, abstract
-          particles/light, neural-network-style visuals, nature (ocean,
-          forest, sky, weather), architecture and cityscapes shot WITHOUT
-          pedestrians or faces in frame, close-ups of objects, clocks,
-          screens, or environments. Byte (our illustrated narrator)
-          appears as the "human" presence in this channel - real human
-          faces/bodies in the stock footage visually clash with his
-          anime style, so NEVER request queries centered on people, faces,
-          hands, or human activity ("person thinking", "couple talking",
-          "handshake", etc.). Prefer mood/metaphor over literal
-          illustration - e.g. for a sentence about overthinking, prefer
-          "tangled wires" or "spinning gears" over "person worrying".
+          EMOTIONALLY HUMAN B-roll (this channel has NO illustrated
+          character - real people ARE the visual language now): a person
+          alone at night, someone looking out a window, walking a city
+          street, staring at a phone, sitting in an empty room, a mirror
+          reflection, rain on glass, a clock in the dark - real human
+          situations and symbolic psychology visuals (mirrors, clocks,
+          doors, roads, shadows, water, empty rooms), NOT generic tech/
+          abstract/particle filler and NOT literal illustration of the
+          exact words. Prefer the emotional truth of the moment over a
+          literal match - e.g. for a sentence about overthinking, prefer
+          "person awake at night" or "person alone thinking" over
+          "spinning gears" or "tangled wires".
         - Also produce "tags": an array of 10-15 SEARCH TERMS a real viewer
           would type into YouTube (NOT stock-footage descriptions) - a mix
           of broad terms ("psychology facts", "human behavior", "why
@@ -852,16 +918,17 @@ def download_file(url: str, dest_path: str) -> None:
 
 
 FALLBACK_QUERIES = [
-    # People-free, cinematic B-roll only (2026-07-23 direction: the channel's
-    # only "human" presence should be Byte's illustrated character - real
-    # people in stock clips visually clash with his anime style). Kept to
-    # nature/tech/abstract/architecture themes, deliberately excluding any
-    # query that tends to surface pedestrians, hands, or faces.
-    "nature", "abstract background", "city timelapse (no people)",
-    "clouds timelapse", "ocean waves", "forest aerial", "starry sky",
-    "futuristic technology", "robot machinery", "neural network abstract",
-    "circuit board macro", "particles light abstract", "gears machinery",
-    "empty architecture", "rain window", "clock close up",
+    # Cinematic-psychology B-roll fallbacks (2026-07-23 pivot: NO custom
+    # characters, footage-only channel - real human emotional footage is
+    # now the whole point, not something to avoid). Kept to the same
+    # emotion/situation/environment/symbolic taxonomy as the Cinematic
+    # Footage Library spec, so a failed specific query still lands on
+    # something visually on-brand rather than generic stock filler.
+    "person alone at night", "person looking out window", "walking alone city street",
+    "person thinking bedroom", "empty room quiet", "rain window night",
+    "silhouette person city", "person on phone alone", "clock close up night",
+    "mirror reflection person", "person sitting alone thinking", "city lights night",
+    "ocean waves alone", "empty street night", "person staring distance",
 ]
 
 
@@ -1029,17 +1096,14 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None, scene_cat
         # direction - Mixkit and Videvo are deliberately excluded, see
         # stock_sources.py's module docstring for why (ToS/licensing).
         #
-        # NO-HUMAN ENFORCEMENT (2026-07-23): per explicit user direction, the
-        # channel's only "human" presence is Byte (the illustrated
-        # character) - real people in stock footage must never appear, full
-        # stop. Wording the search query to avoid people (previous attempt)
-        # is not reliable - verified on a real published video that a
-        # person can still turn up under an innocuous-sounding query. So
-        # every CANDIDATE clip is now actually downloaded and inspected by
-        # no_human_filter.clip_contains_person() before being accepted; a
-        # candidate that fails is deleted and the next candidate (next
-        # stock result, then the next fallback query) is tried instead of
-        # settling for whatever came back first.
+        # NO-HUMAN ENFORCEMENT (2026-07-23, SUPERSEDED 2026-07-23 by the
+        # footage-only cinematic-psychology pivot): the channel no longer
+        # has an illustrated character at all, so there is no more "clash"
+        # to guard against - real human emotional footage (someone alone at
+        # night, walking a street, staring out a window) IS the visual
+        # language now, per MINDBYTE_CINEMATIC_PIPELINE_V2_SPEC.md. This
+        # filter stays in the code, gated OFF (NO_HUMAN_FILTER_ENABLED =
+        # False), as a disabled path only - do not re-enable it.
         dest = os.path.join(workdir, f"clip_{i}.mp4")
         accepted_clip = None
         for query in [keyword] + FALLBACK_QUERIES:
@@ -1228,18 +1292,65 @@ def build_title_card(dest_path: str, title: str, pillar: str) -> None:
     img.save(dest_path)
 
 
-def build_thumbnail(dest_path: str, title: str, pillar: str) -> None:
-    """Generates a custom branded thumbnail/cover frame for the Short,
-    uploaded after the video goes live via set_youtube_thumbnail().
-    Distinct from build_title_card() (a brief in-video intro) - weighted
-    toward a large, bold curiosity-driving title plus a simple pointing
-    accent device. Borrowed as a PRINCIPLE only (never a copy) from the
-    competitor research: TED-Ed's consistent color-block thumbnail
-    template and Kurzgesagt's pointing-arrow device. A missing custom
-    thumbnail/cover treatment was flagged as the single biggest, most
-    obvious first-frame gap versus the researched competitor channels -
-    this is the phase-3 follow-up fix for that gap."""
+def build_thumbnail(dest_path: str, title: str, pillar: str,
+                     clip_paths: list = None, storyboard: list = None) -> None:
+    """Generates the cinematic emotional-image thumbnail (2026-07-23
+    footage-only pivot, per MINDBYTE_CINEMATIC_PIPELINE_V2_SPEC.md section
+    7 - REPLACES the old bold-title-block style entirely: no big text, no
+    color-block background, no pointing-arrow device. The user explicitly
+    banned that style: a thumbnail should be a single powerful cinematic
+    emotional image that makes a viewer ask "what happened here?", with
+    minimal-to-no text.
+
+    Picks the strongest available frame from the video's own footage (the
+    scene whose storyboard `emotion` field is non-empty and, failing that,
+    just the first clip) rather than a separately posed/generated shot, so
+    the thumbnail is honest about what the video actually looks like.
+    Applies the same subtle color grade as the rest of the video. Falls
+    back to a plain dark still with a small MindByte watermark (still no
+    big text) if no clip is available at all, so this never crashes a run."""
     width, height = VIDEO_WIDTH, VIDEO_HEIGHT
+
+    chosen_clip = None
+    if clip_paths:
+        chosen_idx = 0
+        if storyboard:
+            for i, beat in enumerate(storyboard):
+                if i < len(clip_paths) and beat.get("emotion"):
+                    chosen_idx = i
+                    break
+        chosen_idx = min(chosen_idx, len(clip_paths) - 1)
+        chosen_clip = clip_paths[chosen_idx]
+
+    if chosen_clip and os.path.exists(chosen_clip):
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", chosen_clip, "-ss", "00:00:00.5",
+                    "-frames:v", "1",
+                    "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                           f"crop={width}:{height},eq=contrast=1.08:saturation=1.05:brightness=-0.02,"
+                           "vignette=PI/6",
+                    dest_path,
+                ],
+                check=True, capture_output=True,
+            )
+            # Minimal, small, non-boxed watermark only - no title text at all,
+            # per the "let the image speak first" direction.
+            img = Image.open(dest_path).convert("RGB")
+            draw = ImageDraw.Draw(img)
+            logo_cy = int(height * 0.93)
+            logo_cx = int(width * 0.10)
+            logo_r = width * 0.02
+            _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
+            img.save(dest_path)
+            return
+        except Exception as e:  # noqa: BLE001 - fall through to the plain fallback below
+            print(f"[pipeline] cinematic thumbnail frame extraction failed, using fallback: {e}")
+
+    # Fallback: no clip available at all - a plain dark brand-gradient still,
+    # deliberately with no title text (keeps the "minimal-to-no text" rule
+    # even in the degraded case rather than reverting to the old text block).
     img = Image.new("RGB", (width, height), BRAND_BG_TOP)
     draw = ImageDraw.Draw(img)
     for y in range(height):
@@ -1248,56 +1359,10 @@ def build_thumbnail(dest_path: str, title: str, pillar: str) -> None:
         g = int(BRAND_BG_TOP[1] + (BRAND_BG_BOTTOM[1] - BRAND_BG_TOP[1]) * f)
         b = int(BRAND_BG_TOP[2] + (BRAND_BG_BOTTOM[2] - BRAND_BG_TOP[2]) * f)
         draw.line([(0, y), (width, y)], fill=(r, g, b))
-
-    accent = PILLAR_ACCENT_COLORS.get(pillar, (255, 255, 255))
-
-    title_font = _brand_font(int(width * 0.11))
-    words = title.split()
-    lines, cur = [], ""
-    for w in words:
-        trial = (cur + " " + w).strip()
-        if draw.textbbox((0, 0), trial, font=title_font)[2] > width * 0.86 and cur:
-            lines.append(cur)
-            cur = w
-        else:
-            cur = trial
-    if cur:
-        lines.append(cur)
-    lines = lines[:3]
-
-    line_h = int(width * 0.135)
-    block_h = line_h * len(lines)
-    ty = int(height * 0.40) - block_h // 2
-    for line in lines:
-        lb = draw.textbbox((0, 0), line, font=title_font)
-        lw = lb[2] - lb[0]
-        draw.text((width / 2 - lw / 2, ty), line, font=title_font, fill=(255, 255, 255))
-        ty += line_h
-
-    bar_y = ty + 10
-    bar_w = int(width * 0.30)
-    draw.rectangle([width / 2 - bar_w / 2, bar_y, width / 2 + bar_w / 2, bar_y + 8], fill=accent)
-
-    ax = int(width * 0.5)
-    ay = bar_y + int(height * 0.05)
-    arrow_size = int(width * 0.05)
-    draw.polygon(
-        [
-            (ax - arrow_size, ay),
-            (ax + arrow_size, ay),
-            (ax, ay + int(arrow_size * 1.3)),
-        ],
-        fill=accent,
-    )
-
-    logo_cy = int(height * 0.88)
-    logo_cx = int(width * 0.40)
-    logo_r = width * 0.035
+    logo_cy = int(height * 0.5)
+    logo_cx = int(width * 0.5)
+    logo_r = width * 0.05
     _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
-    small_font = _brand_font(int(width * 0.045))
-    draw.text((logo_cx + logo_r + 14, logo_cy - int(width * 0.028)), BRAND_NAME,
-              font=small_font, fill=BRAND_TEXT_COLOR)
-
     img.save(dest_path)
 
 
@@ -2092,12 +2157,17 @@ def main() -> None:
         return
 
     with tempfile.TemporaryDirectory() as workdir:
-        scene_categories = classify_scene_categories(script.get("sentences") or [])
-        scene_categories = ensure_minimum_byte_coverage(scene_categories)
-        print(f"[pipeline] scene categories: {scene_categories}")
+        storyboard = generate_storyboard(script.get("sentences") or [])
+        print(f"[pipeline] storyboard: {storyboard}")
+        # footage_query (the storyboard's own cinematic-human search phrase)
+        # takes priority per slot; fall back to the script's visual_keywords
+        # entry only if the storyboard call failed for that slot.
+        footage_queries = [
+            (beat.get("footage_query") or "").strip() or script["visual_keywords"][i]
+            for i, beat in enumerate(storyboard)
+        ] if storyboard else script["visual_keywords"]
         clip_paths, stock_attributions = gather_clips(
-            script["visual_keywords"], workdir, sentences=script.get("sentences"),
-            scene_categories=scene_categories,
+            footage_queries, workdir, sentences=script.get("sentences"),
         )
         if not clip_paths:
             sheet_row_base[3] = "Failed"
@@ -2160,7 +2230,8 @@ def main() -> None:
 
         thumbnail_path = os.path.join(workdir, "thumbnail.png")
         try:
-            build_thumbnail(thumbnail_path, script["title"], pillar)
+            build_thumbnail(thumbnail_path, script["title"], pillar,
+                             clip_paths=clip_paths, storyboard=storyboard)
         except Exception as e:  # noqa: BLE001 - thumbnail must never abort the run
             print(f"[pipeline] thumbnail generation failed, continuing without a custom thumbnail: {e}")
             thumbnail_path = None
