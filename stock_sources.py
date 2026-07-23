@@ -25,15 +25,25 @@ actual terms:
       vs. attribution-required vs. editorial-only) varies per individual clip
       with no way to query it programmatically. Not automatable safely.
 
-Every search_*_clip() function here returns the SAME normalized shape as the
-existing pipeline.search_pexels_clip():
+Every search_*_candidates() function here returns a LIST of candidates in
+the SAME normalized shape as before:
     {"id": <str>, "url": <str>, "source": <str>, "attribution": <str|None>}
-or None if nothing usable was found - so gather_clips() can try sources in
-order and fall through exactly like the existing FALLBACK_QUERIES rotation,
-without needing to know which source actually served a given clip.
+(empty list if nothing usable was found) - so gather_clips() can try
+candidates in order, download+inspect each with no_human_filter, and move
+to the next candidate/source/fallback query the moment one is rejected,
+instead of committing to whatever the first search hit happened to be.
+
+IMPORTANT (2026-07-23): these functions do NOT mutate `used_ids` themselves
+anymore - they only READ it, to skip ids already spent elsewhere in the
+video. The CALLER (gather_clips) is responsible for adding an id to
+`used_ids` only once it actually downloads and accepts that candidate
+(passes the no-human check). This changed because the old
+"return the first unused hit" design meant a rejected (person-containing)
+candidate could never be reconsidered or skipped in favor of the next
+result - there was no "next result," only ever one.
 
 API keys are read as optional env vars (PIXABAY_API_KEY, COVERR_API_KEY).
-Missing keys quietly disable that source (return None immediately) rather
+Missing keys quietly disable that source (return [] immediately) rather
 than raising, so a repo/CI environment that hasn't added the new secrets yet
 keeps working exactly as before, on Pexels alone.
 """
@@ -46,9 +56,16 @@ SESSION = requests.Session()
 PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY")
 COVERR_API_KEY = os.environ.get("COVERR_API_KEY")
 
+# How many candidates to consider per source per query before giving up on
+# that query - each candidate may need to be downloaded and inspected by
+# no_human_filter before being accepted or rejected, so this is a real
+# cost/thoroughness tradeoff, not just an API page size.
+MAX_CANDIDATES_PER_SOURCE = 6
 
-def search_pixabay_clip(query: str, used_ids: set) -> dict | None:
-    """Search Pixabay Videos. Returns a normalized clip dict or None.
+
+def search_pixabay_candidates(query: str, used_ids: set, limit: int = MAX_CANDIDATES_PER_SOURCE) -> list:
+    """Search Pixabay Videos. Returns up to `limit` normalized candidate
+    dicts (empty list if none/failed).
 
     Pixabay's video API doesn't support a portrait/orientation filter the
     way Pexels does - most Pixabay video results are landscape. That's fine
@@ -57,7 +74,7 @@ def search_pixabay_clip(query: str, used_ids: set) -> dict | None:
     handled the same way a landscape Pexels fallback clip already is.
     """
     if not PIXABAY_API_KEY:
-        return None
+        return []
     try:
         resp = SESSION.get(
             "https://pixabay.com/api/videos/",
@@ -65,9 +82,10 @@ def search_pixabay_clip(query: str, used_ids: set) -> dict | None:
             timeout=30,
         )
     except requests.RequestException:
-        return None
+        return []
     if resp.status_code != 200:
-        return None
+        return []
+    candidates = []
     for hit in resp.json().get("hits", []):
         vid_id = hit.get("id")
         if vid_id is None or vid_id in used_ids:
@@ -78,16 +96,19 @@ def search_pixabay_clip(query: str, used_ids: set) -> dict | None:
         for size in ("large", "medium", "small", "tiny"):
             file_info = videos.get(size)
             if file_info and file_info.get("url"):
-                used_ids.add(vid_id)
-                return {
+                candidates.append({
                     "id": f"pixabay:{vid_id}", "url": file_info["url"],
                     "source": "pixabay", "attribution": None,
-                }
-    return None
+                })
+                break
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
-def search_coverr_clip(query: str, used_ids: set) -> dict | None:
-    """Search Coverr. Returns a normalized clip dict or None.
+def search_coverr_candidates(query: str, used_ids: set, limit: int = MAX_CANDIDATES_PER_SOURCE) -> list:
+    """Search Coverr. Returns up to `limit` normalized candidate dicts
+    (empty list if none/failed).
 
     Coverr's free-tier license requires attribution (to the clip's creator
     or to Coverr.co) - the caller is responsible for adding a credit line
@@ -95,7 +116,7 @@ def search_coverr_clip(query: str, used_ids: set) -> dict | None:
     pipeline.py already uses for non-CC0 background music credits.
     """
     if not COVERR_API_KEY:
-        return None
+        return []
     try:
         resp = SESSION.get(
             "https://api.coverr.co/videos",
@@ -103,40 +124,44 @@ def search_coverr_clip(query: str, used_ids: set) -> dict | None:
             timeout=30,
         )
     except requests.RequestException:
-        return None
+        return []
     if resp.status_code != 200:
-        return None
+        return []
+    candidates = []
     for hit in resp.json().get("hits", []):
         vid_id = hit.get("id")
         if vid_id is None or vid_id in used_ids:
             continue
         url = (hit.get("urls") or {}).get("mp4")
         if url:
-            used_ids.add(vid_id)
-            return {
+            candidates.append({
                 "id": f"coverr:{vid_id}", "url": url, "source": "coverr",
                 "attribution": "Video by Coverr.co",
-            }
-    return None
+            })
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
-def search_multi_source_clip(query: str, used_ids: set, pexels_search_fn) -> dict | None:
-    """Try Pexels, then Pixabay, then Coverr, in that order, for one query.
+def search_multi_source_candidates(query: str, used_ids: set, pexels_candidates_fn) -> list:
+    """Try Pexels, then Pixabay, then Coverr, in that order, for one query -
+    returns a single combined list of candidates (Pexels' first, in each
+    source's own relevance order), for the caller to download+inspect one
+    at a time until one passes the no-human check.
 
-    `pexels_search_fn` is pipeline.search_pexels_clip, passed in rather than
-    imported directly, since pipeline.py imports THIS module - importing
-    pipeline.py back here would create a circular import. Pexels stays
-    first because it's the most-proven/highest-hit-rate source in this
-    pipeline's history; Pixabay and Coverr are genuinely-licensed
+    `pexels_candidates_fn` is pipeline.search_pexels_candidates, passed in
+    rather than imported directly, since pipeline.py imports THIS module -
+    importing pipeline.py back here would create a circular import. Pexels
+    stays first because it's the most-proven/highest-hit-rate source in
+    this pipeline's history; Pixabay and Coverr are genuinely-licensed
     additional attempts, not replacements, per the "don't depend on a
     single source" direction.
     """
-    clip = pexels_search_fn(query, used_ids)
-    if clip:
-        clip.setdefault("source", "pexels")
-        clip.setdefault("attribution", None)
-        return clip
-    clip = search_pixabay_clip(query, used_ids)
-    if clip:
-        return clip
-    return search_coverr_clip(query, used_ids)
+    candidates = []
+    for c in pexels_candidates_fn(query, used_ids):
+        c.setdefault("source", "pexels")
+        c.setdefault("attribution", None)
+        candidates.append(c)
+    candidates.extend(search_pixabay_candidates(query, used_ids))
+    candidates.extend(search_coverr_candidates(query, used_ids))
+    return candidates

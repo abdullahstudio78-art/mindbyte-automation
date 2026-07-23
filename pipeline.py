@@ -30,13 +30,14 @@ from PIL import Image, ImageDraw, ImageFont
 # below. See character_assets.py for details. Never removes/disables the
 # Pexels path - gather_clips() tries a character asset first per slot and
 # falls back to search_pexels_clip() exactly as before if none is found.
-from stock_sources import search_multi_source_clip
+from stock_sources import search_multi_source_candidates
 from character_assets import (
     render_environment_motion_clip,
     apply_atmosphere_overlay,
     load_characters_manifest,
     select_character_asset,
 )
+from no_human_filter import clip_contains_person
 CHARACTERS_MANIFEST = load_characters_manifest()
 # --- end character asset system (new) ---
 
@@ -735,7 +736,17 @@ def compliance_check(script: dict) -> dict:
 # Pexels
 # ---------------------------------------------------------------------------
 
-def search_pexels_clip(query: str, used_ids: set) -> dict | None:
+MAX_PEXELS_CANDIDATES = 6  # see stock_sources.MAX_CANDIDATES_PER_SOURCE for why
+
+
+def search_pexels_candidates(query: str, used_ids: set, limit: int = MAX_PEXELS_CANDIDATES) -> list:
+    """Returns up to `limit` normalized candidate dicts ({"id","url"}),
+    skipping ids already in `used_ids` but NOT mutating it - the caller
+    marks an id used only once it actually downloads and accepts that
+    candidate (see gather_clips' no-human-filter loop). Previously this
+    returned only the single first unused hit, which meant a candidate
+    that turned out to contain a person could never be skipped in favor
+    of the next result - there was no next result to try."""
     resp = SESSION.get(
         "https://api.pexels.com/videos/search",
         headers={"Authorization": PEXELS_API_KEY},
@@ -743,7 +754,8 @@ def search_pexels_clip(query: str, used_ids: set) -> dict | None:
         timeout=30,
     )
     if resp.status_code != 200:
-        return None
+        return []
+    candidates = []
     for video in resp.json().get("videos", []):
         if video["id"] in used_ids:
             continue
@@ -753,15 +765,19 @@ def search_pexels_clip(query: str, used_ids: set) -> dict | None:
             key=lambda f: (f.get("width") or 0) * (f.get("height") or 0),
             reverse=True,
         )
+        chosen = None
         for f in files:
             if f.get("width") and f.get("height") and f["height"] >= f["width"]:
-                used_ids.add(video["id"])
-                return {"id": video["id"], "url": f["link"]}
+                chosen = f
+                break
         # Fall back to the largest available file if no portrait file exists.
-        if files:
-            used_ids.add(video["id"])
-            return {"id": video["id"], "url": files[0]["link"]}
-    return None
+        if chosen is None and files:
+            chosen = files[0]
+        if chosen:
+            candidates.append({"id": video["id"], "url": chosen["link"]})
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def download_file(url: str, dest_path: str) -> None:
@@ -938,19 +954,47 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None, scene_cat
         # then Coverr, in order, per the "don't depend on a single source"
         # direction - Mixkit and Videvo are deliberately excluded, see
         # stock_sources.py's module docstring for why (ToS/licensing).
-        clip = search_multi_source_clip(keyword, used_ids, search_pexels_clip)
-        if not clip:
-            for fb in FALLBACK_QUERIES:
-                clip = search_multi_source_clip(fb, used_ids, search_pexels_clip)
-                if clip:
-                    break
-        if not clip:
-            continue
+        #
+        # NO-HUMAN ENFORCEMENT (2026-07-23): per explicit user direction, the
+        # channel's only "human" presence is Byte (the illustrated
+        # character) - real people in stock footage must never appear, full
+        # stop. Wording the search query to avoid people (previous attempt)
+        # is not reliable - verified on a real published video that a
+        # person can still turn up under an innocuous-sounding query. So
+        # every CANDIDATE clip is now actually downloaded and inspected by
+        # no_human_filter.clip_contains_person() before being accepted; a
+        # candidate that fails is deleted and the next candidate (next
+        # stock result, then the next fallback query) is tried instead of
+        # settling for whatever came back first.
         dest = os.path.join(workdir, f"clip_{i}.mp4")
-        download_file(clip["url"], dest)
+        accepted_clip = None
+        for query in [keyword] + FALLBACK_QUERIES:
+            for candidate in search_multi_source_candidates(query, used_ids, search_pexels_candidates):
+                try:
+                    download_file(candidate["url"], dest)
+                except Exception:  # noqa: BLE001 - broken URL etc, try next candidate
+                    continue
+                if clip_contains_person(dest):
+                    os.remove(dest)
+                    continue
+                used_ids.add(candidate["id"])
+                accepted_clip = candidate
+                break
+            if accepted_clip:
+                break
+        if not accepted_clip:
+            # Every candidate across every query (including the people-free
+            # FALLBACK_QUERIES) either had a person or failed to download -
+            # skip this slot entirely rather than ever accepting a clip with
+            # a real person in it. gather_clips' 1:1 sentence/clip mapping
+            # contract is broken here (same as the pre-existing "if not
+            # clip: continue" behavior), which is an acceptable tradeoff for
+            # never showing a human on screen.
+            print(f"[pipeline] no people-free clip found for slot {i} ('{keyword}') across all queries - skipping this slot")
+            continue
         clip_paths.append(dest)
-        if clip.get("attribution"):
-            stock_attributions.append(clip["attribution"])
+        if accepted_clip.get("attribution"):
+            stock_attributions.append(accepted_clip["attribution"])
     return clip_paths, stock_attributions
 
 
