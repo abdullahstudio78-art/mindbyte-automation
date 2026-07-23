@@ -174,7 +174,13 @@ CONTENT_PILLARS = {
     },
     "Psychology Experiments & Stories": {
         "tone": "documentary, narrative, slightly suspenseful",
-        "voice": "en-US-DavisNeural",
+        # Swapped from en-US-DavisNeural (2026-07-23): run #33 crashed with
+        # edge_tts.exceptions.NoAudioReceived the first time this pillar's
+        # voice was ever actually exercised on a live run - one of the 4
+        # previously-unvalidated pillar voices. Falling back to
+        # en-US-AriaNeural, the one voice confirmed working across dozens
+        # of prior runs, rather than gambling on another unvalidated name.
+        "voice": "en-US-AriaNeural",
         "base_rate": -3,
         "base_pitch": -4,
         "music_queries": [
