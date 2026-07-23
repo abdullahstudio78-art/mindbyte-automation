@@ -15,3 +15,10 @@ prototype/frames/
 # character-cutout compositing. Test clip delivered directly to the user;
 # not pipeline input/output, so not tracked.
 prototype2/
+
+# Third round of scratch (2026-07-23) - iterating the pre-composed-scene
+# technique on a second image (Alex, bedroom/phone) to test lighting,
+# depth cues, and camera motion per the "prove visual quality before
+# scaling" request. Test clips delivered directly to the user; not
+# pipeline input/output, so not tracked.
+prototype3/
