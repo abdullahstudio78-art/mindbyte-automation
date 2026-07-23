@@ -32,6 +32,7 @@ from PIL import Image, ImageDraw, ImageFont
 # falls back to search_pexels_clip() exactly as before if none is found.
 from character_assets import (
     render_environment_motion_clip,
+    apply_atmosphere_overlay,
     load_characters_manifest,
     select_character_asset,
 )
@@ -709,12 +710,24 @@ def _character_image_to_clip(image_path: str, dest_path: str, duration: float = 
             "crop=1080:1920,"
             f"zoompan=z='min(zoom+0.0015,1.08)':d={frames}:s=1080x1920:fps=30"
         )
+        base_path = dest_path + ".base.mp4"
         subprocess.run(
             ["ffmpeg", "-y", "-i", image_path,
              "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-             "-pix_fmt", "yuv420p", "-vf", zoompan, dest_path],
+             "-pix_fmt", "yuv420p", "-vf", zoompan, base_path],
             check=True, capture_output=True,
         )
+        # Give Byte's own shots the same subtle living/flicker motion as the
+        # illustrated Environment backgrounds (lighter opacity here since a
+        # character close-up shouldn't get as much atmosphere grain as a wide
+        # establishing shot) - whichever asset type a beat lands on, the
+        # on-screen result should read as similarly alive, not just the
+        # backgrounds. Falls back to the plain Ken Burns clip if the shared
+        # overlay asset isn't present or ffmpeg fails for any reason.
+        if apply_atmosphere_overlay(base_path, dest_path, duration, opacity=0.18):
+            os.remove(base_path)
+        else:
+            os.replace(base_path, dest_path)
         return True
     except (subprocess.CalledProcessError, OSError):
         return False

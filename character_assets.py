@@ -237,6 +237,35 @@ def select_character_asset(script_beat_text: str, characters_manifest: list,
     }
 
 
+def apply_atmosphere_overlay(base_clip_path: str, dest_path: str, duration: float, opacity: float = 0.3) -> bool:
+    """Screen-blend the shared atmosphere/rain overlay onto an already-rendered
+    clip (e.g. a character Ken Burns clip or an environment push-in clip), so
+    it picks up the same subtle per-frame flicker/grain motion instead of
+    reading as a perfectly static hold. Used for BOTH environment backgrounds
+    and character illustrations, so whichever asset type gets picked for a
+    beat, the on-screen result has the same living quality, not just the
+    background scenes.
+
+    Returns True and writes dest_path on success. Returns False (leaving
+    dest_path untouched) if the overlay asset is missing or ffmpeg fails, so
+    callers can fall back to the plain (overlay-less) clip they already have.
+    """
+    if not os.path.isfile(ATMOSPHERE_OVERLAY_PATH):
+        return False
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", base_clip_path,
+            "-stream_loop", "-1", "-i", ATMOSPHERE_OVERLAY_PATH,
+            "-filter_complex", f"[0:v][1:v]blend=all_mode=screen:all_opacity={opacity}[out]",
+            "-map", "[out]", "-t", str(duration),
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", dest_path,
+        ], check=True, capture_output=True)
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
+
+
 def render_environment_motion_clip(image_path: str, dest_path: str, duration: float = 4.0) -> None:
     """Render an illustrated Environment background (e.g. a dark bedroom-at-night
     scene from the Bing Image Creator queue) as a moving cinematic clip instead
@@ -268,19 +297,8 @@ def render_environment_motion_clip(image_path: str, dest_path: str, duration: fl
         "-t", str(duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", base_path,
     ], check=True)
 
-    if os.path.isfile(ATMOSPHERE_OVERLAY_PATH):
-        try:
-            subprocess.run([
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", base_path,
-                "-stream_loop", "-1", "-i", ATMOSPHERE_OVERLAY_PATH,
-                "-filter_complex", "[0:v][1:v]blend=all_mode=screen:all_opacity=0.3[out]",
-                "-map", "[out]", "-t", str(duration),
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", dest_path,
-            ], check=True)
-            os.remove(base_path)
-            return
-        except subprocess.CalledProcessError:
-            pass  # fall through to the camera-only clip already on disk
+    if apply_atmosphere_overlay(base_path, dest_path, duration, opacity=0.3):
+        os.remove(base_path)
+        return
 
     os.replace(base_path, dest_path)
