@@ -30,6 +30,7 @@ from PIL import Image, ImageDraw, ImageFont
 # below. See character_assets.py for details. Never removes/disables the
 # Pexels path - gather_clips() tries a character asset first per slot and
 # falls back to search_pexels_clip() exactly as before if none is found.
+from stock_sources import search_multi_source_clip
 from character_assets import (
     render_environment_motion_clip,
     apply_atmosphere_overlay,
@@ -686,6 +687,19 @@ FALLBACK_QUERIES = [
 
 
 # --- Character asset system (new) ---
+# Illustrated character/environment clips are rendered in gather_clips(),
+# BEFORE the real per-sentence voiceover duration is known (that comes from
+# generate_voiceover_segments(), which runs later in main()). assemble_video()
+# later trims every clip down to its real segment duration with `-t`, which
+# can only shorten a source clip, never lengthen one. So these illustrated
+# clips must be rendered at least as long as the longest realistic spoken
+# sentence could run, or a longer-than-expected sentence would trim past the
+# end of a too-short source clip and the video would visibly end/freeze
+# before the audio does. 15s comfortably covers any single TTS sentence this
+# pipeline generates.
+CHARACTER_CLIP_SAFE_DURATION = 15.0
+
+
 def _character_image_to_clip(image_path: str, dest_path: str, duration: float = 3.0) -> bool:
     """Convert a still character illustration into a short silent mp4 clip
     so it can slot into clip_paths exactly like a downloaded Pexels clip
@@ -734,15 +748,16 @@ def _character_image_to_clip(image_path: str, dest_path: str, duration: float = 
 # --- end character asset system (new) ---
 
 
-def gather_clips(keywords: list, workdir: str, sentences: list = None) -> list:
+def gather_clips(keywords: list, workdir: str, sentences: list = None) -> tuple:
     """Download exactly one clip per keyword, in order.
 
     A strict 1:1, order-preserving mapping between sentences and clips is
     required so assemble_video can cut to a new clip exactly when each
     sentence is spoken, instead of cutting on an unrelated fixed timer.
-    If a specific keyword yields nothing on Pexels, fall back through a
-    rotation of generic queries for that slot rather than skipping it, so
-    the clip count never drifts out of sync with the sentence count.
+    If a specific keyword yields nothing on any stock source, fall back
+    through a rotation of generic queries for that slot rather than
+    skipping it, so the clip count never drifts out of sync with the
+    sentence count.
 
     `sentences`, if provided, is the full spoken-line text for each slot
     (same length/order as `keywords`). It's used ONLY for the character-
@@ -750,12 +765,19 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None) -> list:
     ("person thinking bedroom") almost never contains a character's
     narrator-style personality_keywords ("here's why", "explain") the way
     the actual spoken sentence does - matching against keyword text alone
-    made this feature effectively dead code. Pexels search itself still
+    made this feature effectively dead code. Stock search itself still
     uses only `keyword`, unchanged.
+
+    Returns (clip_paths, stock_attributions) - the latter is a list of
+    credit-line strings for any non-CC0 stock source used (currently just
+    Coverr's free-tier attribution requirement), for main() to fold into
+    the video description the same way non-CC0 background-music credits
+    already are.
     """
     used_ids: set = set()
     used_character_files: set = set()
     clip_paths = []
+    stock_attributions: list = []
     for i, keyword in enumerate(keywords):
         # --- Character asset system (new) ---
         # Try an illustrated-character asset for this slot before touching
@@ -774,22 +796,38 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None) -> list:
                 # motion treatment instead of the flat character-cutout Ken
                 # Burns, since these are meant to read as cinematic "Mind
                 # Layer" scenes, not talking-head cutaways.
+                #
+                # IMPORTANT: gather_clips() runs BEFORE generate_voiceover_segments(),
+                # so the real per-sentence audio duration for this slot isn't
+                # known yet - assemble_video() trims this clip down to that
+                # real duration later with `-t`, which can only shorten a
+                # clip, never extend one. Rendering at a short 3-4s default
+                # (the old behavior) meant any sentence whose real spoken
+                # duration ran longer left this segment ending early while
+                # the audio kept playing - exactly the "video doesn't end
+                # correctly" symptom reported after the first test video.
+                # Rendering generously long (CHARACTER_CLIP_SAFE_DURATION)
+                # guarantees there's always enough source to trim down from.
                 try:
-                    render_environment_motion_clip(char_asset["path"], dest)
+                    render_environment_motion_clip(char_asset["path"], dest, duration=CHARACTER_CLIP_SAFE_DURATION)
                     clip_paths.append(dest)
                     used_character_files.add(char_asset["filename"])
                     continue
                 except Exception:
                     pass  # fall through to Pexels below on any render failure
-            elif _character_image_to_clip(char_asset["path"], dest):
+            elif _character_image_to_clip(char_asset["path"], dest, duration=CHARACTER_CLIP_SAFE_DURATION):
                 clip_paths.append(dest)
                 used_character_files.add(char_asset["filename"])
                 continue
         # --- end character asset system (new) ---
-        clip = search_pexels_clip(keyword, used_ids)
+        # Category A (everyday stock environments): try Pexels, then Pixabay,
+        # then Coverr, in order, per the "don't depend on a single source"
+        # direction - Mixkit and Videvo are deliberately excluded, see
+        # stock_sources.py's module docstring for why (ToS/licensing).
+        clip = search_multi_source_clip(keyword, used_ids, search_pexels_clip)
         if not clip:
             for fb in FALLBACK_QUERIES:
-                clip = search_pexels_clip(fb, used_ids)
+                clip = search_multi_source_clip(fb, used_ids, search_pexels_clip)
                 if clip:
                     break
         if not clip:
@@ -797,7 +835,9 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None) -> list:
         dest = os.path.join(workdir, f"clip_{i}.mp4")
         download_file(clip["url"], dest)
         clip_paths.append(dest)
-    return clip_paths
+        if clip.get("attribution"):
+            stock_attributions.append(clip["attribution"])
+    return clip_paths, stock_attributions
 
 
 # ---------------------------------------------------------------------------
@@ -1729,10 +1769,12 @@ def main() -> None:
         return
 
     with tempfile.TemporaryDirectory() as workdir:
-        clip_paths = gather_clips(script["visual_keywords"], workdir, sentences=script.get("sentences"))
+        clip_paths, stock_attributions = gather_clips(
+            script["visual_keywords"], workdir, sentences=script.get("sentences")
+        )
         if not clip_paths:
             sheet_row_base[3] = "Failed"
-            sheet_row_base[14] = "No usable Pexels clips found"
+            sheet_row_base[14] = "No usable stock clips found (Pexels/Pixabay/Coverr)"
             sheet_append(access_token, "Videos!A:O", sheet_row_base)
             print("[pipeline] no clips found - aborting")
             return
@@ -1750,6 +1792,11 @@ def main() -> None:
         # aborting the run over a missing music track.
         final_audio_path = audio_path
         description = script["description"]
+        for attribution in stock_attributions:
+            # Currently only Coverr's free-tier clips carry a required
+            # credit line - Pexels/Pixabay clips used here need none.
+            if attribution not in description:
+                description += f"\n\n{attribution}"
         music_path = os.path.join(workdir, "music.mp3")
         music_meta = fetch_background_music(music_path, pillar)
         if music_meta:
