@@ -855,13 +855,47 @@ def build_title_card_longform(dest_path: str, title: str, pillar: str) -> None:
     img.save(dest_path)
 
 
-def build_thumbnail_longform(dest_path: str, title: str, pillar: str) -> None:
-    """Landscape (1920x1080) counterpart to pipeline.py's build_thumbnail().
-    Long-form had NO custom thumbnail at all before this pass - YouTube was
-    auto-picking a random mid-video frame with illegible baked-in caption
-    text as the cover image, the single biggest gap flagged when the first
-    real long-form upload was reviewed."""
+def build_thumbnail_longform(dest_path: str, title: str, pillar: str,
+                              clip_groups: list = None) -> None:
+    """Landscape (1920x1080) cinematic-emotional-image thumbnail (2026-07-23
+    footage-only pivot - REPLACES the old bold-title-block style, matching
+    pipeline.py's build_thumbnail(): no big text, just the strongest real
+    frame from the video's own footage, color-graded, with at most a small
+    watermark. Falls back to a plain dark still (still no big text) if no
+    clip is available at all."""
     width, height = LF_VIDEO_WIDTH, LF_VIDEO_HEIGHT
+
+    chosen_clip = None
+    if clip_groups:
+        for group in clip_groups:
+            if group:
+                chosen_clip = group[0]
+                break
+
+    if chosen_clip and os.path.exists(chosen_clip):
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", chosen_clip, "-ss", "00:00:00.5",
+                    "-frames:v", "1",
+                    "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                           f"crop={width}:{height},eq=contrast=1.08:saturation=1.05:brightness=-0.02,"
+                           "vignette=PI/6",
+                    dest_path,
+                ],
+                check=True, capture_output=True,
+            )
+            img = Image.open(dest_path).convert("RGB")
+            draw = ImageDraw.Draw(img)
+            logo_cy = int(height * 0.93)
+            logo_cx = int(width * 0.06)
+            logo_r = width * 0.015
+            _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
+            img.save(dest_path)
+            return
+        except Exception as e:  # noqa: BLE001 - fall through to the plain fallback below
+            print(f"[pipeline_longform] cinematic thumbnail frame extraction failed, using fallback: {e}")
+
     img = Image.new("RGB", (width, height), BRAND_BG_TOP)
     draw = ImageDraw.Draw(img)
     for y in range(height):
@@ -870,56 +904,10 @@ def build_thumbnail_longform(dest_path: str, title: str, pillar: str) -> None:
         g = int(BRAND_BG_TOP[1] + (BRAND_BG_BOTTOM[1] - BRAND_BG_TOP[1]) * f)
         b = int(BRAND_BG_TOP[2] + (BRAND_BG_BOTTOM[2] - BRAND_BG_TOP[2]) * f)
         draw.line([(0, y), (width, y)], fill=(r, g, b))
-
-    accent = PILLAR_ACCENT_COLORS.get(pillar, (255, 255, 255))
-
-    title_font = _brand_font(int(height * 0.16))
-    words = title.split()
-    lines, cur = [], ""
-    for w in words:
-        trial = (cur + " " + w).strip()
-        if draw.textbbox((0, 0), trial, font=title_font)[2] > width * 0.86 and cur:
-            lines.append(cur)
-            cur = w
-        else:
-            cur = trial
-    if cur:
-        lines.append(cur)
-    lines = lines[:3]
-
-    line_h = int(height * 0.185)
-    block_h = line_h * len(lines)
-    ty = int(height * 0.42) - block_h // 2
-    for line in lines:
-        lb = draw.textbbox((0, 0), line, font=title_font)
-        lw = lb[2] - lb[0]
-        draw.text((width / 2 - lw / 2, ty), line, font=title_font, fill=(255, 255, 255))
-        ty += line_h
-
-    bar_y = ty + 14
-    bar_w = int(width * 0.22)
-    draw.rectangle([width / 2 - bar_w / 2, bar_y, width / 2 + bar_w / 2, bar_y + 8], fill=accent)
-
-    ax = int(width * 0.5)
-    ay = bar_y + int(height * 0.05)
-    arrow_size = int(width * 0.028)
-    draw.polygon(
-        [
-            (ax - arrow_size, ay),
-            (ax + arrow_size, ay),
-            (ax, ay + int(arrow_size * 1.3)),
-        ],
-        fill=accent,
-    )
-
-    logo_cy = int(height * 0.90)
-    logo_cx = int(width * 0.42)
-    logo_r = width * 0.02
+    logo_cy = int(height * 0.5)
+    logo_cx = int(width * 0.5)
+    logo_r = width * 0.03
     _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
-    small_font = _brand_font(int(height * 0.05))
-    draw.text((logo_cx + logo_r + 14, logo_cy - int(height * 0.028)), BRAND_NAME,
-              font=small_font, fill=BRAND_TEXT_COLOR)
-
     img.save(dest_path)
 
 
@@ -1264,7 +1252,7 @@ def main() -> None:
         # and was relying on a random auto-picked video frame as its cover.
         try:
             thumb_path = os.path.join(workdir, "thumbnail_lf.png")
-            build_thumbnail_longform(thumb_path, script["title"], pillar)
+            build_thumbnail_longform(thumb_path, script["title"], pillar, clip_groups=clip_groups)
             set_youtube_thumbnail(access_token, video_id, thumb_path)
             print("[pipeline_longform] custom branded thumbnail set")
         except Exception as e:  # noqa: BLE001 - thumbnail is a bonus, never abort the run
