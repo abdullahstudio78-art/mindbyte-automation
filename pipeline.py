@@ -39,6 +39,24 @@ from character_assets import (
 )
 from no_human_filter import clip_contains_person
 CHARACTERS_MANIFEST = load_characters_manifest()
+
+# --- Interim stopgap (2026-07-24), per explicit user direction ---
+# The illustrated-character-in-scene system (Lucifer-Talk-style) needs a
+# real generated/illustrated scene library to look right - a runtime cutout
+# composited onto a generic background reads as broken (e.g. a character
+# "walking on a table"), and there's no free stock source for anime-style
+# footage. Until that real asset pipeline is built, the user asked to keep
+# the daily Shorts cadence unbroken with the channel's ORIGINAL plain-stock
+# look (real human stock footage allowed, no Byte/character compositing)
+# rather than have publishing gaps while that work is in progress.
+#
+# Both flags below are OFF for that reason. This is a toggle, not a
+# revert/deletion - the character system and no-human-footage filter code
+# all still exist, tested, and working (see run #41 verification) - once
+# the real illustrated-scene asset library exists, flip these back to True
+# to re-enable them. Do not delete the gated code paths.
+CHARACTER_SYSTEM_ENABLED = False
+NO_HUMAN_FILTER_ENABLED = False
 # --- end character asset system (new) ---
 
 # ---------------------------------------------------------------------------
@@ -960,10 +978,10 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None, scene_cat
         # in which case we fall through to the stock logic below unchanged.
         sentence_text = sentences[i] if sentences and i < len(sentences) else ""
         match_text = f"{keyword} {sentence_text}".strip()
-        char_asset = None if category == "A" else select_character_asset(
+        char_asset = None if (not CHARACTER_SYSTEM_ENABLED or category == "A") else select_character_asset(
             match_text, CHARACTERS_MANIFEST, exclude_files=used_character_files
         )
-        if char_asset is None and category == "B":
+        if CHARACTER_SYSTEM_ENABLED and char_asset is None and category == "B":
             # Category B is a guarantee that Byte appears in this slot (see
             # ensure_minimum_byte_coverage() / MIN_BYTE_CATEGORY_SLOTS) - if
             # this beat's exact wording happened not to contain any of
@@ -1030,7 +1048,7 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None, scene_cat
                     download_file(candidate["url"], dest)
                 except Exception:  # noqa: BLE001 - broken URL etc, try next candidate
                     continue
-                if clip_contains_person(dest):
+                if NO_HUMAN_FILTER_ENABLED and clip_contains_person(dest):
                     os.remove(dest)
                     continue
                 used_ids.add(candidate["id"])

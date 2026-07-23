@@ -1,0 +1,7 @@
+[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(zoom+0.0009,1.15)':d=210:s=1080x1920:fps=30[bg];
+[1:v]scale=-1:1000,eq=saturation=0.85:brightness=-0.02,colorbalance=bs=0.12:bm=0.08[char];
+[bg][char]overlay=x='(main_w-overlay_w)/2-120+240*t/7':y='main_h-overlay_h+40+8*sin(2*PI*t*2)':shortest=1[comp1];
+[2:v]geq=lum='if(lt(mod(X+3*Y+200*T\,45)\,2)\,255\,0)',format=gray,lutyuv=y='val*0.4'[rainmask];
+color=white:s=1080x1920:d=7[white];
+[white][rainmask]alphamerge[rainrgba];
+[comp1][rainrgba]overlay=shortest=1[out]
