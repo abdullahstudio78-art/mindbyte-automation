@@ -31,6 +31,7 @@ from PIL import Image, ImageDraw, ImageFont
 # Pexels path - gather_clips() tries a character asset first per slot and
 # falls back to search_pexels_clip() exactly as before if none is found.
 from character_assets import (
+    render_environment_motion_clip,
     load_characters_manifest,
     select_character_asset,
 )
@@ -754,7 +755,20 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None) -> list:
         char_asset = select_character_asset(match_text, CHARACTERS_MANIFEST, exclude_files=used_character_files)
         if char_asset:
             dest = os.path.join(workdir, f"clip_{i}.mp4")
-            if _character_image_to_clip(char_asset["path"], dest):
+            if char_asset["asset_type"] == "Environments":
+                # Illustrated background plate (dark bedroom, rain-lit street,
+                # etc.) - render with the camera-push + atmosphere-overlay
+                # motion treatment instead of the flat character-cutout Ken
+                # Burns, since these are meant to read as cinematic "Mind
+                # Layer" scenes, not talking-head cutaways.
+                try:
+                    render_environment_motion_clip(char_asset["path"], dest)
+                    clip_paths.append(dest)
+                    used_character_files.add(char_asset["filename"])
+                    continue
+                except Exception:
+                    pass  # fall through to Pexels below on any render failure
+            elif _character_image_to_clip(char_asset["path"], dest):
                 clip_paths.append(dest)
                 used_character_files.add(char_asset["filename"])
                 continue

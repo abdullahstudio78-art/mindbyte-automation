@@ -29,10 +29,19 @@ callers transparently keep using Pexels.
 import os
 import json
 import re
+import subprocess
 
 DEFAULT_ASSETS_ROOT = os.environ.get("ASSETS_ROOT", "./character_assets")
 
-ASSET_TYPES = ["Expressions", "Poses", "Scenes", "Reference"]
+ASSET_TYPES = ["Expressions", "Poses", "Scenes", "Reference", "Environments"]
+
+# Reusable atmosphere/rain overlay clip checked into the repo (generated once
+# via ffmpeg noise+contrast, NOT AI video - see render_environment_motion_clip
+# docstring for why). Looped and screen-blended over Environment illustrations
+# so scenes get real per-frame motion instead of a flat Ken Burns pan alone.
+ATMOSPHERE_OVERLAY_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "assets", "motion", "atmosphere_overlay.mp4"
+)
 
 # Emotional/tone keywords we try to match against filename components, e.g.
 # "alex_bedroom_night_phone_anxious.jpg" -> tone "anxious". Order matters
@@ -149,7 +158,11 @@ def _pick_asset_file(assets_root: str, folder_name: str, script_beat_text: str,
             return (fresh or tone_matches)[0]
 
     if tone == "scene":
-        scene_matches = [f for f in files if f[0] == "Scenes"]
+        # Prefer a fully-illustrated Environment plate (cinematic Mind-Layer
+        # background, gets the camera+atmosphere motion treatment) over the
+        # older flat Scenes cutout shots, when one exists for this character.
+        scene_matches = [f for f in files if f[0] == "Environments"] or \
+            [f for f in files if f[0] == "Scenes"]
         if scene_matches:
             fresh = [f for f in scene_matches if f[2] not in exclude_files]
             return (fresh or scene_matches)[0]
@@ -222,3 +235,52 @@ def select_character_asset(script_beat_text: str, characters_manifest: list,
         "filename": filename,
         "path": full_path,
     }
+
+
+def render_environment_motion_clip(image_path: str, dest_path: str, duration: float = 4.0) -> None:
+    """Render an illustrated Environment background (e.g. a dark bedroom-at-night
+    scene from the Bing Image Creator queue) as a moving cinematic clip instead
+    of a flat static image.
+
+    IMPORTANT - what this is and isn't: there is no AI video-generation tool
+    available in this pipeline (no Runway/Pika/Kling/Sora access), so this is
+    NOT generative motion - the rain doesn't actually fall, the light doesn't
+    actually flicker in any physically simulated way. What it IS: a slow
+    ffmpeg zoompan camera push-in over the illustration, screen-blended with a
+    looped noise-based "atmosphere" overlay (assets/motion/atmosphere_overlay.mp4,
+    generated once and checked into the repo so it's never regenerated at
+    render time) at low opacity. That gives every frame a bit of visible grain/
+    flicker motion on top of the camera move, which reads as more alive than a
+    perfectly static pan, without pretending to be true animation.
+
+    Falls back to a plain camera-only clip (no overlay) if the overlay asset
+    isn't present, so this never hard-fails a real pipeline run.
+    """
+    frames = max(1, int(duration * 30))
+    base_path = dest_path + ".base.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-loglevel", "error", "-i", image_path,
+        "-vf", (
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,"
+            f"zoompan=z='min(zoom+0.0012,1.15)':d={frames}:s=1080x1920:fps=30"
+        ),
+        "-t", str(duration), "-c:v", "libx264", "-pix_fmt", "yuv420p", base_path,
+    ], check=True)
+
+    if os.path.isfile(ATMOSPHERE_OVERLAY_PATH):
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", base_path,
+                "-stream_loop", "-1", "-i", ATMOSPHERE_OVERLAY_PATH,
+                "-filter_complex", "[0:v][1:v]blend=all_mode=screen:all_opacity=0.3[out]",
+                "-map", "[out]", "-t", str(duration),
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", dest_path,
+            ], check=True)
+            os.remove(base_path)
+            return
+        except subprocess.CalledProcessError:
+            pass  # fall through to the camera-only clip already on disk
+
+    os.replace(base_path, dest_path)
