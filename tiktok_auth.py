@@ -22,7 +22,8 @@ this script if the refresh token is ever revoked or expires from disuse.
 Usage:
     export TIKTOK_CLIENT_KEY=...
     export TIKTOK_CLIENT_SECRET=...
-    export TIKTOK_REDIRECT_URI=...   # must exactly match the app's registered redirect URI
+    # Must exactly match the Redirect URI registered on the app's Login Kit page:
+    export TIKTOK_REDIRECT_URI=https://abdullahstudio78-art.github.io/mindbyte-automation/oauth-callback.html
     python tiktok_auth.py
 """
 
