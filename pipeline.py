@@ -25,6 +25,40 @@ import requests
 import math
 from PIL import Image, ImageDraw, ImageFont
 
+# --- Character asset system (new) ---
+# Additive illustrated-character B-roll supplement to the Pexels flow
+# below. See character_assets.py for details. Never removes/disables the
+# Pexels path - gather_clips() tries a character asset first per slot and
+# falls back to search_pexels_clip() exactly as before if none is found.
+from stock_sources import search_multi_source_candidates
+from character_assets import (
+    render_environment_motion_clip,
+    apply_atmosphere_overlay,
+    load_characters_manifest,
+    select_character_asset,
+)
+from no_human_filter import clip_contains_person
+CHARACTERS_MANIFEST = load_characters_manifest()
+
+# --- Interim stopgap (2026-07-24), per explicit user direction ---
+# The illustrated-character-in-scene system (Lucifer-Talk-style) needs a
+# real generated/illustrated scene library to look right - a runtime cutout
+# composited onto a generic background reads as broken (e.g. a character
+# "walking on a table"), and there's no free stock source for anime-style
+# footage. Until that real asset pipeline is built, the user asked to keep
+# the daily Shorts cadence unbroken with the channel's ORIGINAL plain-stock
+# look (real human stock footage allowed, no Byte/character compositing)
+# rather than have publishing gaps while that work is in progress.
+#
+# Both flags below are OFF for that reason. This is a toggle, not a
+# revert/deletion - the character system and no-human-footage filter code
+# all still exist, tested, and working (see run #41 verification) - once
+# the real illustrated-scene asset library exists, flip these back to True
+# to re-enable them. Do not delete the gated code paths.
+CHARACTER_SYSTEM_ENABLED = False
+NO_HUMAN_FILTER_ENABLED = False
+# --- end character asset system (new) ---
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -162,7 +196,13 @@ CONTENT_PILLARS = {
     },
     "Psychology Experiments & Stories": {
         "tone": "documentary, narrative, slightly suspenseful",
-        "voice": "en-US-DavisNeural",
+        # Swapped from en-US-DavisNeural (2026-07-23): run #33 crashed with
+        # edge_tts.exceptions.NoAudioReceived the first time this pillar's
+        # voice was ever actually exercised on a live run - one of the 4
+        # previously-unvalidated pillar voices. Falling back to
+        # en-US-AriaNeural, the one voice confirmed working across dozens
+        # of prior runs, rather than gambling on another unvalidated name.
+        "voice": "en-US-AriaNeural",
         "base_rate": -3,
         "base_pitch": -4,
         "music_queries": [
@@ -374,6 +414,134 @@ def call_groq(prompt: str, _retries: int = 2) -> str:
         return data["choices"][0]["message"]["content"]
 
 
+# ---------------------------------------------------------------------------
+# Visual category classification (A/B/C plan, 2026-07-23 design discussion)
+# ---------------------------------------------------------------------------
+# The pipeline should not treat every beat the same way. Per the explicit
+# spec: classify each spoken sentence into one of three visual categories so
+# gather_clips() can route it appropriately, rather than always trying an
+# illustrated character asset first and falling back to stock:
+#   A - Stock Footage: everyday real-world environments (cities, streets,
+#       parks, offices, cafes, homes, traffic, nature, lifestyle). Byte should
+#       NOT be inserted here - these beats should stay pure stock footage.
+#   B - Hybrid Scene: a cinematic real-world environment with Byte appearing
+#       naturally in it. True compositing (matched lighting/shadow/color grade
+#       so Byte doesn't look pasted on) needs a background-removal step on
+#       Byte's assets that hasn't been built yet - see NOTE in gather_clips().
+#       Until that lands, Category B beats fall back to the same illustrated-
+#       character-cutout handling Category C uses, same as before this change.
+#   C - Custom AI Scene: ONLY for environments/concepts that can't realistically
+#       exist in stock libraries - dreams, memories, abstract psychology,
+#       surreal mental worlds, symbolic visuals, impossible scenarios. Routes
+#       to the illustrated Environments system (render_environment_motion_clip).
+def classify_scene_categories(sentences: list) -> list:
+    """Classify each sentence into "A", "B", "C", or None (classification
+    failed/unavailable for that slot). Returns a list of None (same length
+    as `sentences`) on ANY failure - the classifier is an ADDITIVE routing
+    layer, not a required dependency, so a Groq outage or malformed response
+    must never break a run. gather_clips() treats None the same as before
+    this feature existed (character-first-then-stock, unchanged)."""
+    if not sentences:
+        return []
+    numbered = "\n".join(f"{i}: {s}" for i, s in enumerate(sentences))
+    prompt = (
+        "Classify each numbered sentence below into exactly one visual category "
+        "for a short psychology video. This is a REAL stock-footage-vs-custom-art "
+        "routing decision, not a creative-writing exercise - default to A or B "
+        "unless the sentence is IMPOSSIBLE to represent with a real filmed "
+        "environment. Category C is expensive and should be RARE, but Category B "
+        "is EXPECTED and REQUIRED: Byte, our recurring narrator character, must "
+        "visibly appear talking to the viewer multiple times in every single "
+        "video, or the channel loses its identity - a video with zero B beats "
+        "is a failure. In a typical 16-sentence psychology script, expect "
+        "roughly 6-9 sentences as A, 6-9 as B, and at most 1-3 as C. Any "
+        "sentence that reads naturally as direct address to the viewer "
+        "(\"you\", \"we\", rhetorical questions, narrator commentary, intros, "
+        "transitions, conclusions) should be B, not A - only use A for beats "
+        "that are purely describing OTHER people/environments with no narrator "
+        "voice. If you're unsure between B and C, choose B. If you're unsure "
+        "between A and B, choose B.\n\n"
+        "A - Stock Footage: ONLY use for sentences describing OTHER people, "
+        "in the third person, with no narrator voice - e.g. \"studies show "
+        "people who feel rejected...\", \"a coworker who avoids eye contact...\". "
+        "Everyday real-world environments/activities (cities, streets, parks, "
+        "offices, cafes, homes, bedrooms, traffic, nature, walking, typing, "
+        "phones, conversations, commuting, exercising, cooking, etc.) are the "
+        "right VISUAL content for these, but the deciding factor for A vs B is "
+        "whether the sentence is narrator commentary or third-person "
+        "description.\n"
+        "B - Hybrid Scene (EXPECTED, roughly as common as A): any sentence "
+        "that is our recurring narrator character (Byte) speaking directly - "
+        "intros, hooks, transitions, rhetorical questions, \"you\"/\"we\" "
+        "statements, explanations, insights, conclusions, calls to action. "
+        "Most of a typical script is written in this narrator voice, so most "
+        "sentences should be B, not A.\n"
+        "C - Custom AI Scene (RARE - use sparingly): reserve strictly for "
+        "concepts that CANNOT be represented by any real filmed environment "
+        "at all - literal dreams, literal memories being replayed, abstract "
+        "mental/psychological metaphors made visual (a fractured mind, a maze "
+        "of thoughts), surreal or impossible imagery, or explicitly symbolic "
+        "visuals. A sentence merely being about emotions, growth, healing, or "
+        "relationships in the abstract is NOT enough to qualify for C - only "
+        "use C when the literal content described could not be filmed by a "
+        "camera in the real world.\n\n"
+        f"Sentences:\n{numbered}\n\n"
+        'Respond ONLY with JSON: {"categories": ["A", "B", "C", ...]} - exact '
+        "same order and count as the sentences above."
+    )
+    try:
+        raw = call_groq(prompt)
+        data = json.loads(raw)
+        categories = data.get("categories", [])
+        if len(categories) != len(sentences):
+            print(f"[pipeline] scene category count mismatch ({len(categories)} vs "
+                  f"{len(sentences)} sentences) - falling back to default routing")
+            return [None] * len(sentences)
+        return [c if c in ("A", "B", "C") else None for c in categories]
+    except Exception as e:  # noqa: BLE001 - classifier must never abort a run
+        print(f"[pipeline] scene category classification failed, falling back: {e}")
+        return [None] * len(sentences)
+
+
+# Minimum number of Category-B (Byte) slots every published video must have.
+# Added 2026-07-23 after run #40 was verified to have ZERO Byte appearances:
+# the classifier (an LLM call) had swung to labeling all 16 sentences "A"
+# after the earlier over-labeling-as-C fix, and since gather_clips() only
+# even TRIES a character asset for non-A slots (see the "category == 'A'"
+# check there), an all-A result silently means Byte never appears at all -
+# a prompt-only fix already failed once for the human-footage problem, so
+# this is enforced in code, not just in the LLM prompt, to make it a hard
+# guarantee rather than something one bad classifier call can undo again.
+MIN_BYTE_CATEGORY_SLOTS = 3
+
+
+def ensure_minimum_byte_coverage(categories: list) -> list:
+    """Force at least MIN_BYTE_CATEGORY_SLOTS entries to "B" if the
+    classifier didn't already produce enough B/C slots on its own, so Byte
+    (our recurring narrator) is guaranteed to appear multiple times in every
+    video regardless of any single classifier call's quirks. Only ever
+    converts "A" (or None) slots to "B" - never touches existing B/C calls.
+    Evenly spaces the forced slots across the video rather than clustering
+    them at the start. No-ops on an empty list.
+    """
+    if not categories:
+        return categories
+    categories = list(categories)
+    existing = sum(1 for c in categories if c in ("B", "C"))
+    needed = MIN_BYTE_CATEGORY_SLOTS - existing
+    if needed <= 0:
+        return categories
+    candidates = [i for i, c in enumerate(categories) if c not in ("B", "C")]
+    if not candidates:
+        return categories
+    needed = min(needed, len(candidates))
+    step = max(1, len(candidates) // needed)
+    chosen = candidates[::step][:needed]
+    for i in chosen:
+        categories[i] = "B"
+    return categories
+
+
 def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
     feedback_block = ""
     if feedback:
@@ -451,11 +619,20 @@ def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
           hashtags).
         - Also produce "visual_keywords": an array with EXACTLY the same
           number of entries as "sentences", in the same order - one 2-3
-          word stock-video search phrase per sentence, for REAL,
-          human-centric, emotionally matching footage (facial expressions,
-          real-life situations, people in relatable moments). Avoid
-          abstract or generic queries like "brain neurons" unless the
-          sentence is literally about brain anatomy.
+          word stock-video search phrase per sentence, for CINEMATIC,
+          PEOPLE-FREE B-roll that fits an anime/illustrated-character
+          channel: technology and futuristic machinery, robots, abstract
+          particles/light, neural-network-style visuals, nature (ocean,
+          forest, sky, weather), architecture and cityscapes shot WITHOUT
+          pedestrians or faces in frame, close-ups of objects, clocks,
+          screens, or environments. Byte (our illustrated narrator)
+          appears as the "human" presence in this channel - real human
+          faces/bodies in the stock footage visually clash with his
+          anime style, so NEVER request queries centered on people, faces,
+          hands, or human activity ("person thinking", "couple talking",
+          "handshake", etc.). Prefer mood/metaphor over literal
+          illustration - e.g. for a sentence about overthinking, prefer
+          "tangled wires" or "spinning gears" over "person worrying".
         - Also produce "tags": an array of 10-15 SEARCH TERMS a real viewer
           would type into YouTube (NOT stock-footage descriptions) - a mix
           of broad terms ("psychology facts", "human behavior", "why
@@ -622,7 +799,17 @@ def compliance_check(script: dict) -> dict:
 # Pexels
 # ---------------------------------------------------------------------------
 
-def search_pexels_clip(query: str, used_ids: set) -> dict | None:
+MAX_PEXELS_CANDIDATES = 6  # see stock_sources.MAX_CANDIDATES_PER_SOURCE for why
+
+
+def search_pexels_candidates(query: str, used_ids: set, limit: int = MAX_PEXELS_CANDIDATES) -> list:
+    """Returns up to `limit` normalized candidate dicts ({"id","url"}),
+    skipping ids already in `used_ids` but NOT mutating it - the caller
+    marks an id used only once it actually downloads and accepts that
+    candidate (see gather_clips' no-human-filter loop). Previously this
+    returned only the single first unused hit, which meant a candidate
+    that turned out to contain a person could never be skipped in favor
+    of the next result - there was no next result to try."""
     resp = SESSION.get(
         "https://api.pexels.com/videos/search",
         headers={"Authorization": PEXELS_API_KEY},
@@ -630,7 +817,8 @@ def search_pexels_clip(query: str, used_ids: set) -> dict | None:
         timeout=30,
     )
     if resp.status_code != 200:
-        return None
+        return []
+    candidates = []
     for video in resp.json().get("videos", []):
         if video["id"] in used_ids:
             continue
@@ -640,15 +828,19 @@ def search_pexels_clip(query: str, used_ids: set) -> dict | None:
             key=lambda f: (f.get("width") or 0) * (f.get("height") or 0),
             reverse=True,
         )
+        chosen = None
         for f in files:
             if f.get("width") and f.get("height") and f["height"] >= f["width"]:
-                used_ids.add(video["id"])
-                return {"id": video["id"], "url": f["link"]}
+                chosen = f
+                break
         # Fall back to the largest available file if no portrait file exists.
-        if files:
-            used_ids.add(video["id"])
-            return {"id": video["id"], "url": files[0]["link"]}
-    return None
+        if chosen is None and files:
+            chosen = files[0]
+        if chosen:
+            candidates.append({"id": video["id"], "url": chosen["link"]})
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def download_file(url: str, dest_path: str) -> None:
@@ -660,36 +852,224 @@ def download_file(url: str, dest_path: str) -> None:
 
 
 FALLBACK_QUERIES = [
-    "nature", "abstract background", "city timelapse", "clouds timelapse",
-    "ocean waves", "forest aerial", "starry sky",
+    # People-free, cinematic B-roll only (2026-07-23 direction: the channel's
+    # only "human" presence should be Byte's illustrated character - real
+    # people in stock clips visually clash with his anime style). Kept to
+    # nature/tech/abstract/architecture themes, deliberately excluding any
+    # query that tends to surface pedestrians, hands, or faces.
+    "nature", "abstract background", "city timelapse (no people)",
+    "clouds timelapse", "ocean waves", "forest aerial", "starry sky",
+    "futuristic technology", "robot machinery", "neural network abstract",
+    "circuit board macro", "particles light abstract", "gears machinery",
+    "empty architecture", "rain window", "clock close up",
 ]
 
 
-def gather_clips(keywords: list, workdir: str) -> list:
+# --- Character asset system (new) ---
+# Illustrated character/environment clips are rendered in gather_clips(),
+# BEFORE the real per-sentence voiceover duration is known (that comes from
+# generate_voiceover_segments(), which runs later in main()). assemble_video()
+# later trims every clip down to its real segment duration with `-t`, which
+# can only shorten a source clip, never lengthen one. So these illustrated
+# clips must be rendered at least as long as the longest realistic spoken
+# sentence could run, or a longer-than-expected sentence would trim past the
+# end of a too-short source clip and the video would visibly end/freeze
+# before the audio does. 15s comfortably covers any single TTS sentence this
+# pipeline generates.
+CHARACTER_CLIP_SAFE_DURATION = 15.0
+
+
+def _character_image_to_clip(image_path: str, dest_path: str, duration: float = 3.0) -> bool:
+    """Convert a still character illustration into a short silent mp4 clip
+    so it can slot into clip_paths exactly like a downloaded Pexels clip
+    (assemble_video() trims every clip_paths[i] to segment_durations[i] via
+    plain -i/-t, which needs a looped image source, not a single frame).
+    Returns True on success, False on any ffmpeg failure (caller should
+    treat that the same as "no asset found" and fall back to Pexels)."""
+    try:
+        frames = max(1, int(duration * 30))
+        # Slow, subtle Ken Burns zoom (1.0 -> ~1.08x over the clip) so a
+        # held illustration reads as a deliberate cinematic shot rather
+        # than a static slideshow image - directly addresses the standing
+        # "must not feel like a slideshow" requirement for illustrated
+        # character beats, same as real B-roll clips already have motion.
+        # Source character art comes in mixed aspect ratios (portrait
+        # reference shots, landscape scene shots), so scale-to-cover +
+        # center-crop to the target 1080x1920 frame before zoompan, rather
+        # than a plain scale that can leave one dimension too small for
+        # zoompan/crop to work with.
+        zoompan = (
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,"
+            f"zoompan=z='min(zoom+0.0015,1.08)':d={frames}:s=1080x1920:fps=30"
+        )
+        base_path = dest_path + ".base.mp4"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", image_path,
+             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+             "-pix_fmt", "yuv420p", "-vf", zoompan, base_path],
+            check=True, capture_output=True,
+        )
+        # Give Byte's own shots the same subtle living/flicker motion as the
+        # illustrated Environment backgrounds (lighter opacity here since a
+        # character close-up shouldn't get as much atmosphere grain as a wide
+        # establishing shot) - whichever asset type a beat lands on, the
+        # on-screen result should read as similarly alive, not just the
+        # backgrounds. Falls back to the plain Ken Burns clip if the shared
+        # overlay asset isn't present or ffmpeg fails for any reason.
+        if apply_atmosphere_overlay(base_path, dest_path, duration, opacity=0.18):
+            os.remove(base_path)
+        else:
+            os.replace(base_path, dest_path)
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
+# --- end character asset system (new) ---
+
+
+def gather_clips(keywords: list, workdir: str, sentences: list = None, scene_categories: list = None) -> tuple:
     """Download exactly one clip per keyword, in order.
+
+    `scene_categories`, if provided (same length/order as `keywords`), is the
+    per-beat A/B/C classification from classify_scene_categories(). Category
+    "A" (pure everyday stock footage) skips the illustrated-character-asset
+    attempt entirely, so a beat like "walking down a city street" doesn't
+    accidentally get Byte pasted into a generic B-roll shot that was never
+    meant to feature him. Categories "B"/"C" and None (classifier
+    unavailable/skipped this slot) all go through the existing character-
+    asset-first logic unchanged - see the module-level A/B/C comment block
+    above classify_scene_categories() for why B and C share handling for now.
 
     A strict 1:1, order-preserving mapping between sentences and clips is
     required so assemble_video can cut to a new clip exactly when each
     sentence is spoken, instead of cutting on an unrelated fixed timer.
-    If a specific keyword yields nothing on Pexels, fall back through a
-    rotation of generic queries for that slot rather than skipping it, so
-    the clip count never drifts out of sync with the sentence count.
+    If a specific keyword yields nothing on any stock source, fall back
+    through a rotation of generic queries for that slot rather than
+    skipping it, so the clip count never drifts out of sync with the
+    sentence count.
+
+    `sentences`, if provided, is the full spoken-line text for each slot
+    (same length/order as `keywords`). It's used ONLY for the character-
+    asset match below, since a 2-3 word stock-footage search phrase
+    ("person thinking bedroom") almost never contains a character's
+    narrator-style personality_keywords ("here's why", "explain") the way
+    the actual spoken sentence does - matching against keyword text alone
+    made this feature effectively dead code. Stock search itself still
+    uses only `keyword`, unchanged.
+
+    Returns (clip_paths, stock_attributions) - the latter is a list of
+    credit-line strings for any non-CC0 stock source used (currently just
+    Coverr's free-tier attribution requirement), for main() to fold into
+    the video description the same way non-CC0 background-music credits
+    already are.
     """
     used_ids: set = set()
+    used_character_files: set = set()
     clip_paths = []
+    stock_attributions: list = []
     for i, keyword in enumerate(keywords):
-        clip = search_pexels_clip(keyword, used_ids)
-        if not clip:
-            for fb in FALLBACK_QUERIES:
-                clip = search_pexels_clip(fb, used_ids)
-                if clip:
-                    break
-        if not clip:
-            continue
+        category = scene_categories[i] if scene_categories and i < len(scene_categories) else None
+        # --- Character asset system (new) ---
+        # Try an illustrated-character asset for this slot before touching
+        # stock at all - UNLESS this beat was classified as Category A (pure
+        # everyday stock footage), in which case Byte should never appear
+        # here at all. select_character_asset() returns None whenever no
+        # character/asset matches (or assets aren't present on disk yet),
+        # in which case we fall through to the stock logic below unchanged.
+        sentence_text = sentences[i] if sentences and i < len(sentences) else ""
+        match_text = f"{keyword} {sentence_text}".strip()
+        char_asset = None if (not CHARACTER_SYSTEM_ENABLED or category == "A") else select_character_asset(
+            match_text, CHARACTERS_MANIFEST, exclude_files=used_character_files
+        )
+        if CHARACTER_SYSTEM_ENABLED and char_asset is None and category == "B":
+            # Category B is a guarantee that Byte appears in this slot (see
+            # ensure_minimum_byte_coverage() / MIN_BYTE_CATEGORY_SLOTS) - if
+            # this beat's exact wording happened not to contain any of
+            # Byte's personality_keywords, force-select Byte directly rather
+            # than silently falling through to stock and breaking that
+            # guarantee.
+            char_asset = select_character_asset(
+                match_text, CHARACTERS_MANIFEST, exclude_files=used_character_files,
+                force_character_name="Byte",
+            )
+        if char_asset:
+            dest = os.path.join(workdir, f"clip_{i}.mp4")
+            if char_asset["asset_type"] == "Environments":
+                # Illustrated background plate (dark bedroom, rain-lit street,
+                # etc.) - render with the camera-push + atmosphere-overlay
+                # motion treatment instead of the flat character-cutout Ken
+                # Burns, since these are meant to read as cinematic "Mind
+                # Layer" scenes, not talking-head cutaways.
+                #
+                # IMPORTANT: gather_clips() runs BEFORE generate_voiceover_segments(),
+                # so the real per-sentence audio duration for this slot isn't
+                # known yet - assemble_video() trims this clip down to that
+                # real duration later with `-t`, which can only shorten a
+                # clip, never extend one. Rendering at a short 3-4s default
+                # (the old behavior) meant any sentence whose real spoken
+                # duration ran longer left this segment ending early while
+                # the audio kept playing - exactly the "video doesn't end
+                # correctly" symptom reported after the first test video.
+                # Rendering generously long (CHARACTER_CLIP_SAFE_DURATION)
+                # guarantees there's always enough source to trim down from.
+                try:
+                    render_environment_motion_clip(char_asset["path"], dest, duration=CHARACTER_CLIP_SAFE_DURATION)
+                    clip_paths.append(dest)
+                    used_character_files.add(char_asset["filename"])
+                    continue
+                except Exception:
+                    pass  # fall through to Pexels below on any render failure
+            elif _character_image_to_clip(char_asset["path"], dest, duration=CHARACTER_CLIP_SAFE_DURATION):
+                clip_paths.append(dest)
+                used_character_files.add(char_asset["filename"])
+                continue
+        # --- end character asset system (new) ---
+        # Category A (everyday stock environments): try Pexels, then Pixabay,
+        # then Coverr, in order, per the "don't depend on a single source"
+        # direction - Mixkit and Videvo are deliberately excluded, see
+        # stock_sources.py's module docstring for why (ToS/licensing).
+        #
+        # NO-HUMAN ENFORCEMENT (2026-07-23): per explicit user direction, the
+        # channel's only "human" presence is Byte (the illustrated
+        # character) - real people in stock footage must never appear, full
+        # stop. Wording the search query to avoid people (previous attempt)
+        # is not reliable - verified on a real published video that a
+        # person can still turn up under an innocuous-sounding query. So
+        # every CANDIDATE clip is now actually downloaded and inspected by
+        # no_human_filter.clip_contains_person() before being accepted; a
+        # candidate that fails is deleted and the next candidate (next
+        # stock result, then the next fallback query) is tried instead of
+        # settling for whatever came back first.
         dest = os.path.join(workdir, f"clip_{i}.mp4")
-        download_file(clip["url"], dest)
+        accepted_clip = None
+        for query in [keyword] + FALLBACK_QUERIES:
+            for candidate in search_multi_source_candidates(query, used_ids, search_pexels_candidates):
+                try:
+                    download_file(candidate["url"], dest)
+                except Exception:  # noqa: BLE001 - broken URL etc, try next candidate
+                    continue
+                if NO_HUMAN_FILTER_ENABLED and clip_contains_person(dest):
+                    os.remove(dest)
+                    continue
+                used_ids.add(candidate["id"])
+                accepted_clip = candidate
+                break
+            if accepted_clip:
+                break
+        if not accepted_clip:
+            # Every candidate across every query (including the people-free
+            # FALLBACK_QUERIES) either had a person or failed to download -
+            # skip this slot entirely rather than ever accepting a clip with
+            # a real person in it. gather_clips' 1:1 sentence/clip mapping
+            # contract is broken here (same as the pre-existing "if not
+            # clip: continue" behavior), which is an acceptable tradeoff for
+            # never showing a human on screen.
+            print(f"[pipeline] no people-free clip found for slot {i} ('{keyword}') across all queries - skipping this slot")
+            continue
         clip_paths.append(dest)
-    return clip_paths
+        if accepted_clip.get("attribution"):
+            stock_attributions.append(accepted_clip["attribution"])
+    return clip_paths, stock_attributions
 
 
 # ---------------------------------------------------------------------------
@@ -705,7 +1085,11 @@ MUSIC_QUERIES = [
     "ambient technology", "dark ambient minimal", "inspiring ambient",
 ]
 MIN_MUSIC_DURATION_MS = 30000  # skip very short stingers that can't cover a full clip
-MUSIC_VOLUME = 0.22  # bumped up from 0.15 (2026-07-19) - user found music too quiet
+MUSIC_VOLUME = 0.14  # lowered from 0.22 (2026-07-23) - user found the louder bed
+# distracting under narration; 0.14 keeps a felt-but-not-noticed ambient bed.
+# (History: was 0.15 originally, bumped to 0.22 on 2026-07-19 because music was
+# too quiet, now brought back down because loud enough to distract - the goal
+# is present-but-unobtrusive, not loud.)
 
 # ---------------------------------------------------------------------------
 # Visual branding (content-strategy branding pass, 2026-07-19) - a
@@ -930,48 +1314,85 @@ def fetch_background_music(dest_path: str, pillar: str) -> dict | None:
     ambient for Brain & Neuroscience, subtle tension for Psychology
     Experiments & Stories, etc. - falling back to the generic
     MUSIC_QUERIES list if the pillar has none or nothing is found.
+
+    IMPORTANT (fixed 2026-07-23): previously this tried exactly ONE
+    randomly-chosen query and gave up entirely - returning None - the
+    moment that single query had no results, which is why run #37
+    published with no music at all even though Openverse almost
+    certainly had SOMETHING usable under a different query. Now it
+    tries every pillar query, then every generic fallback query (in a
+    shuffled, deduplicated order), and only gives up after all of them
+    come up empty - music should be the exception-not-the-rule case,
+    not "first query fails -> silent video."
     """
-    queries = CONTENT_PILLARS.get(pillar, {}).get("music_queries") or MUSIC_QUERIES
-    query = random.choice(queries)
-    try:
-        resp = SESSION.get(
-            OPENVERSE_AUDIO_URL,
-            params={"q": query, "license_type": "commercial", "page_size": 10},
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            print(f"[pipeline] music search failed: {resp.status_code} {resp.text[:200]}")
-            return None
-        results = resp.json().get("results", [])
-        candidates = [
-            r for r in results
-            if r.get("url") and (r.get("duration") or 0) >= MIN_MUSIC_DURATION_MS
-        ]
-        if not candidates:
-            print(f"[pipeline] no suitable music candidates for query '{query}'")
-            return None
-        track = random.choice(candidates)
-        download_file(track["url"], dest_path)
-        return {
-            "title": track.get("title") or "Untitled",
-            "creator": track.get("creator") or "Unknown artist",
-            "license": (track.get("license") or "unknown").lower(),
-        }
-    except Exception as e:  # noqa: BLE001 - deliberately broad, see docstring
-        print(f"[pipeline] music fetch failed, continuing without music: {e}")
-        return None
+    pillar_queries = CONTENT_PILLARS.get(pillar, {}).get("music_queries") or []
+    # Try the pillar's own mood-matched queries first, then fall back to the
+    # generic list - dedup while preserving order, then shuffle each group
+    # independently so repeated runs don't always hammer the same query first.
+    seen = set()
+    ordered_queries = []
+    for group in (pillar_queries, MUSIC_QUERIES):
+        group = list(group)
+        random.shuffle(group)
+        for q in group:
+            if q not in seen:
+                seen.add(q)
+                ordered_queries.append(q)
+
+    for query in ordered_queries:
+        try:
+            resp = SESSION.get(
+                OPENVERSE_AUDIO_URL,
+                params={"q": query, "license_type": "commercial", "page_size": 10},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                print(f"[pipeline] music search failed for '{query}': {resp.status_code} {resp.text[:200]}")
+                continue
+            results = resp.json().get("results", [])
+            candidates = [
+                r for r in results
+                if r.get("url") and (r.get("duration") or 0) >= MIN_MUSIC_DURATION_MS
+            ]
+            if not candidates:
+                print(f"[pipeline] no suitable music candidates for query '{query}', trying next query")
+                continue
+            track = random.choice(candidates)
+            download_file(track["url"], dest_path)
+            return {
+                "title": track.get("title") or "Untitled",
+                "creator": track.get("creator") or "Unknown artist",
+                "license": (track.get("license") or "unknown").lower(),
+            }
+        except Exception as e:  # noqa: BLE001 - deliberately broad, see docstring
+            print(f"[pipeline] music fetch failed for '{query}', trying next query: {e}")
+            continue
+
+    print(f"[pipeline] no suitable music found across {len(ordered_queries)} queries - continuing without music")
+    return None
 
 def mix_background_music(voice_path: str, music_path: str, duration: float,
                           dest_path: str) -> None:
     """Loop the music bed to cover the narration, duck its volume well
-    under the voice, and mix the two into a single audio track."""
+    under the voice, and mix the two into a single audio track.
+
+    On top of the low MUSIC_VOLUME, the music bed is gently EQ'd (highpass
+    to drop rumble, lowpass to tame bright/percussive transients that
+    otherwise poke through under the voice) and lightly compressed so it
+    reads as a soft ambient texture rather than a competing second layer -
+    "present but unobtrusive" per user feedback that the previous mix was
+    distracting under narration.
+    """
     subprocess.run(
         [
             "ffmpeg", "-y",
             "-stream_loop", "-1", "-i", music_path,
             "-i", voice_path,
             "-filter_complex",
-            f"[0:a]atrim=0:{duration:.3f},volume={MUSIC_VOLUME}[music];"
+            f"[0:a]atrim=0:{duration:.3f},"
+            "highpass=f=150,lowpass=f=6000,"
+            f"volume={MUSIC_VOLUME},"
+            "acompressor=threshold=0.1:ratio=4:attack=20:release=250[music];"
             f"[1:a]volume=1.0[voice];"
             f"[music][voice]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
             "-map", "[aout]", "-t", f"{duration:.3f}",
@@ -1178,24 +1599,74 @@ HIGHLIGHT_KEYWORDS = {
 HIGHLIGHT_ASS_COLOR = "07C1FF"  # amber/gold
 BASE_ASS_COLOR = "FFFFFF"  # matches the Style line's PrimaryColour (white)
 
-def _highlight_ass_text(sentence: str) -> str:
-    """Uppercase and color any HIGHLIGHT_KEYWORDS word within a caption
-    line using inline ASS override tags, e.g. "people often avoid
-    difficult conversations" becomes "people often {\\c&H07C1FF&}AVOID{\\c&HFFFFFF&}
-    difficult conversations" if "avoid" is on the list. A plain SRT file
-    can't do this (force_style only applies one uniform style to the
-    whole line) - this is why captions moved to .ass in phase 2."""
+# Words to never pick for the highlight-fallback below (function words carry
+# no visual "punch" even when they happen to be the longest word in a short
+# caption chunk).
+_HIGHLIGHT_FALLBACK_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "this",
+    "that", "these", "those", "your", "you", "our", "we", "it", "its", "of",
+    "to", "in", "on", "for", "with", "as", "at", "by", "from", "be", "been",
+    "being", "has", "have", "had", "do", "does", "did", "will", "would",
+    "can", "could", "should", "not", "so", "if", "than", "then", "there",
+    "here", "just", "really", "very", "quite", "almost", "into", "out",
+    "about", "over", "under", "when", "while", "what", "why", "how",
+}
+
+
+def _highlight_ass_text(sentence: str, force_highlight: bool = True) -> str:
+    """Uppercase and color a word within a caption chunk using inline ASS
+    override tags, e.g. "people often avoid difficult conversations" becomes
+    "people often {\\c&H07C1FF&}AVOID{\\c&HFFFFFF&} difficult conversations"
+    if "avoid" is on the HIGHLIGHT_KEYWORDS list. A plain SRT file can't do
+    this (force_style only applies one uniform style to the whole line) -
+    this is why captions moved to .ass in phase 2.
+
+    Real-video review (2026-07-23, run #36) showed captions coming out
+    plain white for most chunks in practice - HIGHLIGHT_KEYWORDS is a fixed
+    list of emotionally-loaded words, and most 3-4 word caption chunks
+    simply don't happen to contain one, so the "colored caption" identity
+    almost never actually showed on screen. When force_highlight is True
+    (the default) and no HIGHLIGHT_KEYWORDS word matched, fall back to
+    coloring the single longest non-stopword in the chunk instead, so
+    nearly every caption chunk gets some color pop rather than only the
+    rare keyword hit - this is what actually makes it read as a
+    consistently "colored caption style" across a whole video.
+    """
+    matched = False
+
     def repl(match):
+        nonlocal matched
         word = match.group(0)
         core = re.sub(r"[^A-Za-z']", "", word).lower()
         if core in HIGHLIGHT_KEYWORDS:
+            matched = True
             return (
                 r"{\c&H" + HIGHLIGHT_ASS_COLOR + r"&}"
                 + word.upper()
                 + r"{\c&H" + BASE_ASS_COLOR + r"&}"
             )
         return word
-    return re.sub(r"\S+", repl, sentence)
+
+    result = re.sub(r"\S+", repl, sentence)
+    if matched or not force_highlight:
+        return result
+
+    words = sentence.split()
+    candidates = [
+        w for w in words
+        if len(re.sub(r"[^A-Za-z']", "", w)) >= 4
+        and re.sub(r"[^A-Za-z']", "", w).lower() not in _HIGHLIGHT_FALLBACK_STOPWORDS
+    ]
+    if not candidates:
+        return result
+    target = max(candidates, key=lambda w: len(re.sub(r"[^A-Za-z']", "", w)))
+    idx = words.index(target)
+    words[idx] = (
+        r"{\c&H" + HIGHLIGHT_ASS_COLOR + r"&}"
+        + target.upper()
+        + r"{\c&H" + BASE_ASS_COLOR + r"&}"
+    )
+    return " ".join(words)
 
 def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
     """Build a MindByte-branded .ass caption file.
@@ -1621,10 +2092,16 @@ def main() -> None:
         return
 
     with tempfile.TemporaryDirectory() as workdir:
-        clip_paths = gather_clips(script["visual_keywords"], workdir)
+        scene_categories = classify_scene_categories(script.get("sentences") or [])
+        scene_categories = ensure_minimum_byte_coverage(scene_categories)
+        print(f"[pipeline] scene categories: {scene_categories}")
+        clip_paths, stock_attributions = gather_clips(
+            script["visual_keywords"], workdir, sentences=script.get("sentences"),
+            scene_categories=scene_categories,
+        )
         if not clip_paths:
             sheet_row_base[3] = "Failed"
-            sheet_row_base[14] = "No usable Pexels clips found"
+            sheet_row_base[14] = "No usable stock clips found (Pexels/Pixabay/Coverr)"
             sheet_append(access_token, "Videos!A:O", sheet_row_base)
             print("[pipeline] no clips found - aborting")
             return
@@ -1642,6 +2119,11 @@ def main() -> None:
         # aborting the run over a missing music track.
         final_audio_path = audio_path
         description = script["description"]
+        for attribution in stock_attributions:
+            # Currently only Coverr's free-tier clips carry a required
+            # credit line - Pexels/Pixabay clips used here need none.
+            if attribution not in description:
+                description += f"\n\n{attribution}"
         music_path = os.path.join(workdir, "music.mp3")
         music_meta = fetch_background_music(music_path, pillar)
         if music_meta:

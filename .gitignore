@@ -1,0 +1,17 @@
+__pycache__/
+
+# Scratch output from local cinematic-shot prototyping (2026-07-23) - test
+# renders/frames delivered directly to the user via chat, not pipeline
+# inputs/outputs, so they don't belong in version control. The reusable
+# technique (background removal + filter graph) is written up in
+# prototype/README.md, which IS tracked.
+prototype/*.mp4
+prototype/*.png
+prototype/frames/
+
+# Second round of scratch (2026-07-23) - proved out the "pre-composed
+# scene image + pan/zoom" technique (character already drawn into the
+# environment by the user's own generated images) instead of runtime
+# character-cutout compositing. Test clip delivered directly to the user;
+# not pipeline input/output, so not tracked.
+prototype2/
