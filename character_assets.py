@@ -76,17 +76,35 @@ def load_characters_manifest(manifest_path: str = None) -> list:
         return []
 
 
-def _pick_character(script_beat_text: str, characters_manifest: list) -> dict | None:
+def _pick_character(script_beat_text: str, characters_manifest: list,
+                     assets_root: str = None) -> dict | None:
     """Pick the character (manifest entry) whose personality_keywords best
     match script_beat_text, via simple case-insensitive substring counting.
-    Returns None if no character has any keyword hit (i.e. this beat is
-    probably generic and better served by Pexels B-roll)."""
+
+    Only considers characters who actually have at least one asset file on
+    disk. Without this check, a character with zero built assets (e.g. Maya
+    or Alex before their libraries exist) could still "win" purely on
+    keyword score, and select_character_asset() would then return None
+    entirely instead of falling back to a character who DOES have real
+    assets (e.g. Byte) - this was confirmed as the root cause of Byte never
+    appearing in run #36's video, despite Byte being a valid (if
+    lower-scoring) candidate for that beat.
+
+    Returns None if no character with real assets has any keyword hit.
+    """
     if not script_beat_text or not characters_manifest:
         return None
+    if assets_root is None:
+        assets_root = DEFAULT_ASSETS_ROOT
     lowered = script_beat_text.lower()
     best_character = None
     best_score = 0
     for character in characters_manifest:
+        folder_name = character.get("folder_name", character.get("name"))
+        if not _list_asset_files(assets_root, folder_name):
+            # No real assets on disk for this character - never eligible,
+            # no matter how high their keyword score is.
+            continue
         keywords = character.get("personality_keywords", [])
         score = sum(1 for kw in keywords if kw.lower() in lowered)
         if score > best_score:
@@ -214,7 +232,7 @@ def select_character_asset(script_beat_text: str, characters_manifest: list,
     if assets_root is None:
         assets_root = DEFAULT_ASSETS_ROOT
 
-    character = _pick_character(script_beat_text, characters_manifest)
+    character = _pick_character(script_beat_text, characters_manifest, assets_root=assets_root)
     if character is None:
         return None
 
