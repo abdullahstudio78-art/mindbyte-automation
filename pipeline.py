@@ -1402,24 +1402,74 @@ HIGHLIGHT_KEYWORDS = {
 HIGHLIGHT_ASS_COLOR = "07C1FF"  # amber/gold
 BASE_ASS_COLOR = "FFFFFF"  # matches the Style line's PrimaryColour (white)
 
-def _highlight_ass_text(sentence: str) -> str:
-    """Uppercase and color any HIGHLIGHT_KEYWORDS word within a caption
-    line using inline ASS override tags, e.g. "people often avoid
-    difficult conversations" becomes "people often {\\c&H07C1FF&}AVOID{\\c&HFFFFFF&}
-    difficult conversations" if "avoid" is on the list. A plain SRT file
-    can't do this (force_style only applies one uniform style to the
-    whole line) - this is why captions moved to .ass in phase 2."""
+# Words to never pick for the highlight-fallback below (function words carry
+# no visual "punch" even when they happen to be the longest word in a short
+# caption chunk).
+_HIGHLIGHT_FALLBACK_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "this",
+    "that", "these", "those", "your", "you", "our", "we", "it", "its", "of",
+    "to", "in", "on", "for", "with", "as", "at", "by", "from", "be", "been",
+    "being", "has", "have", "had", "do", "does", "did", "will", "would",
+    "can", "could", "should", "not", "so", "if", "than", "then", "there",
+    "here", "just", "really", "very", "quite", "almost", "into", "out",
+    "about", "over", "under", "when", "while", "what", "why", "how",
+}
+
+
+def _highlight_ass_text(sentence: str, force_highlight: bool = True) -> str:
+    """Uppercase and color a word within a caption chunk using inline ASS
+    override tags, e.g. "people often avoid difficult conversations" becomes
+    "people often {\\c&H07C1FF&}AVOID{\\c&HFFFFFF&} difficult conversations"
+    if "avoid" is on the HIGHLIGHT_KEYWORDS list. A plain SRT file can't do
+    this (force_style only applies one uniform style to the whole line) -
+    this is why captions moved to .ass in phase 2.
+
+    Real-video review (2026-07-23, run #36) showed captions coming out
+    plain white for most chunks in practice - HIGHLIGHT_KEYWORDS is a fixed
+    list of emotionally-loaded words, and most 3-4 word caption chunks
+    simply don't happen to contain one, so the "colored caption" identity
+    almost never actually showed on screen. When force_highlight is True
+    (the default) and no HIGHLIGHT_KEYWORDS word matched, fall back to
+    coloring the single longest non-stopword in the chunk instead, so
+    nearly every caption chunk gets some color pop rather than only the
+    rare keyword hit - this is what actually makes it read as a
+    consistently "colored caption style" across a whole video.
+    """
+    matched = False
+
     def repl(match):
+        nonlocal matched
         word = match.group(0)
         core = re.sub(r"[^A-Za-z']", "", word).lower()
         if core in HIGHLIGHT_KEYWORDS:
+            matched = True
             return (
                 r"{\c&H" + HIGHLIGHT_ASS_COLOR + r"&}"
                 + word.upper()
                 + r"{\c&H" + BASE_ASS_COLOR + r"&}"
             )
         return word
-    return re.sub(r"\S+", repl, sentence)
+
+    result = re.sub(r"\S+", repl, sentence)
+    if matched or not force_highlight:
+        return result
+
+    words = sentence.split()
+    candidates = [
+        w for w in words
+        if len(re.sub(r"[^A-Za-z']", "", w)) >= 4
+        and re.sub(r"[^A-Za-z']", "", w).lower() not in _HIGHLIGHT_FALLBACK_STOPWORDS
+    ]
+    if not candidates:
+        return result
+    target = max(candidates, key=lambda w: len(re.sub(r"[^A-Za-z']", "", w)))
+    idx = words.index(target)
+    words[idx] = (
+        r"{\c&H" + HIGHLIGHT_ASS_COLOR + r"&}"
+        + target.upper()
+        + r"{\c&H" + BASE_ASS_COLOR + r"&}"
+    )
+    return " ".join(words)
 
 def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
     """Build a MindByte-branded .ass caption file.
