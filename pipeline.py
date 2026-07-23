@@ -431,27 +431,33 @@ def classify_scene_categories(sentences: list) -> list:
         "for a short psychology video. This is a REAL stock-footage-vs-custom-art "
         "routing decision, not a creative-writing exercise - default to A or B "
         "unless the sentence is IMPOSSIBLE to represent with a real filmed "
-        "environment. Category C is expensive and should be RARE: in a typical "
-        "16-sentence psychology script, expect roughly 8-12 sentences as A, "
-        "3-6 as B, and at most 1-3 as C. If you're unsure between B and C, "
-        "choose B. If you're unsure between A and B, choose A.\n\n"
-        "A - Stock Footage (DEFAULT, most common): any everyday real-world "
-        "environment or generic human activity that exists in real stock "
-        "footage libraries - cities, streets, parks, offices, cafes, homes, "
-        "bedrooms, traffic, nature, walking, typing, phones, conversations, "
-        "commuting, exercising, cooking, etc. Most factual/explanatory/"
-        "relatable statements about feelings, behavior, or relationships "
-        "still belong here - a sentence describing an emotion does NOT by "
-        "itself require anything other than a real-world clip of a person "
-        "experiencing that emotion (e.g. someone looking hurt, someone alone "
-        "at a window, two people talking) - it does not need our illustrated "
-        "character or a custom drawn scene.\n"
-        "B - Hybrid Scene: only when the sentence is specifically about OUR "
-        "recurring narrator character (Byte) doing, feeling, or reacting to "
-        "something in an ordinary real place (at a desk, walking a street, "
-        "in a bedroom, at a cafe) - i.e. sentences that read as Byte's own "
-        "direct experience or address to the viewer, not a general statement "
-        "about people/emotions in the abstract.\n"
+        "environment. Category C is expensive and should be RARE, but Category B "
+        "is EXPECTED and REQUIRED: Byte, our recurring narrator character, must "
+        "visibly appear talking to the viewer multiple times in every single "
+        "video, or the channel loses its identity - a video with zero B beats "
+        "is a failure. In a typical 16-sentence psychology script, expect "
+        "roughly 6-9 sentences as A, 6-9 as B, and at most 1-3 as C. Any "
+        "sentence that reads naturally as direct address to the viewer "
+        "(\"you\", \"we\", rhetorical questions, narrator commentary, intros, "
+        "transitions, conclusions) should be B, not A - only use A for beats "
+        "that are purely describing OTHER people/environments with no narrator "
+        "voice. If you're unsure between B and C, choose B. If you're unsure "
+        "between A and B, choose B.\n\n"
+        "A - Stock Footage: ONLY use for sentences describing OTHER people, "
+        "in the third person, with no narrator voice - e.g. \"studies show "
+        "people who feel rejected...\", \"a coworker who avoids eye contact...\". "
+        "Everyday real-world environments/activities (cities, streets, parks, "
+        "offices, cafes, homes, bedrooms, traffic, nature, walking, typing, "
+        "phones, conversations, commuting, exercising, cooking, etc.) are the "
+        "right VISUAL content for these, but the deciding factor for A vs B is "
+        "whether the sentence is narrator commentary or third-person "
+        "description.\n"
+        "B - Hybrid Scene (EXPECTED, roughly as common as A): any sentence "
+        "that is our recurring narrator character (Byte) speaking directly - "
+        "intros, hooks, transitions, rhetorical questions, \"you\"/\"we\" "
+        "statements, explanations, insights, conclusions, calls to action. "
+        "Most of a typical script is written in this narrator voice, so most "
+        "sentences should be B, not A.\n"
         "C - Custom AI Scene (RARE - use sparingly): reserve strictly for "
         "concepts that CANNOT be represented by any real filmed environment "
         "at all - literal dreams, literal memories being replayed, abstract "
@@ -477,6 +483,45 @@ def classify_scene_categories(sentences: list) -> list:
     except Exception as e:  # noqa: BLE001 - classifier must never abort a run
         print(f"[pipeline] scene category classification failed, falling back: {e}")
         return [None] * len(sentences)
+
+
+# Minimum number of Category-B (Byte) slots every published video must have.
+# Added 2026-07-23 after run #40 was verified to have ZERO Byte appearances:
+# the classifier (an LLM call) had swung to labeling all 16 sentences "A"
+# after the earlier over-labeling-as-C fix, and since gather_clips() only
+# even TRIES a character asset for non-A slots (see the "category == 'A'"
+# check there), an all-A result silently means Byte never appears at all -
+# a prompt-only fix already failed once for the human-footage problem, so
+# this is enforced in code, not just in the LLM prompt, to make it a hard
+# guarantee rather than something one bad classifier call can undo again.
+MIN_BYTE_CATEGORY_SLOTS = 3
+
+
+def ensure_minimum_byte_coverage(categories: list) -> list:
+    """Force at least MIN_BYTE_CATEGORY_SLOTS entries to "B" if the
+    classifier didn't already produce enough B/C slots on its own, so Byte
+    (our recurring narrator) is guaranteed to appear multiple times in every
+    video regardless of any single classifier call's quirks. Only ever
+    converts "A" (or None) slots to "B" - never touches existing B/C calls.
+    Evenly spaces the forced slots across the video rather than clustering
+    them at the start. No-ops on an empty list.
+    """
+    if not categories:
+        return categories
+    categories = list(categories)
+    existing = sum(1 for c in categories if c in ("B", "C"))
+    needed = MIN_BYTE_CATEGORY_SLOTS - existing
+    if needed <= 0:
+        return categories
+    candidates = [i for i, c in enumerate(categories) if c not in ("B", "C")]
+    if not candidates:
+        return categories
+    needed = min(needed, len(candidates))
+    step = max(1, len(candidates) // needed)
+    chosen = candidates[::step][:needed]
+    for i in chosen:
+        categories[i] = "B"
+    return categories
 
 
 def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
@@ -918,6 +963,17 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None, scene_cat
         char_asset = None if category == "A" else select_character_asset(
             match_text, CHARACTERS_MANIFEST, exclude_files=used_character_files
         )
+        if char_asset is None and category == "B":
+            # Category B is a guarantee that Byte appears in this slot (see
+            # ensure_minimum_byte_coverage() / MIN_BYTE_CATEGORY_SLOTS) - if
+            # this beat's exact wording happened not to contain any of
+            # Byte's personality_keywords, force-select Byte directly rather
+            # than silently falling through to stock and breaking that
+            # guarantee.
+            char_asset = select_character_asset(
+                match_text, CHARACTERS_MANIFEST, exclude_files=used_character_files,
+                force_character_name="Byte",
+            )
         if char_asset:
             dest = os.path.join(workdir, f"clip_{i}.mp4")
             if char_asset["asset_type"] == "Environments":
@@ -2019,6 +2075,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as workdir:
         scene_categories = classify_scene_categories(script.get("sentences") or [])
+        scene_categories = ensure_minimum_byte_coverage(scene_categories)
         print(f"[pipeline] scene categories: {scene_categories}")
         clip_paths, stock_attributions = gather_clips(
             script["visual_keywords"], workdir, sentences=script.get("sentences"),

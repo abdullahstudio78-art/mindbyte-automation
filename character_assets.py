@@ -202,7 +202,8 @@ def _pick_asset_file(assets_root: str, folder_name: str, script_beat_text: str,
 
 
 def select_character_asset(script_beat_text: str, characters_manifest: list,
-                            assets_root: str = None, exclude_files: set = None) -> dict | None:
+                            assets_root: str = None, exclude_files: set = None,
+                            force_character_name: str = None) -> dict | None:
     """Select a character illustration for one beat of script text.
 
     Args:
@@ -216,6 +217,17 @@ def select_character_asset(script_beat_text: str, characters_manifest: list,
             same still. Caller should add the returned "filename" to this
             set after each call. Optional - omitting it just disables the
             rotation (falls back to the tone-only match).
+        force_character_name: if set, SKIP the keyword-scoring pick and use
+            this character by name directly (still requires the character
+            to have real asset files on disk, exactly like the normal path -
+            still returns None if not). Added 2026-07-23: the classifier
+            guarantees a handful of Category-B slots per video so Byte is
+            never completely absent, but a beat's exact wording can still
+            fail to contain any of Byte's personality_keywords - without
+            this bypass, a guaranteed-B slot with no keyword hit would
+            silently fall through to stock and defeat the guarantee. The
+            caller (gather_clips) only uses this as a fallback AFTER a
+            keyword-based match has already been tried and returned None.
 
     Returns:
         None if no character matches, or the matched character has no
@@ -232,7 +244,15 @@ def select_character_asset(script_beat_text: str, characters_manifest: list,
     if assets_root is None:
         assets_root = DEFAULT_ASSETS_ROOT
 
-    character = _pick_character(script_beat_text, characters_manifest, assets_root=assets_root)
+    if force_character_name:
+        character = next(
+            (c for c in characters_manifest
+             if c.get("name") == force_character_name
+             and _list_asset_files(assets_root, c.get("folder_name", c.get("name")))),
+            None,
+        )
+    else:
+        character = _pick_character(script_beat_text, characters_manifest, assets_root=assets_root)
     if character is None:
         return None
 
