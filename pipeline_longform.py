@@ -61,6 +61,7 @@ from pipeline import (
     # Google OAuth / Sheets
     get_access_token,
     sheet_append,
+    ensure_sheet_tab,
     # Topic selection (shared pool + shared UsedTopics tab across both
     # Shorts and long-form - a topic covered in either format is still
     # "spent" for a while, which is good content strategy, not a bug)
@@ -1114,10 +1115,24 @@ def log_longform_checklist(access_token: str, topic: str, pillar: str, result: d
     try:
         sheet_append(access_token, LF_CHECKLIST_SHEET_TAB, row)
     except Exception as e:  # noqa: BLE001 - logging must never abort the run
-        print(
-            f"[pipeline_longform] could not log to LongformChecklist tab "
-            f"(does it exist in the Sheet yet?): {e}"
-        )
+        header = [
+            "Timestamp", "VideoID", "Topic", "Pillar", "OverallResult",
+            "HookOK", "IdeaScoreOK", "ScriptQualityOK", "ComplianceOK",
+            "DurationOK", "ResolutionOK", "AudioOK", "TagsOK",
+            "ParagraphCountOK", "FailedChecks",
+        ]
+        healed = False
+        try:
+            healed = ensure_sheet_tab(access_token, "LongformChecklist", header)
+            if healed:
+                sheet_append(access_token, LF_CHECKLIST_SHEET_TAB, row)
+        except Exception:
+            healed = False
+        if not healed:
+            print(
+                f"[pipeline_longform] could not log to LongformChecklist tab "
+                f"(does it exist in the Sheet yet?): {e}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1155,10 +1170,23 @@ def main() -> None:
         try:
             sheet_append(access_token, LF_VIDEOS_SHEET_TAB, sheet_row_base)
         except Exception as e:  # noqa: BLE001 - new tab may not exist yet
-            print(
-                f"[pipeline_longform] could not log to LongformVideos tab "
-                f"(does it exist in the Sheet yet?): {e}"
-            )
+            header = [
+                "VideoID", "Title", "Topic", "Status", "CreatedDate",
+                "PublishAt", "QualityScore", "ComplianceNotes", "DurationSec",
+                "ParagraphCount", "WordCount", "IdeaScoreAvg", "URL", "Notes",
+            ]
+            healed = False
+            try:
+                healed = ensure_sheet_tab(access_token, "LongformVideos", header)
+                if healed:
+                    sheet_append(access_token, LF_VIDEOS_SHEET_TAB, sheet_row_base)
+            except Exception:
+                healed = False
+            if not healed:
+                print(
+                    f"[pipeline_longform] could not log to LongformVideos tab "
+                    f"(does it exist in the Sheet yet?): {e}"
+                )
 
     if quality["score"] < LF_QUALITY_THRESHOLD or not compliance["passed"]:
         sheet_row_base[3] = "Rejected"
