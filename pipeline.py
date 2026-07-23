@@ -395,6 +395,68 @@ def call_groq(prompt: str, _retries: int = 2) -> str:
         return data["choices"][0]["message"]["content"]
 
 
+# ---------------------------------------------------------------------------
+# Visual category classification (A/B/C plan, 2026-07-23 design discussion)
+# ---------------------------------------------------------------------------
+# The pipeline should not treat every beat the same way. Per the explicit
+# spec: classify each spoken sentence into one of three visual categories so
+# gather_clips() can route it appropriately, rather than always trying an
+# illustrated character asset first and falling back to stock:
+#   A - Stock Footage: everyday real-world environments (cities, streets,
+#       parks, offices, cafes, homes, traffic, nature, lifestyle). Byte should
+#       NOT be inserted here - these beats should stay pure stock footage.
+#   B - Hybrid Scene: a cinematic real-world environment with Byte appearing
+#       naturally in it. True compositing (matched lighting/shadow/color grade
+#       so Byte doesn't look pasted on) needs a background-removal step on
+#       Byte's assets that hasn't been built yet - see NOTE in gather_clips().
+#       Until that lands, Category B beats fall back to the same illustrated-
+#       character-cutout handling Category C uses, same as before this change.
+#   C - Custom AI Scene: ONLY for environments/concepts that can't realistically
+#       exist in stock libraries - dreams, memories, abstract psychology,
+#       surreal mental worlds, symbolic visuals, impossible scenarios. Routes
+#       to the illustrated Environments system (render_environment_motion_clip).
+def classify_scene_categories(sentences: list) -> list:
+    """Classify each sentence into "A", "B", "C", or None (classification
+    failed/unavailable for that slot). Returns a list of None (same length
+    as `sentences`) on ANY failure - the classifier is an ADDITIVE routing
+    layer, not a required dependency, so a Groq outage or malformed response
+    must never break a run. gather_clips() treats None the same as before
+    this feature existed (character-first-then-stock, unchanged)."""
+    if not sentences:
+        return []
+    numbered = "\n".join(f"{i}: {s}" for i, s in enumerate(sentences))
+    prompt = (
+        "Classify each numbered sentence below into exactly one visual category "
+        "for a short psychology video:\n"
+        "A - Stock Footage: everyday real-world environments - cities, streets, "
+        "parks, offices, cafes, homes, traffic, nature, lifestyle scenes. Nothing "
+        "in the sentence requires our recurring illustrated character to appear.\n"
+        "B - Hybrid Scene: a cinematic real-world environment where our recurring "
+        "illustrated character (Byte) should appear naturally - the sentence "
+        "describes Byte doing or feeling something in an ordinary place (at a "
+        "desk, walking a street, in a bedroom, at a cafe).\n"
+        "C - Custom AI Scene: ONLY for environments/concepts that can't "
+        "realistically be found in stock footage - dreams, memories, abstract "
+        "psychology, surreal mental worlds, symbolic visuals, impossible or "
+        "metaphorical scenarios.\n\n"
+        f"Sentences:\n{numbered}\n\n"
+        'Respond ONLY with JSON: {"categories": ["A", "B", "C", ...]} - exact '
+        "same order and count as the sentences above."
+    )
+    try:
+        raw = call_groq(prompt)
+        data = json.loads(raw)
+        categories = data.get("categories", [])
+        if len(categories) != len(sentences):
+            print(f"[pipeline] scene category count mismatch ({len(categories)} vs "
+                  f"{len(sentences)} sentences) - falling back to default routing")
+            return [None] * len(sentences)
+        return [c if c in ("A", "B", "C") else None for c in categories]
+    except Exception as e:  # noqa: BLE001 - classifier must never abort a run
+        print(f"[pipeline] scene category classification failed, falling back: {e}")
+        return [None] * len(sentences)
+
+
 def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
     feedback_block = ""
     if feedback:
@@ -748,8 +810,18 @@ def _character_image_to_clip(image_path: str, dest_path: str, duration: float = 
 # --- end character asset system (new) ---
 
 
-def gather_clips(keywords: list, workdir: str, sentences: list = None) -> tuple:
+def gather_clips(keywords: list, workdir: str, sentences: list = None, scene_categories: list = None) -> tuple:
     """Download exactly one clip per keyword, in order.
+
+    `scene_categories`, if provided (same length/order as `keywords`), is the
+    per-beat A/B/C classification from classify_scene_categories(). Category
+    "A" (pure everyday stock footage) skips the illustrated-character-asset
+    attempt entirely, so a beat like "walking down a city street" doesn't
+    accidentally get Byte pasted into a generic B-roll shot that was never
+    meant to feature him. Categories "B"/"C" and None (classifier
+    unavailable/skipped this slot) all go through the existing character-
+    asset-first logic unchanged - see the module-level A/B/C comment block
+    above classify_scene_categories() for why B and C share handling for now.
 
     A strict 1:1, order-preserving mapping between sentences and clips is
     required so assemble_video can cut to a new clip exactly when each
@@ -779,15 +851,19 @@ def gather_clips(keywords: list, workdir: str, sentences: list = None) -> tuple:
     clip_paths = []
     stock_attributions: list = []
     for i, keyword in enumerate(keywords):
+        category = scene_categories[i] if scene_categories and i < len(scene_categories) else None
         # --- Character asset system (new) ---
         # Try an illustrated-character asset for this slot before touching
-        # Pexels at all. select_character_asset() returns None whenever no
+        # stock at all - UNLESS this beat was classified as Category A (pure
+        # everyday stock footage), in which case Byte should never appear
+        # here at all. select_character_asset() returns None whenever no
         # character/asset matches (or assets aren't present on disk yet),
-        # in which case we fall through to the existing Pexels logic below
-        # completely unchanged.
+        # in which case we fall through to the stock logic below unchanged.
         sentence_text = sentences[i] if sentences and i < len(sentences) else ""
         match_text = f"{keyword} {sentence_text}".strip()
-        char_asset = select_character_asset(match_text, CHARACTERS_MANIFEST, exclude_files=used_character_files)
+        char_asset = None if category == "A" else select_character_asset(
+            match_text, CHARACTERS_MANIFEST, exclude_files=used_character_files
+        )
         if char_asset:
             dest = os.path.join(workdir, f"clip_{i}.mp4")
             if char_asset["asset_type"] == "Environments":
@@ -1769,8 +1845,11 @@ def main() -> None:
         return
 
     with tempfile.TemporaryDirectory() as workdir:
+        scene_categories = classify_scene_categories(script.get("sentences") or [])
+        print(f"[pipeline] scene categories: {scene_categories}")
         clip_paths, stock_attributions = gather_clips(
-            script["visual_keywords"], workdir, sentences=script.get("sentences")
+            script["visual_keywords"], workdir, sentences=script.get("sentences"),
+            scene_categories=scene_categories,
         )
         if not clip_paths:
             sheet_row_base[3] = "Failed"
