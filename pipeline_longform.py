@@ -67,6 +67,11 @@ from pipeline import (
     # "spent" for a while, which is good content strategy, not a bug)
     pick_topic_with_idea_score,
     mark_topic_used,
+    # Weekly self-improvement closed loop (2026-07-30) - shared with
+    # pipeline.py so both formats drain the same NextWeekQueue tab, filtered
+    # by format ("short" vs "longform")
+    select_topic_for_run,
+    log_video_meta,
     # Groq
     call_groq,
     # Pexels / downloads
@@ -161,7 +166,7 @@ GENERIC_PHRASES = [
 # Script generation (Groq) - paragraph-structured, not sentence-structured
 # ---------------------------------------------------------------------------
 
-def generate_longform_script(topic: str, pillar: str, feedback: str = "") -> dict:
+def generate_longform_script(topic: str, pillar: str, feedback: str = "", brief: dict = None) -> dict:
     """Generate a long-form (8-15 min) documentary-style script as a list of
     PARAGRAPHS rather than individual sentences (see module docstring for
     why - this drives paragraph-level TTS/B-roll chunking downstream).
@@ -190,6 +195,24 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "") -> dic
         weakness, while still following every requirement below.
         """)
 
+    brief_block = ""
+    if brief:
+        # From weekly_review.py's self-improvement analysis of actual
+        # long-form performance history - creative direction, not a
+        # frozen script; every gate below (quality/compliance/checklist)
+        # still applies exactly as before.
+        brief_block = textwrap.dedent(f"""
+
+        THIS WEEK'S PERFORMANCE-INFORMED BRIEF (from analyzing real
+        channel analytics - lean into this, it reflects what has
+        actually worked recently, not a guess):
+        - Suggested angle: {brief.get('angle') or '(none given)'}
+        - Suggested hook direction: {brief.get('hook') or '(none given)'}
+        - Suggested CTA/closing style: {brief.get('cta_style') or '(none given)'}
+        Use this as strong creative direction, not a rigid template -
+        still write a fully original script and follow every rule below.
+        """)
+
     tone = CONTENT_PILLARS[pillar]["tone"]
     prompt = textwrap.dedent(f"""
     You are the writer for MindByte, a YouTube channel about why humans
@@ -197,6 +220,7 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "") -> dic
     (8-15 minutes), not a Short - it should feel like a psychology
     documentary essay, positioned as a documentary essay channel - NOT a
     generic facts channel, listicle, or low-effort AI content farm.
+    {brief_block}
 
     STORY ARC - this is the most important structural requirement. Do not
     write a list of separate facts about the topic. Write ONE continuous
@@ -433,7 +457,8 @@ def expand_longform_script(script: dict, topic: str, pillar: str, words_needed: 
 
 
 def generate_and_score_longform_script(topic: str, pillar: str,
-                                        max_attempts: int = LF_MAX_SCRIPT_ATTEMPTS) -> tuple:
+                                        max_attempts: int = LF_MAX_SCRIPT_ATTEMPTS,
+                                        brief: dict = None) -> tuple:
     """Mirrors pipeline.py's generate_and_score_script(), but the retry
     decision also checks the long-form word-count band (LF_MIN_WORDS /
     LF_MAX_WORDS) instead of a single floor, since a long-form script can
@@ -445,7 +470,7 @@ def generate_and_score_longform_script(topic: str, pillar: str,
     attempts = []
     feedback = ""
     for attempt in range(1, max_attempts + 1):
-        script = generate_longform_script(topic, pillar, feedback=feedback)
+        script = generate_longform_script(topic, pillar, feedback=feedback, brief=brief)
         quality = score_longform_quality(topic, pillar, script)
         word_count = sum(len(p["text"].split()) for p in script["paragraphs"])
         in_band = LF_MIN_WORDS <= word_count <= LF_MAX_WORDS
@@ -1141,10 +1166,14 @@ def log_longform_checklist(access_token: str, topic: str, pillar: str, result: d
 
 def main() -> None:
     access_token = get_access_token()
-    topic, pillar, idea_score_avg = pick_topic_with_idea_score(access_token)
-    print(f"[pipeline_longform] topic: {topic} (pillar: {pillar}) - idea score avg {idea_score_avg:.1f}")
+    # Closed self-improvement loop (2026-07-30) - same mechanism as
+    # pipeline.py's main(), filtered to fmt="longform" so Shorts and
+    # long-form each drain their own queued briefs from NextWeekQueue.
+    topic, pillar, idea_score_avg, brief = select_topic_for_run(access_token, fmt="longform")
+    print(f"[pipeline_longform] topic: {topic} (pillar: {pillar}) - idea score avg {idea_score_avg:.1f}"
+          + (" [from weekly self-improvement queue]" if brief else ""))
 
-    script, quality = generate_and_score_longform_script(topic, pillar)
+    script, quality = generate_and_score_longform_script(topic, pillar, brief=brief)
     word_count = sum(len(p["text"].split()) for p in script["paragraphs"])
     print(f"[pipeline_longform] title: {script['title']}")
     print(
@@ -1293,6 +1322,13 @@ def main() -> None:
         log_video_row()
         log_longform_checklist(access_token, topic, pillar, checklist, video_id)
         mark_topic_used(access_token, topic, video_id)
+
+        log_video_meta(
+            access_token, video_id, script["title"], topic, pillar, "longform",
+            script["paragraphs"][0]["text"] if script.get("paragraphs") else "",
+            "story_arc_longform_v1", word_count, len(script["paragraphs"]),
+            checklist["duration"], script.get("tags", []),
+        )
         print("[pipeline_longform] done")
 
 

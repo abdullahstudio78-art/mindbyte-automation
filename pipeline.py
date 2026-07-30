@@ -280,6 +280,20 @@ def sheet_append(access_token: str, a1_range: str, row: list) -> None:
     resp.raise_for_status()
 
 
+def sheet_update(access_token: str, a1_range: str, row: list) -> None:
+    """Overwrite a specific cell range (as opposed to sheet_append, which
+    always adds a new row). Used by the self-improvement loop to mark a
+    single NextWeekQueue row as consumed without touching any other row."""
+    resp = SESSION.put(
+        f"{SHEETS_BASE}/values/{a1_range}",
+        headers=google_headers(access_token),
+        params={"valueInputOption": "USER_ENTERED"},
+        json={"values": [row]},
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+
 # ---------------------------------------------------------------------------
 # Topic selection
 # ---------------------------------------------------------------------------
@@ -371,6 +385,122 @@ def pick_topic_with_idea_score(access_token: str, max_attempts: int = MAX_IDEA_A
         f"{max_attempts} attempts - using best seen: '{best[0]}'"
     )
     return best[0], best[1], best[2]
+
+
+# ---------------------------------------------------------------------------
+# Weekly self-improvement closed loop (2026-07-30)
+# ---------------------------------------------------------------------------
+# weekly_review.py analyzes performance history every Sunday and writes
+# concrete next-video "briefs" (title/hook/angle/SEO/CTA guidance, informed
+# by what actually won and lost) into a NextWeekQueue sheet tab. The
+# functions below let a normal publish run *optionally* pick one up instead
+# of a fully random topic - this is what closes the loop from "we wrote a
+# report" to "the report actually changes what gets made". Everything here
+# is additive and best-effort: if the tab doesn't exist yet, or is empty, or
+# a lookup fails for any reason, callers fall straight back to the existing
+# random/idea-scored topic selection with zero behavior change.
+
+NEXT_QUEUE_SHEET_TAB = "NextWeekQueue"
+NEXT_QUEUE_RANGE = f"{NEXT_QUEUE_SHEET_TAB}!A2:M"
+NEXT_QUEUE_HEADER = [
+    "WeekOf", "Format", "Pillar", "Title", "Hook", "Angle",
+    "SEOTitle", "SEODescription", "SEOTags", "CTAStyle",
+    "TargetLengthSec", "Used", "CreatedAt",
+]
+
+
+def get_next_queue_brief(access_token: str, fmt: str = "short") -> dict:
+    """Return the oldest not-yet-used NextWeekQueue row matching `fmt`
+    ("short" or "longform"), as a dict, plus its 1-based sheet row number
+    under key "_row" (needed to mark it consumed later). Returns None if
+    the tab doesn't exist, is empty, or has no matching unused row - all
+    treated as "no brief available" rather than an error, since this
+    feature must never block a normal publish run."""
+    try:
+        rows = sheet_get(access_token, NEXT_QUEUE_RANGE)
+    except Exception as e:  # noqa: BLE001 - tab may not exist yet, that's fine
+        print(f"[pipeline] NextWeekQueue not available yet ({e}) - using normal topic selection")
+        return None
+    for i, row in enumerate(rows, start=2):  # sheet row 2 is the first data row
+        row = row + [""] * (13 - len(row))
+        week_of, row_fmt, pillar, title, hook, angle = row[0], row[1], row[2], row[3], row[4], row[5]
+        seo_title, seo_desc, seo_tags, cta_style, target_len, used = (
+            row[6], row[7], row[8], row[9], row[10], row[11],
+        )
+        if not title or used.strip().upper() == "Y":
+            continue
+        if row_fmt.strip().lower() != fmt.strip().lower():
+            continue
+        return {
+            "_row": i,
+            "week_of": week_of,
+            "format": row_fmt,
+            "pillar": pillar,
+            "title": title,
+            "hook": hook,
+            "angle": angle,
+            "seo_title": seo_title,
+            "seo_description": seo_desc,
+            "seo_tags": [t.strip() for t in seo_tags.split(",") if t.strip()],
+            "cta_style": cta_style,
+            "target_length_sec": target_len,
+        }
+    return None
+
+
+def mark_queue_brief_used(access_token: str, row_number: int) -> None:
+    """Best-effort: flip the Used column (L) for a consumed brief so it's
+    never picked up twice. A failure here just means the row might be
+    reused later - not worth ever blocking a publish run over."""
+    try:
+        sheet_update(access_token, f"{NEXT_QUEUE_SHEET_TAB}!L{row_number}", ["Y"])
+    except Exception as e:  # noqa: BLE001 - never let this abort a run
+        print(f"[pipeline] could not mark NextWeekQueue row {row_number} as used: {e}")
+
+
+def select_topic_for_run(access_token: str, fmt: str = "short") -> tuple:
+    """The closed-loop entry point: try a weekly-generated brief first, and
+    only fall back to the existing random/idea-scored pick_topic_with_idea_score()
+    if no brief is queued or the queued idea doesn't score well. Returns
+    (topic, pillar, idea_score_avg, brief_or_None). This wraps the existing
+    function rather than modifying it, so any caller that still calls
+    pick_topic_with_idea_score() directly (e.g. an older script) keeps
+    working exactly as before - this is purely additive."""
+    brief = get_next_queue_brief(access_token, fmt=fmt)
+    if brief is None:
+        topic, pillar, idea_score_avg = pick_topic_with_idea_score(access_token)
+        return topic, pillar, idea_score_avg, None
+
+    topic, pillar = brief["title"], brief["pillar"] if brief["pillar"] in CONTENT_PILLARS else None
+    if pillar is None:
+        # Groq may not always return an exact pillar key match - fall back
+        # to a random valid pillar rather than crashing the whole run over
+        # a formatting mismatch in a generated brief.
+        pillar = random.choice(list(CONTENT_PILLARS.keys()))
+    try:
+        scores = score_topic_idea(topic, pillar)
+        axis_keys = ("curiosity", "emotional_impact", "global_appeal", "evergreen_value", "share_potential")
+        idea_score_avg = sum(scores.get(k, 0) for k in axis_keys) / len(axis_keys)
+    except Exception as e:  # noqa: BLE001 - scoring failure shouldn't block the queue
+        print(f"[pipeline] idea-scoring the queued brief failed ({e}) - proceeding with it anyway")
+        idea_score_avg = IDEA_SCORE_AVG_THRESHOLD  # assume it clears the bar
+
+    # Drain the queue row regardless of outcome - if it scores too low we
+    # fall back to a normal pick below, but we never want to keep retrying
+    # the same weak queued idea forever.
+    mark_queue_brief_used(access_token, brief["_row"])
+
+    if idea_score_avg < IDEA_SCORE_AVG_THRESHOLD:
+        print(
+            f"[pipeline] queued brief '{topic}' scored {idea_score_avg:.1f} "
+            f"(below {IDEA_SCORE_AVG_THRESHOLD}) - falling back to normal topic selection"
+        )
+        topic, pillar, idea_score_avg = pick_topic_with_idea_score(access_token)
+        return topic, pillar, idea_score_avg, None
+
+    print(f"[pipeline] using queued weekly-plan brief: '{topic}' ({pillar}) - idea score {idea_score_avg:.1f}")
+    return topic, pillar, idea_score_avg, brief
+
 
 def call_groq(prompt: str, _retries: int = 2) -> str:
     """Same Groq call as before, now with retry-with-backoff on a 429
@@ -609,7 +739,7 @@ def generate_storyboard(sentences: list) -> list:
         ]
 
 
-def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
+def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = None) -> dict:
     feedback_block = ""
     if feedback:
         feedback_block = textwrap.dedent(f"""
@@ -618,6 +748,24 @@ def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
             scored too low because: "{feedback}"
             Write a genuinely different draft that specifically fixes that
             weakness, while still following every requirement below.
+        """)
+    brief_block = ""
+    if brief:
+        # brief comes from weekly_review.py's self-improvement analysis of
+        # actual past performance (winning hooks/topics/CTAs) - this is
+        # guidance to steer the writer toward what has worked, not a
+        # frozen/pre-written script, so the existing quality/compliance/
+        # pre-publish gates below still apply exactly as before.
+        brief_block = textwrap.dedent(f"""
+
+            THIS WEEK'S PERFORMANCE-INFORMED BRIEF (from analyzing real
+            channel analytics - lean into this, it reflects what has
+            actually worked recently, not a guess):
+            - Suggested angle: {brief.get('angle') or '(none given)'}
+            - Suggested hook direction: {brief.get('hook') or '(none given)'}
+            - Suggested CTA/closing style: {brief.get('cta_style') or '(none given)'}
+            Use this as strong creative direction, not a rigid template -
+            still write fully original sentences and follow every rule below.
         """)
     tone = CONTENT_PILLARS[pillar]["tone"]
     prompt = textwrap.dedent(f"""
@@ -629,7 +777,7 @@ def generate_script(topic: str, pillar: str, feedback: str = "") -> dict:
 
         You are writing a 30-60 second YouTube Short. The topic is:
         "{topic}", from the "{pillar}" pillar. Tone for this pillar: {tone}.
-        {feedback_block}
+        {feedback_block}{brief_block}
         STRUCTURE - tell one small story, do not dump facts:
         1. HOOK (first 1-3 seconds) - grab attention instantly.
         2. Introduce a relatable human problem or moment tied to the topic.
@@ -776,7 +924,9 @@ def score_quality(topic: str, pillar: str, script: dict) -> dict:
 MIN_SCRIPT_WORDS = 130  # keeps narration filling the 45-55s target instead of drifting to ~30s
 
 
-def generate_and_score_script(topic: str, pillar: str, max_attempts: int = MAX_SCRIPT_ATTEMPTS) -> tuple:
+def generate_and_score_script(
+    topic: str, pillar: str, max_attempts: int = MAX_SCRIPT_ATTEMPTS, brief: dict = None,
+) -> tuple:
     """Generate + score a script, retrying with feedback if it falls short
     of the quality bar OR is too short to fill the target duration, so a
     single pipeline run gets multiple shots at clearing both bars instead
@@ -801,7 +951,7 @@ def generate_and_score_script(topic: str, pillar: str, max_attempts: int = MAX_S
     )
     feedback = ""
     for attempt in range(1, max_attempts + 1):
-        script = generate_script(topic, pillar, feedback=feedback)
+        script = generate_script(topic, pillar, feedback=feedback, brief=brief)
         quality = score_quality(topic, pillar, script)
         word_count = sum(len(s.split()) for s in script["sentences"])
         meets_bar = quality["score"] >= QUALITY_THRESHOLD and word_count >= MIN_SCRIPT_WORDS
@@ -2082,6 +2232,54 @@ def ensure_sheet_tab(access_token: str, tab_name: str, header_row: list) -> bool
     except Exception:
         return False
 
+
+# ---------------------------------------------------------------------------
+# VideoMeta logging (2026-07-30) - structured, per-video attributes for the
+# weekly pattern-detection pass. Everything score_quality()/the checklist
+# already knows about a video (hook text, structure, length, pillar, tags,
+# upload time) is captured here as its own row, so weekly_review.py can
+# correlate performance against these fields instead of raw title text.
+# ---------------------------------------------------------------------------
+
+VIDEO_META_SHEET_TAB = "VideoMeta!A:N"
+VIDEO_META_HEADER = [
+    "VideoID", "Title", "Topic", "Pillar", "Format", "HookText",
+    "HookOpenerWords", "ScriptStructure", "WordCount", "SentenceOrParaCount",
+    "VideoLengthSec", "UploadHourUTC", "Tags", "CreatedAt",
+]
+
+
+def log_video_meta(
+    access_token: str, video_id: str, title: str, topic: str, pillar: str,
+    fmt: str, hook_text: str, structure_tag: str, word_count: int,
+    unit_count: int, video_length_sec: float, tags: list,
+) -> None:
+    """Best-effort logging of one row per published video to the VideoMeta
+    tab. Never raises - a failure here (e.g. tab doesn't exist yet) must
+    never affect the publish run that's already succeeded by the time this
+    is called. Self-heals the tab the same way every other Sheet logger in
+    this file does."""
+    hook_opener = " ".join((hook_text or "").split()[:6])
+    row = [
+        video_id, title, topic, pillar, fmt, hook_text, hook_opener,
+        structure_tag, word_count, unit_count, round(video_length_sec, 1),
+        datetime.now(timezone.utc).hour, ", ".join(tags or []),
+        datetime.now(timezone.utc).isoformat(),
+    ]
+    try:
+        sheet_append(access_token, VIDEO_META_SHEET_TAB, row)
+    except Exception as e:  # noqa: BLE001 - logging must never abort/affect the run
+        healed = False
+        try:
+            healed = ensure_sheet_tab(access_token, "VideoMeta", VIDEO_META_HEADER)
+            if healed:
+                sheet_append(access_token, VIDEO_META_SHEET_TAB, row)
+        except Exception:
+            healed = False
+        if not healed:
+            print(f"[pipeline] could not log to VideoMeta tab (does it exist in the Sheet yet?): {e}")
+
+
 def log_quality_checklist(
     access_token: str, topic: str, pillar: str, result: dict, video_id: str = "",
 ) -> None:
@@ -2133,10 +2331,16 @@ def log_quality_checklist(
 
 def main() -> None:
     access_token = get_access_token()
-    topic, pillar, idea_score_avg = pick_topic_with_idea_score(access_token)
-    print(f"[pipeline] topic: {topic} (pillar: {pillar}) - idea score avg {idea_score_avg:.1f}")
+    # Closed self-improvement loop (2026-07-30): try a weekly-generated,
+    # performance-informed brief first; falls back to the original random/
+    # idea-scored pick automatically if no brief is queued. See
+    # select_topic_for_run()'s docstring - this is purely additive on top
+    # of pick_topic_with_idea_score(), which is unchanged.
+    topic, pillar, idea_score_avg, brief = select_topic_for_run(access_token, fmt="short")
+    print(f"[pipeline] topic: {topic} (pillar: {pillar}) - idea score avg {idea_score_avg:.1f}"
+          + (" [from weekly self-improvement queue]" if brief else ""))
 
-    script, quality = generate_and_score_script(topic, pillar)
+    script, quality = generate_and_score_script(topic, pillar, brief=brief)
     print(f"[pipeline] title: {script['title']}")
     print(f"[pipeline] final quality score: {quality['score']} - {quality['notes']}")
 
@@ -2293,6 +2497,14 @@ def main() -> None:
     sheet_append(access_token, "Videos!A:O", sheet_row_base)
     log_quality_checklist(access_token, topic, pillar, checklist, video_id)
     mark_topic_used(access_token, topic, video_id)
+
+    word_count = sum(len(s.split()) for s in script["sentences"])
+    log_video_meta(
+        access_token, video_id, script["title"], topic, pillar, "short",
+        script["sentences"][0] if script.get("sentences") else "",
+        "story_short_v1", word_count, len(script["sentences"]),
+        checklist["duration"], script.get("tags", []),
+    )
     print("[pipeline] done")
 
 
