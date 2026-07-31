@@ -151,16 +151,10 @@ LF_CHECKLIST_SHEET_TAB = "LongformChecklist!A:O"
 # card, proportionate to an 8+ minute video instead of a 60s Short.
 LF_TITLE_CARD_SECONDS = 2.2
 
-FORBIDDEN_HOOK_OPENERS = [
-    "welcome back", "today we will discuss", "did you know",
-    "in this video", "hey guys", "hey everyone", "what's up guys",
-]
-
-GENERIC_PHRASES = [
-    "did you know that", "in this video we will", "welcome back to my channel",
-    "smash that like button", "don't forget to subscribe",
-    "today we will discuss", "in today's video", "stay tuned to find out",
-]
+# Consolidated 2026-07-31 into brand_rules.py (single source of truth shared
+# with pipeline.py) - imported under the same names so nothing below that
+# references FORBIDDEN_HOOK_OPENERS/GENERIC_PHRASES has to change.
+from brand_rules import FORBIDDEN_HOOK_OPENERS, GENERIC_PHRASES  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Script generation (Groq) - paragraph-structured, not sentence-structured
@@ -208,7 +202,11 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "", brief:
         actually worked recently, not a guess):
         - Suggested angle: {brief.get('angle') or '(none given)'}
         - Suggested hook direction: {brief.get('hook') or '(none given)'}
+        - Suggested hook type: {brief.get('hook_type') or '(none given)'}
         - Suggested CTA/closing style: {brief.get('cta_style') or '(none given)'}
+        - Recurring series (if any): {brief.get('series') or '(none)'}
+        - Suggested thumbnail concept: {brief.get('thumbnail_concept') or '(none given)'}
+        - Loyalty angle (why this should make a viewer subscribe): {brief.get('loyalty_angle') or '(none given)'}
         Use this as strong creative direction, not a rigid template -
         still write a fully original script and follow every rule below.
         """)
@@ -319,11 +317,16 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "", brief:
 
     Topic: {topic} (pillar: {pillar})
 
+    Also classify "hook_type" as exactly one of: "question", "mystery",
+    "emotional", "story" - whichever best describes the opening paragraph's
+    hook you actually wrote.
+
     Return ONLY valid JSON with this exact shape:
     {{
       "title": "...",
       "description": "...",
       "tags": ["...", "..."],
+      "hook_type": "question|mystery|emotional|story",
       "paragraphs": [
         {{"text": "...", "visual_keywords": ["...", "...", "..."]}}
       ]
@@ -332,6 +335,12 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "", brief:
 
     raw = call_groq(prompt)
     data = json.loads(raw)
+
+    valid_hook_types = {"question", "mystery", "emotional", "story"}
+    if str(data.get("hook_type", "")).strip().lower() not in valid_hook_types:
+        data["hook_type"] = "unclassified"
+    else:
+        data["hook_type"] = str(data["hook_type"]).strip().lower()
 
     paragraphs = data.get("paragraphs", [])
     # Defensive: guarantee every paragraph has at least one visual keyword
@@ -1328,6 +1337,9 @@ def main() -> None:
             script["paragraphs"][0]["text"] if script.get("paragraphs") else "",
             "story_arc_longform_v1", word_count, len(script["paragraphs"]),
             checklist["duration"], script.get("tags", []),
+            hook_type=script.get("hook_type", "unclassified"),
+            series=(brief.get("series", "") if brief else ""),
+            thumbnail_identity=os.path.basename(thumb_path) if thumb_path else "",
         )
         print("[pipeline_longform] done")
 

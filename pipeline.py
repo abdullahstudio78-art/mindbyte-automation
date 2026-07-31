@@ -401,11 +401,14 @@ def pick_topic_with_idea_score(access_token: str, max_attempts: int = MAX_IDEA_A
 # random/idea-scored topic selection with zero behavior change.
 
 NEXT_QUEUE_SHEET_TAB = "NextWeekQueue"
-NEXT_QUEUE_RANGE = f"{NEXT_QUEUE_SHEET_TAB}!A2:M"
+NEXT_QUEUE_RANGE = f"{NEXT_QUEUE_SHEET_TAB}!A2:S"
 NEXT_QUEUE_HEADER = [
     "WeekOf", "Format", "Pillar", "Title", "Hook", "Angle",
     "SEOTitle", "SEODescription", "SEOTags", "CTAStyle",
     "TargetLengthSec", "Used", "CreatedAt",
+    # Appended at end 2026-07-31 - see weekly_review.py's confidence/loyalty upgrade
+    "HookType", "Series", "ThumbnailConcept", "ChapterOutline",
+    "LoyaltyAngle", "Confidence",
 ]
 
 
@@ -415,17 +418,24 @@ def get_next_queue_brief(access_token: str, fmt: str = "short") -> dict:
     under key "_row" (needed to mark it consumed later). Returns None if
     the tab doesn't exist, is empty, or has no matching unused row - all
     treated as "no brief available" rather than an error, since this
-    feature must never block a normal publish run."""
+    feature must never block a normal publish run.
+
+    Extended 2026-07-31: also reads the new optional HookType/Series/
+    ThumbnailConcept/ChapterOutline/LoyaltyAngle columns (blank/absent on
+    older rows, which is fine - they default to "" / [] below)."""
     try:
         rows = sheet_get(access_token, NEXT_QUEUE_RANGE)
     except Exception as e:  # noqa: BLE001 - tab may not exist yet, that's fine
         print(f"[pipeline] NextWeekQueue not available yet ({e}) - using normal topic selection")
         return None
     for i, row in enumerate(rows, start=2):  # sheet row 2 is the first data row
-        row = row + [""] * (13 - len(row))
+        row = row + [""] * (19 - len(row))
         week_of, row_fmt, pillar, title, hook, angle = row[0], row[1], row[2], row[3], row[4], row[5]
         seo_title, seo_desc, seo_tags, cta_style, target_len, used = (
             row[6], row[7], row[8], row[9], row[10], row[11],
+        )
+        hook_type, series, thumbnail_concept, chapter_outline_raw, loyalty_angle = (
+            row[13], row[14], row[15], row[16], row[17],
         )
         if not title or used.strip().upper() == "Y":
             continue
@@ -444,6 +454,11 @@ def get_next_queue_brief(access_token: str, fmt: str = "short") -> dict:
             "seo_tags": [t.strip() for t in seo_tags.split(",") if t.strip()],
             "cta_style": cta_style,
             "target_length_sec": target_len,
+            "hook_type": hook_type,
+            "series": series,
+            "thumbnail_concept": thumbnail_concept,
+            "chapter_outline": [c.strip() for c in chapter_outline_raw.split(";") if c.strip()],
+            "loyalty_angle": loyalty_angle,
         }
     return None
 
@@ -763,7 +778,10 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
             actually worked recently, not a guess):
             - Suggested angle: {brief.get('angle') or '(none given)'}
             - Suggested hook direction: {brief.get('hook') or '(none given)'}
+            - Suggested hook type: {brief.get('hook_type') or '(none given)'}
             - Suggested CTA/closing style: {brief.get('cta_style') or '(none given)'}
+            - Recurring series (if any): {brief.get('series') or '(none)'}
+            - Loyalty angle (why this should make a viewer subscribe): {brief.get('loyalty_angle') or '(none given)'}
             Use this as strong creative direction, not a rigid template -
             still write fully original sentences and follow every rule below.
         """)
@@ -852,6 +870,9 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
           of broad terms ("psychology facts", "human behavior", "why
           people", "self improvement"), terms specific to "{topic}", and
           the channel name "MindByte".
+        - Also classify "hook_type" as exactly one of: "question",
+          "mystery", "emotional", "story" - whichever best describes the
+          opening hook you actually wrote.
 
         Return ONLY valid JSON with this exact shape:
         {{
@@ -859,11 +880,19 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
         "description": "...",
         "sentences": ["...", "..."],
         "visual_keywords": ["...", "..."],
-        "tags": ["...", "..."]
+        "tags": ["...", "..."],
+        "hook_type": "question|mystery|emotional|story"
         }}
     """).strip()
     raw = call_groq(prompt)
     data = json.loads(raw)
+    # Defensive: never raise on a missing/unexpected hook_type - default to
+    # "unclassified" rather than blocking the run.
+    valid_hook_types = {"question", "mystery", "emotional", "story"}
+    if str(data.get("hook_type", "")).strip().lower() not in valid_hook_types:
+        data["hook_type"] = "unclassified"
+    else:
+        data["hook_type"] = str(data["hook_type"]).strip().lower()
     # Defensive: guarantee 1:1 sentence/keyword pairing even if the model
     # drifts from the requested shape, since assembly depends on it.
     sentences = data.get("sentences", [])
@@ -2117,10 +2146,10 @@ def upload_to_youtube(access_token: str, video_path: str, title: str, descriptio
 # Phase 3: automated pre-publish quality checklist
 # ---------------------------------------------------------------------------
 
-FORBIDDEN_HOOK_OPENERS = [
-    "welcome back", "today we will discuss", "did you know",
-    "in this video", "hey guys", "hey everyone", "what's up guys",
-]
+# Consolidated 2026-07-31 into brand_rules.py (single source of truth shared
+# with pipeline_longform.py) - imported under the same name so nothing below
+# that references FORBIDDEN_HOOK_OPENERS has to change.
+from brand_rules import FORBIDDEN_HOOK_OPENERS, GENERIC_PHRASES  # noqa: E402
 MIN_VIDEO_DURATION_SEC = 40
 MAX_VIDEO_DURATION_SEC = 80
 REQUIRED_WIDTH = 1080
@@ -2241,11 +2270,13 @@ def ensure_sheet_tab(access_token: str, tab_name: str, header_row: list) -> bool
 # correlate performance against these fields instead of raw title text.
 # ---------------------------------------------------------------------------
 
-VIDEO_META_SHEET_TAB = "VideoMeta!A:N"
+VIDEO_META_SHEET_TAB = "VideoMeta!A:Q"
 VIDEO_META_HEADER = [
     "VideoID", "Title", "Topic", "Pillar", "Format", "HookText",
     "HookOpenerWords", "ScriptStructure", "WordCount", "SentenceOrParaCount",
     "VideoLengthSec", "UploadHourUTC", "Tags", "CreatedAt",
+    # Appended at end 2026-07-31:
+    "HookType", "Series", "ThumbnailIdentity",
 ]
 
 
@@ -2253,18 +2284,24 @@ def log_video_meta(
     access_token: str, video_id: str, title: str, topic: str, pillar: str,
     fmt: str, hook_text: str, structure_tag: str, word_count: int,
     unit_count: int, video_length_sec: float, tags: list,
+    hook_type: str = "", series: str = "", thumbnail_identity: str = "",
 ) -> None:
     """Best-effort logging of one row per published video to the VideoMeta
     tab. Never raises - a failure here (e.g. tab doesn't exist yet) must
     never affect the publish run that's already succeeded by the time this
     is called. Self-heals the tab the same way every other Sheet logger in
-    this file does."""
+    this file does.
+
+    Extended 2026-07-31 with optional hook_type/series/thumbnail_identity
+    kwargs, all defaulting to "" so any existing call site that doesn't
+    pass them keeps working exactly as before."""
     hook_opener = " ".join((hook_text or "").split()[:6])
     row = [
         video_id, title, topic, pillar, fmt, hook_text, hook_opener,
         structure_tag, word_count, unit_count, round(video_length_sec, 1),
         datetime.now(timezone.utc).hour, ", ".join(tags or []),
         datetime.now(timezone.utc).isoformat(),
+        hook_type or "unclassified", series or "", thumbnail_identity or "",
     ]
     try:
         sheet_append(access_token, VIDEO_META_SHEET_TAB, row)
@@ -2504,6 +2541,9 @@ def main() -> None:
         script["sentences"][0] if script.get("sentences") else "",
         "story_short_v1", word_count, len(script["sentences"]),
         checklist["duration"], script.get("tags", []),
+        hook_type=script.get("hook_type", "unclassified"),
+        series=(brief.get("series", "") if brief else ""),
+        thumbnail_identity=os.path.basename(thumbnail_path) if thumbnail_path else "",
     )
     print("[pipeline] done")
 

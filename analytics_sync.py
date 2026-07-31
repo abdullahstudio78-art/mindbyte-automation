@@ -18,9 +18,40 @@ Extended 2026-07-30 for the weekly self-improving system:
   - Everything here is additive: the existing Videos!I:M write is
     unchanged (same columns, same meaning), so any script or person
     reading that tab today keeps working exactly as before.
+
+Extended 2026-07-31 for long-form parity + external-signal helpers:
+  - A SECOND loop now reads the LongformVideos tab (written by
+    pipeline_longform.py) and pulls the same YouTube Data/Analytics stats
+    per long-form video, appending Format="longform" rows to the SAME
+    AnalyticsHistory tab the Shorts loop already writes to, and appending
+    new Views/Likes/Comments/Shares/LastSynced columns onto the END of the
+    LongformVideos tab itself (that tab never reserved columns for these,
+    unlike Videos!I:M, so this is a pure append rather than an overwrite).
+  - IMPORTANT API LIMITATION (documented here rather than guessed around):
+    YouTube Shorts do NOT expose a true impressions/CTR metric via the
+    public YouTube Analytics API the way long-form does - Shorts discovery
+    is swipe/feed-based, not thumbnail-click-based, and the API simply has
+    no equivalent field for Shorts. This code does NOT fabricate an
+    impressions/CTR number for Shorts. Instead, EarlyRetentionPct (retention
+    in the first few seconds of the video, from an elapsedVideoTimeRatio
+    report) is used as the closest reliable proxy for "does the opening
+    grab people" that the public API actually supports for both formats.
+  - EarlyRetentionPct is a best-effort, may-be-None value: for Shorts it is
+    the audienceWatchRatio at the first available elapsedVideoTimeRatio
+    bucket (a proxy for "the first ~3 seconds"). For long-form it uses the
+    bucket closest to ratio 0.05 as a proxy for "the first ~30 seconds" of
+    a roughly 10-minute video - this is an APPROXIMATION, since
+    elapsedVideoTimeRatio is a relative (0.0-1.0) position in the video,
+    not an absolute second count, and actual video length varies. Treat it
+    as directional, not a precise seconds-based figure.
+  - A channel-level (not per-video, to avoid quota multiplication)
+    subscribedStatus report is pulled once per sync run as a best-effort
+    "returning viewers" signal, logged and written to a new
+    ChannelAudienceSnapshot tab.
 """
 
 import os
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -40,7 +71,19 @@ ANALYTICS_HISTORY_HEADER = [
     "Views", "Likes", "Comments", "Shares",
     "AvgViewDurationSec", "AvgViewPercentage", "SubscribersGained",
     "UploadHourUTC", "PublishDate",
+    "EarlyRetentionPct",  # appended at end 2026-07-31 - see module docstring
 ]
+
+# New end-of-header columns appended to LongformVideos (2026-07-31) - that
+# tab never reserved view/like/comment columns the way Videos!I:M did, so
+# these are appended after whatever the last existing column is rather than
+# assuming a fixed position.
+LONGFORM_NEW_COLS = ["Views", "Likes", "Comments", "Shares", "LastSynced"]
+
+CHANNEL_AUDIENCE_TAB = "ChannelAudienceSnapshot"
+CHANNEL_AUDIENCE_HEADER = ["Date", "SubscribedViews", "UnsubscribedViews", "SubscribedSharePct"]
+
+SHEETS_RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
 def get_access_token() -> str:
@@ -111,36 +154,143 @@ def get_video_analytics(token: str, video_id: str) -> dict:
     }
 
 
+def _sheets_call_with_retry(fn, _retries: int = 2):
+    """Same 429/5xx retry-with-backoff idea already used for Groq calls
+    (call_groq(..., _retries=2) in pipeline.py/weekly_review.py), applied
+    to Sheets HTTP calls: catch a rate-limit/server error, sleep with a
+    short backoff, retry up to `_retries` times, then let the final
+    exception propagate as before (callers already handle failures via
+    their existing try/except self-heal patterns)."""
+    last_exc = None
+    for attempt in range(_retries + 1):
+        try:
+            resp = fn()
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < _retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+        if resp.status_code in SHEETS_RETRY_STATUSES and attempt < _retries:
+            wait_s = 1.5 * (attempt + 1)
+            print(f"[analytics] Sheets call got {resp.status_code} - retrying in {wait_s:.1f}s")
+            time.sleep(wait_s)
+            continue
+        resp.raise_for_status()
+        return resp
+    if last_exc:
+        raise last_exc
+
+
+def get_early_retention_pct(token: str, video_id: str, is_longform: bool) -> float | None:
+    """Best-effort retention-curve summary: a SEPARATE YouTube Analytics API
+    v2 report per video, dimensioned by elapsedVideoTimeRatio (metrics=
+    audienceWatchRatio). Returns one summary number - see the module
+    docstring for the exact definition/approximation for each format.
+    Wrapped end-to-end in try/except: missing data is very likely for
+    low-view videos, and a None here must never block the row write."""
+    try:
+        resp = SESSION.get(
+            "https://youtubeanalytics.googleapis.com/v2/reports",
+            headers=headers(token),
+            params={
+                "ids": f"channel=={YOUTUBE_CHANNEL_ID}",
+                "startDate": "2020-01-01",
+                "endDate": datetime.now(timezone.utc).date().isoformat(),
+                "metrics": "audienceWatchRatio",
+                "dimensions": "elapsedVideoTimeRatio",
+                "filters": f"video=={video_id}",
+                "sort": "elapsedVideoTimeRatio",
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return None
+        rows = resp.json().get("rows", [])
+        if not rows:
+            return None
+        if not is_longform:
+            # Shorts: first available bucket is the closest proxy for
+            # "the first ~3 seconds" since Shorts are already only 30-75s.
+            ratio, watch_ratio = rows[0][0], rows[0][1]
+            return round(float(watch_ratio) * 100, 2)
+        # Long-form: bucket closest to ratio 0.05 (APPROXIMATION of "first
+        # ~30 seconds" on a ~10 minute video - elapsedVideoTimeRatio is
+        # relative, not absolute seconds, so this is directional only).
+        best_row = min(rows, key=lambda r: abs(float(r[0]) - 0.05))
+        return round(float(best_row[1]) * 100, 2)
+    except Exception as e:  # noqa: BLE001 - retention-curve data is a bonus, never fatal
+        print(f"[analytics] EarlyRetentionPct lookup failed for {video_id} (non-fatal): {e}")
+        return None
+
+
+def get_channel_audience_snapshot(token: str) -> dict | None:
+    """Best-effort, once-per-run (NOT per-video, to avoid quota
+    multiplication) channel-level subscribedStatus report - a simple
+    "returning viewers" proxy signal. Returns None on any failure."""
+    try:
+        resp = SESSION.get(
+            "https://youtubeanalytics.googleapis.com/v2/reports",
+            headers=headers(token),
+            params={
+                "ids": f"channel=={YOUTUBE_CHANNEL_ID}",
+                "startDate": "2020-01-01",
+                "endDate": datetime.now(timezone.utc).date().isoformat(),
+                "metrics": "views",
+                "dimensions": "subscribedStatus",
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return None
+        rows = resp.json().get("rows", [])
+        if not rows:
+            return None
+        subscribed = 0
+        unsubscribed = 0
+        for row in rows:
+            status, views = row[0], int(row[1])
+            if status == "SUBSCRIBED":
+                subscribed = views
+            elif status == "UNSUBSCRIBED":
+                unsubscribed = views
+        total = subscribed + unsubscribed
+        share_pct = round(subscribed / total * 100, 2) if total > 0 else 0.0
+        return {"subscribed": subscribed, "unsubscribed": unsubscribed, "share_pct": share_pct}
+    except Exception as e:  # noqa: BLE001 - best-effort signal only, never fatal
+        print(f"[analytics] channel audience snapshot failed (non-fatal): {e}")
+        return None
+
+
 def sheet_get(token: str, a1_range: str) -> list:
-    resp = SESSION.get(
-        f"{SHEETS_BASE}/values/{a1_range}",
-        headers=headers(token),
-        timeout=30,
+    resp = _sheets_call_with_retry(
+        lambda: SESSION.get(f"{SHEETS_BASE}/values/{a1_range}", headers=headers(token), timeout=30)
     )
-    resp.raise_for_status()
     return resp.json().get("values", [])
 
 
 def sheet_update(token: str, a1_range: str, row: list) -> None:
-    resp = SESSION.put(
-        f"{SHEETS_BASE}/values/{a1_range}",
-        headers=headers(token),
-        params={"valueInputOption": "USER_ENTERED"},
-        json={"values": [row]},
-        timeout=30,
+    _sheets_call_with_retry(
+        lambda: SESSION.put(
+            f"{SHEETS_BASE}/values/{a1_range}",
+            headers=headers(token),
+            params={"valueInputOption": "USER_ENTERED"},
+            json={"values": [row]},
+            timeout=30,
+        )
     )
-    resp.raise_for_status()
 
 
 def sheet_append(token: str, a1_range: str, row: list) -> None:
-    resp = SESSION.post(
-        f"{SHEETS_BASE}/values/{a1_range}:append",
-        headers=headers(token),
-        params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
-        json={"values": [row]},
-        timeout=30,
+    _sheets_call_with_retry(
+        lambda: SESSION.post(
+            f"{SHEETS_BASE}/values/{a1_range}:append",
+            headers=headers(token),
+            params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+            json={"values": [row]},
+            timeout=30,
+        )
     )
-    resp.raise_for_status()
 
 
 def ensure_sheet_tab(token: str, tab_name: str, header_row: list) -> bool:
@@ -164,17 +314,99 @@ def ensure_sheet_tab(token: str, tab_name: str, header_row: list) -> bool:
 
 def append_history_row(token: str, row: list) -> None:
     try:
-        sheet_append(token, f"{ANALYTICS_HISTORY_TAB}!A:O", row)
+        sheet_append(token, f"{ANALYTICS_HISTORY_TAB}!A:P", row)
     except Exception as e:  # noqa: BLE001 - history logging must never crash the sync
         healed = False
         try:
             healed = ensure_sheet_tab(token, ANALYTICS_HISTORY_TAB, ANALYTICS_HISTORY_HEADER)
             if healed:
-                sheet_append(token, f"{ANALYTICS_HISTORY_TAB}!A:O", row)
+                sheet_append(token, f"{ANALYTICS_HISTORY_TAB}!A:P", row)
         except Exception:
             healed = False
         if not healed:
             print(f"[analytics] could not log to {ANALYTICS_HISTORY_TAB} tab (does it exist yet?): {e}")
+
+
+def append_channel_audience_snapshot(token: str, snapshot: dict) -> None:
+    """Best-effort single row per sync run into the new, self-healing
+    ChannelAudienceSnapshot tab. Never raises."""
+    row = [
+        datetime.now(timezone.utc).date().isoformat(),
+        snapshot["subscribed"], snapshot["unsubscribed"], snapshot["share_pct"],
+    ]
+    try:
+        sheet_append(token, f"{CHANNEL_AUDIENCE_TAB}!A:D", row)
+    except Exception as e:  # noqa: BLE001 - never crash the sync over this
+        healed = False
+        try:
+            healed = ensure_sheet_tab(token, CHANNEL_AUDIENCE_TAB, CHANNEL_AUDIENCE_HEADER)
+            if healed:
+                sheet_append(token, f"{CHANNEL_AUDIENCE_TAB}!A:D", row)
+        except Exception:
+            healed = False
+        if not healed:
+            print(f"[analytics] could not log to {CHANNEL_AUDIENCE_TAB} tab (non-fatal): {e}")
+
+
+def sync_longform_videos(token: str, video_meta: dict, today: str) -> None:
+    """Long-form parity loop (2026-07-31): pulls the same YouTube Data/
+    Analytics stats for every LongformVideos row and (a) appends new
+    Views/Likes/Comments/Shares/LastSynced columns at the END of that
+    tab's header, and (b) appends an enriched AnalyticsHistory row with
+    Format="longform", exactly like the Shorts loop above. Wrapped so any
+    failure to even read the LongformVideos tab (e.g. it doesn't exist yet)
+    degrades to a no-op rather than breaking the Shorts sync that already
+    ran successfully above."""
+    try:
+        rows = sheet_get(token, "LongformVideos!A2:N")
+    except Exception as e:  # noqa: BLE001 - tab may not exist yet; that's fine
+        print(f"[analytics] LongformVideos tab not available yet (non-fatal): {e}")
+        return
+    print(f"[analytics] {len(rows)} rows in LongformVideos sheet")
+
+    for i, row in enumerate(rows, start=2):
+        row = row + [""] * (14 - len(row))
+        video_id = row[0].strip()
+        title, topic = row[1], row[2]
+        publish_date = row[4]
+        if not video_id:
+            continue
+        try:
+            stats = get_video_stats(token, video_id)
+        except Exception as e:  # noqa: BLE001 - one bad video must not stop the loop
+            print(f"[analytics] LongformVideos row {i}: stats lookup failed (non-fatal): {e}")
+            continue
+        if not stats:
+            print(f"[analytics] LongformVideos row {i}: video {video_id} not found (may still be private)")
+            continue
+        analytics = get_video_analytics(token, video_id)
+        views = stats.get("viewCount", 0)
+        likes = stats.get("likeCount", 0)
+        comments = stats.get("commentCount", 0)
+        shares = analytics["shares"]
+        now = datetime.now(timezone.utc).isoformat()
+
+        # New end-of-header columns O-S (Views, Likes, Comments, Shares,
+        # LastSynced) - the existing A-N columns (VideoID..Notes) are
+        # completely untouched.
+        try:
+            sheet_update(token, f"LongformVideos!O{i}:S{i}", [views, likes, comments, shares, now])
+        except Exception as e:  # noqa: BLE001 - a write failure shouldn't stop the loop
+            print(f"[analytics] LongformVideos row {i}: could not write new columns (non-fatal): {e}")
+
+        early_retention = get_early_retention_pct(token, video_id, is_longform=True)
+        print(f"[analytics] LongformVideos row {i}: video {video_id} -> views={views} likes={likes} "
+              f"comments={comments} shares={shares} avg_view_pct={analytics['avg_view_pct']:.1f} "
+              f"early_retention_pct={early_retention}")
+
+        meta = video_meta.get(video_id, {})
+        append_history_row(token, [
+            today, video_id, title, topic, meta.get("pillar", ""), "longform",
+            views, likes, comments, shares,
+            round(analytics["avg_view_duration"], 1), round(analytics["avg_view_pct"], 2),
+            analytics["subs_gained"], meta.get("upload_hour_utc", ""), publish_date,
+            early_retention,
+        ])
 
 
 def load_video_meta(token: str) -> dict:
@@ -232,13 +464,31 @@ def main() -> None:
               f"comments={comments} shares={shares} avg_view_pct={analytics['avg_view_pct']:.1f} "
               f"avg_view_duration={analytics['avg_view_duration']:.1f}s subs_gained={analytics['subs_gained']}")
 
+        early_retention = get_early_retention_pct(token, video_id, is_longform=False)
         meta = video_meta.get(video_id, {})
         append_history_row(token, [
             today, video_id, title, topic, meta.get("pillar", ""), meta.get("format", ""),
             views, likes, comments, shares,
             round(analytics["avg_view_duration"], 1), round(analytics["avg_view_pct"], 2),
             analytics["subs_gained"], meta.get("upload_hour_utc", ""), publish_date,
+            early_retention,
         ])
+
+    # Long-form parity loop (2026-07-31) - best-effort, never breaks the
+    # Shorts sync above even if it fails entirely.
+    try:
+        sync_longform_videos(token, video_meta, today)
+    except Exception as e:  # noqa: BLE001 - long-form sync must never break Shorts sync
+        print(f"[analytics] long-form sync failed unexpectedly (non-fatal): {e}")
+
+    # Channel-level "returning viewers" signal - once per run, best-effort.
+    snapshot = get_channel_audience_snapshot(token)
+    if snapshot:
+        print(f"[analytics] channel audience snapshot: subscribed_views={snapshot['subscribed']} "
+              f"unsubscribed_views={snapshot['unsubscribed']} subscribed_share_pct={snapshot['share_pct']}")
+        append_channel_audience_snapshot(token, snapshot)
+    else:
+        print("[analytics] channel audience snapshot unavailable this run (non-fatal)")
 
     print("[analytics] done")
 

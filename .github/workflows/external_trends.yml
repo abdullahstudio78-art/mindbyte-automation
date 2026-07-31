@@ -1,0 +1,31 @@
+name: External Trend Learning
+
+on:
+  # Sundays at 10:00 UTC - deliberately BEFORE weekly_review.yml's Sunday
+  # 12:00 UTC run, so this week's CompetitorTrends data is fresh by the
+  # time weekly_review.py builds its Groq prompt.
+  schedule:
+    - cron: '0 10 * * 0'
+  workflow_dispatch: {}
+
+jobs:
+  external_trends:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run external trend learning
+        env:
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python external_trends.py
