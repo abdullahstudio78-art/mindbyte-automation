@@ -145,6 +145,30 @@ check("confidence_for_group: no best key -> Low",
       wr.confidence_for_group({}, None, None) == "Low")
 
 
+# --- 3b. weekly_review.py main() must not crash on a Groq outage -----------
+# Regression test for the 2026-07-31 fix: call_groq() at the main() call site
+# used to be unwrapped, so a non-429 Groq error (5xx, network failure, etc.)
+# would raise uncaught and crash the whole weekly run. It should now be
+# caught and degrade to "skip this week's report," matching every other
+# external call in this file.
+with mock.patch.object(wr, "get_access_token", return_value="fake-token"), \
+     mock.patch.object(wr, "load_videos", return_value=[{"video_id": "v1", "views": 10}]), \
+     mock.patch.object(wr, "load_longform_videos", return_value=[]), \
+     mock.patch.object(wr, "load_analytics_history_latest", return_value={}), \
+     mock.patch.object(wr, "load_video_meta", return_value={}), \
+     mock.patch.object(wr, "load_competitor_trends", return_value=[]), \
+     mock.patch.object(wr, "merge_records", return_value=[{"video_id": "v1", "composite_score": 0.5}]), \
+     mock.patch.object(wr, "compute_composite_scores", return_value=None), \
+     mock.patch.object(wr, "detect_patterns", return_value=({}, False)), \
+     mock.patch.object(wr, "build_groq_prompt", return_value="fake prompt"), \
+     mock.patch.object(wr, "call_groq", side_effect=Exception("Groq 503 - service unavailable")):
+    try:
+        wr.main()
+        check("weekly_review.main() degrades cleanly on a Groq outage (no crash)", True)
+    except Exception as e:
+        check(f"weekly_review.main() degrades cleanly on a Groq outage ({e})", False)
+
+
 # --- 4. pipeline.py log_video_meta() backward compatibility ----------------
 import pipeline as pl
 

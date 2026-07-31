@@ -758,7 +758,14 @@ def main() -> None:
         print(f"[weekly] pattern - {format_pattern_line(dim, data)}")
 
     prompt = build_groq_prompt(records, patterns, has_subscriber_data, competitor_trends)
-    raw = call_groq(prompt)
+    try:
+        raw = call_groq(prompt)
+    except Exception as e:  # noqa: BLE001 - a Groq outage/non-429 error must not
+        # crash the whole weekly run; skip this week's report and let next
+        # Sunday's run try again, matching the non-fatal pattern used by
+        # every other external call in this file (Sheets, YouTube, trends).
+        print(f"[weekly] Groq call failed unexpectedly, skipping this week's report: {e}")
+        return
     try:
         report = json.loads(raw)
     except json.JSONDecodeError as e:
