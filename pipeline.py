@@ -754,7 +754,7 @@ def generate_storyboard(sentences: list) -> list:
         ]
 
 
-def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = None) -> dict:
+def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = None, cta_style: str = None) -> dict:
     feedback_block = ""
     if feedback:
         feedback_block = textwrap.dedent(f"""
@@ -785,6 +785,24 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
             Use this as strong creative direction, not a rigid template -
             still write fully original sentences and follow every rule below.
         """)
+    from brand_rules import CTA_STYLES
+    cta_instruction = CTA_STYLES.get(cta_style, {}).get("instruction", "") if cta_style else ""
+    cta_block = ""
+    if cta_instruction:
+        cta_block = textwrap.dedent(f"""
+
+            SUBSCRIBE LINE (separate from the story - written as its own
+            short field, NOT one of the 15-19 story sentences above):
+            After the story's closing insight, write ONE additional short,
+            natural spoken sentence (under 20 words) that invites the
+            viewer to subscribe, in this specific style: {cta_instruction}
+            It must sound like a natural continuation of THIS video's
+            specific topic, not a generic tacked-on line - reference what
+            the video was actually about. Never use "don't forget to
+            subscribe", "smash that like button", or any other tired
+            generic phrasing. Return it in a separate "cta_line" field,
+            NOT inside "sentences".
+        """)
     tone = CONTENT_PILLARS[pillar]["tone"]
     prompt = textwrap.dedent(f"""
         You are the writer for MindByte, a YouTube channel about why humans
@@ -795,7 +813,7 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
 
         You are writing a 30-60 second YouTube Short. The topic is:
         "{topic}", from the "{pillar}" pillar. Tone for this pillar: {tone}.
-        {feedback_block}{brief_block}
+        {feedback_block}{brief_block}{cta_block}
         STRUCTURE - tell one small story, do not dump facts:
         1. HOOK (first 1-3 seconds) - grab attention instantly.
         2. Introduce a relatable human problem or moment tied to the topic.
@@ -881,7 +899,8 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
         "sentences": ["...", "..."],
         "visual_keywords": ["...", "..."],
         "tags": ["...", "..."],
-        "hook_type": "question|mystery|emotional|story"
+        "hook_type": "question|mystery|emotional|story",
+        "cta_line": "..."
         }}
     """).strip()
     raw = call_groq(prompt)
@@ -893,6 +912,12 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
         data["hook_type"] = "unclassified"
     else:
         data["hook_type"] = str(data["hook_type"]).strip().lower()
+    # Subscriber-conversion CTA line (2026-08-01) - optional field, only
+    # present when a cta_style was actually requested; defaults to "" so
+    # every downstream call site (compliance scan, voiceover, captions)
+    # can treat a missing/failed CTA the same as "no CTA this run" rather
+    # than crashing on a missing key.
+    data["cta_line"] = str(data.get("cta_line", "") or "").strip()
     # Defensive: guarantee 1:1 sentence/keyword pairing even if the model
     # drifts from the requested shape, since assembly depends on it.
     sentences = data.get("sentences", [])
@@ -955,6 +980,7 @@ MIN_SCRIPT_WORDS = 130  # keeps narration filling the 45-55s target instead of d
 
 def generate_and_score_script(
     topic: str, pillar: str, max_attempts: int = MAX_SCRIPT_ATTEMPTS, brief: dict = None,
+    cta_style: str = None,
 ) -> tuple:
     """Generate + score a script, retrying with feedback if it falls short
     of the quality bar OR is too short to fill the target duration, so a
@@ -980,7 +1006,7 @@ def generate_and_score_script(
     )
     feedback = ""
     for attempt in range(1, max_attempts + 1):
-        script = generate_script(topic, pillar, feedback=feedback, brief=brief)
+        script = generate_script(topic, pillar, feedback=feedback, brief=brief, cta_style=cta_style)
         quality = score_quality(topic, pillar, script)
         word_count = sum(len(s.split()) for s in script["sentences"])
         meets_bar = quality["score"] >= QUALITY_THRESHOLD and word_count >= MIN_SCRIPT_WORDS
@@ -1033,7 +1059,7 @@ def compliance_check(script: dict) -> dict:
         "smash that like button", "don't forget to subscribe",
         "today we will discuss", "in today's video", "stay tuned to find out",
     ]
-    lowered = " ".join(script["sentences"]).lower()
+    lowered = " ".join(script["sentences"] + [script.get("cta_line", "")]).lower()
     flags = [p for p in generic_phrases if p in lowered]
     passed = len(flags) == 0
     notes = "OK" if passed else f"Generic phrasing detected: {', '.join(flags)}"
@@ -1413,6 +1439,60 @@ def build_watermark_png(dest_path: str) -> None:
     _draw_logo_mark(draw, WATERMARK_SIZE / 2, WATERMARK_SIZE / 2, WATERMARK_SIZE * 0.32,
                      color=(255, 255, 255, 230))
     img.save(dest_path)
+
+
+# Subscriber-conversion visual cue (2026-08-01) - a small "Subscribe for
+# More" badge shown for the last SUBSCRIBE_BADGE_SECONDS of every Shorts
+# video, replacing the old plain static drawtext "Follow MindByte for
+# more" cue with a proper branded, animated (fade-in) graphic. See
+# assemble_video()'s subscribe_badge_path wiring for the fade + timing.
+SUBSCRIBE_BADGE_SECONDS = 2.5
+SUBSCRIBE_BADGE_WIDTH = 460
+SUBSCRIBE_BADGE_HEIGHT = 120
+
+
+def build_subscribe_badge(dest_path: str, pillar: str,
+                           width: int = SUBSCRIBE_BADGE_WIDTH,
+                           height: int = SUBSCRIBE_BADGE_HEIGHT) -> None:
+    """Small, modern, on-brand "Subscribe for More" pill badge: rounded
+    dark-brand background (semi-transparent, so it never fully blocks the
+    footage behind it), the MindByte logo mark, "SUBSCRIBE" wordmark, and
+    a thin pillar-accent underline so it still reads as MindByte's own
+    branding regardless of which pillar the video belongs to (same accent-
+    color system used by the title card/thumbnail). Deliberately reuses
+    the exact same brand primitives (_draw_logo_mark, BRAND_BG_TOP,
+    PILLAR_ACCENT_COLORS, _brand_font) as the rest of the branding system
+    so this cue is instantly recognizable as "the same channel" rather
+    than a bolted-on generic subscribe button. Sized to stay well under
+    half the frame width - small enough to never cover captions or the
+    Shorts UI's own bottom safe zone (it's positioned near the TOP of the
+    frame by assemble_video(), same spot the old text cue used)."""
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    accent = PILLAR_ACCENT_COLORS.get(pillar, (255, 255, 255))
+    pad = 6
+    draw.rounded_rectangle(
+        [pad, pad, width - pad, height - pad], radius=(height - 2 * pad) / 2,
+        fill=(*BRAND_BG_TOP, 225), outline=(*accent, 255), width=3,
+    )
+    logo_r = (height - 2 * pad) * 0.30
+    logo_cx = pad + logo_r + 22
+    logo_cy = height / 2
+    _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255, 255))
+    font = _brand_font(int(height * 0.30))
+    text = "SUBSCRIBE FOR MORE"
+    tb = draw.textbbox((0, 0), text, font=font)
+    text_w, text_h = tb[2] - tb[0], tb[3] - tb[1]
+    text_x = logo_cx + logo_r + 18
+    text_y = height / 2 - text_h / 2 - tb[1]
+    draw.text((text_x, text_y), text, font=font, fill=(255, 255, 255, 255))
+    underline_y = text_y + text_h + 8
+    draw.line(
+        [(text_x, underline_y), (min(text_x + text_w, width - pad - 10), underline_y)],
+        fill=(*accent, 255), width=3,
+    )
+    img.save(dest_path)
+
 
 def build_title_card(dest_path: str, title: str, pillar: str) -> None:
     """Generates the branded intro frame shown for TITLE_CARD_SECONDS at
@@ -2020,7 +2100,8 @@ def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
 
 def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
                     ass_path: str, output_path: str,
-                    title_card_path: str = None, watermark_path: str = None) -> None:
+                    title_card_path: str = None, watermark_path: str = None,
+                    subscribe_badge_path: str = None) -> None:
     # Each clip is trimmed to the real measured duration of the sentence it
     # illustrates (see generate_voiceover_segments), so cuts land exactly on
     # sentence boundaries instead of an even, content-blind split. zip()
@@ -2064,18 +2145,26 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
     # can't do the per-word highlighting an .ass file's override tags can).
     ass_escaped = ass_path.replace(":", r"\:")
 
-    # Small "Follow MindByte for more" cue burned in for the last ~1.8s of
-    # the video, positioned near the TOP of the frame (captions own the
-    # bottom) so it never collides with the last line's caption. This is a
-    # plain growth/branding cue, not part of the spoken narration, so it
-    # doesn't affect compliance_check()'s originality scan.
+    # Subscribe cue burned in for the last SUBSCRIBE_BADGE_SECONDS of the
+    # video, positioned near the TOP of the frame (captions own the bottom)
+    # so it never collides with the last line's caption. This is a plain
+    # growth/branding cue, not part of the spoken narration, so it doesn't
+    # affect compliance_check()'s originality scan. Prefers the branded
+    # build_subscribe_badge() image (composited further below as a
+    # fade-in overlay); if badge generation failed upstream (best-effort,
+    # per every other branding asset in this file), falls back to the
+    # original plain-text drawtext cue so a Pillow hiccup never blocks a
+    # video from publishing (2026-08-01 subscriber-conversion feature).
     total_duration = sum(segment_durations)
-    follow_from = max(total_duration - 1.8, 0.0)
-    follow_overlay = (
-        "drawtext=text='Follow MindByte for more':fontcolor=white:fontsize=54:"
-        "font=Arial:box=1:boxcolor=black@0.45:boxborderw=14:"
-        f"x=(w-text_w)/2:y=180:enable='gte(t\\,{follow_from:.3f})'"
-    )
+    follow_from = max(total_duration - SUBSCRIBE_BADGE_SECONDS, 0.0)
+    if subscribe_badge_path:
+        follow_overlay = "null"
+    else:
+        follow_overlay = (
+            "drawtext=text='Subscribe for More':fontcolor=white:fontsize=54:"
+            "font=Arial:box=1:boxcolor=black@0.45:boxborderw=14:"
+            "x=(w-text_w)/2:y=180:enable='gte(t\\,{:.3f})'"
+        ).format(follow_from)
 
     # Title card + watermark are added as extra overlay inputs on top of
     # the existing subtitles/follow-cue chain (content-strategy branding
@@ -2103,6 +2192,24 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
             f"[{last_label}][{next_input_index}:v]overlay=40:40[branded]"
         )
         last_label = "branded"
+        next_input_index += 1
+    if subscribe_badge_path:
+        # Small on-brand "Subscribe for More" badge, bottom-right corner
+        # (clear of the bottom-center captions and the top-left watermark),
+        # faded in over 0.3s starting at follow_from and held through the
+        # end of the clip - a genuine animation rather than a hard cut, per
+        # the 2026-08-01 subscriber-conversion feature spec.
+        extra_input_args += ["-loop", "1", "-i", subscribe_badge_path]
+        badge_x = VIDEO_WIDTH - SUBSCRIBE_BADGE_WIDTH - 40
+        badge_y = VIDEO_HEIGHT - SUBSCRIBE_BADGE_HEIGHT - 420
+        filter_stages.append(
+            f"[{next_input_index}:v]fade=t=in:st={follow_from:.3f}:d=0.3:alpha=1[badge]"
+        )
+        filter_stages.append(
+            f"[{last_label}][badge]overlay={badge_x}:{badge_y}:"
+            f"enable='gte(t\\,{follow_from:.3f})'[subbed]"
+        )
+        last_label = "subbed"
         next_input_index += 1
     filter_complex = ";".join(filter_stages)
 
@@ -2288,13 +2395,15 @@ def ensure_sheet_tab(access_token: str, tab_name: str, header_row: list) -> bool
 # correlate performance against these fields instead of raw title text.
 # ---------------------------------------------------------------------------
 
-VIDEO_META_SHEET_TAB = "VideoMeta!A:Q"
+VIDEO_META_SHEET_TAB = "VideoMeta!A:S"
 VIDEO_META_HEADER = [
     "VideoID", "Title", "Topic", "Pillar", "Format", "HookText",
     "HookOpenerWords", "ScriptStructure", "WordCount", "SentenceOrParaCount",
     "VideoLengthSec", "UploadHourUTC", "Tags", "CreatedAt",
     # Appended at end 2026-07-31:
     "HookType", "Series", "ThumbnailIdentity",
+    # Appended at end 2026-08-01 (subscriber-conversion CTA feature):
+    "CTAStyle", "CTAText",
 ]
 
 
@@ -2303,6 +2412,7 @@ def log_video_meta(
     fmt: str, hook_text: str, structure_tag: str, word_count: int,
     unit_count: int, video_length_sec: float, tags: list,
     hook_type: str = "", series: str = "", thumbnail_identity: str = "",
+    cta_style: str = "", cta_text: str = "",
 ) -> None:
     """Best-effort logging of one row per published video to the VideoMeta
     tab. Never raises - a failure here (e.g. tab doesn't exist yet) must
@@ -2312,7 +2422,11 @@ def log_video_meta(
 
     Extended 2026-07-31 with optional hook_type/series/thumbnail_identity
     kwargs, all defaulting to "" so any existing call site that doesn't
-    pass them keeps working exactly as before."""
+    pass them keeps working exactly as before. Extended again 2026-08-01
+    with optional cta_style/cta_text kwargs, same backward-compatible
+    default-to-"" pattern, so get_recent_cta_styles() can read the
+    CTAStyle column back out for rotation and the weekly review can
+    eventually score which style converts best."""
     hook_opener = " ".join((hook_text or "").split()[:6])
     row = [
         video_id, title, topic, pillar, fmt, hook_text, hook_opener,
@@ -2320,6 +2434,7 @@ def log_video_meta(
         datetime.now(timezone.utc).hour, ", ".join(tags or []),
         datetime.now(timezone.utc).isoformat(),
         hook_type or "unclassified", series or "", thumbnail_identity or "",
+        cta_style or "", cta_text or "",
     ]
     try:
         sheet_append(access_token, VIDEO_META_SHEET_TAB, row)
@@ -2384,6 +2499,22 @@ def log_quality_checklist(
 # Main
 # ---------------------------------------------------------------------------
 
+def get_recent_cta_styles(access_token: str, limit: int = 4) -> list:
+    """Reads the last few CTAStyle values already logged to VideoMeta, most
+    recent last, so pick_next_cta_style() can avoid repeating the same
+    style back-to-back. Best-effort: returns [] on any failure (tab
+    doesn't exist yet, column not there yet on an older sheet) so a Sheets
+    hiccup degrades to "no history, pick anything" instead of blocking the
+    run - consistent with every other Sheet read in this file.
+    """
+    try:
+        rows = sheet_get(access_token, "VideoMeta!R2:R")
+    except Exception:
+        return []
+    styles = [row[0].strip() for row in rows if row and row[0].strip()]
+    return styles[-limit:]
+
+
 def main() -> None:
     access_token = get_access_token()
     # Closed self-improvement loop (2026-07-30): try a weekly-generated,
@@ -2395,8 +2526,14 @@ def main() -> None:
     print(f"[pipeline] topic: {topic} (pillar: {pillar}) - idea score avg {idea_score_avg:.1f}"
           + (" [from weekly self-improvement queue]" if brief else ""))
 
-    script, quality = generate_and_score_script(topic, pillar, brief=brief)
+    from brand_rules import pick_next_cta_style
+    cta_style = pick_next_cta_style(get_recent_cta_styles(access_token))
+    print(f"[pipeline] CTA style this run: {cta_style}")
+
+    script, quality = generate_and_score_script(topic, pillar, brief=brief, cta_style=cta_style)
     print(f"[pipeline] title: {script['title']}")
+    if script.get("cta_line"):
+        print(f"[pipeline] CTA line: {script['cta_line']}")
     print(f"[pipeline] final quality score: {quality['score']} - {quality['notes']}")
 
     compliance = compliance_check(script)
@@ -2425,8 +2562,25 @@ def main() -> None:
             (beat.get("footage_query") or "").strip() or script["visual_keywords"][i]
             for i, beat in enumerate(storyboard)
         ] if storyboard else script["visual_keywords"]
+
+        # Subscriber-conversion CTA line (2026-08-01): spoken as one extra
+        # sentence after the story's own closing insight. It's generated
+        # separately from "sentences" (see generate_script()'s cta_block)
+        # so the existing word-count/quality/retry logic above is
+        # completely unaffected by it - this just appends it to the
+        # spoken/visual timeline for voiceover, captions, and B-roll. No
+        # dedicated storyboard beat is requested for it (would cost an
+        # extra Groq call for one throwaway shot); it simply continues the
+        # last shot of the story, which reads fine for a 1-2 second cue.
+        spoken_sentences = list(script["sentences"])
+        if script.get("cta_line"):
+            spoken_sentences.append(script["cta_line"])
+            footage_queries = list(footage_queries) + [
+                footage_queries[-1] if footage_queries else script["title"]
+            ]
+
         clip_paths, stock_attributions = gather_clips(
-            footage_queries, workdir, sentences=script.get("sentences"),
+            footage_queries, workdir, sentences=spoken_sentences,
         )
         if not clip_paths:
             sheet_row_base[3] = "Failed"
@@ -2440,7 +2594,7 @@ def main() -> None:
         # a flat, run-on read - see generate_voiceover_segments() docstring.
         # segment_durations here are REAL measured per-sentence durations,
         # not a word-count estimate, so captions/cuts land exactly on them.
-        audio_path, segment_durations = generate_voiceover_segments(script["sentences"], workdir, pillar)
+        audio_path, segment_durations = generate_voiceover_segments(spoken_sentences, workdir, pillar)
         audio_duration = ffprobe_duration(audio_path)
 
         # Background music is best-effort: fetch + mix under the narration,
@@ -2479,13 +2633,16 @@ def main() -> None:
 
         title_card_path = os.path.join(workdir, "title_card.png")
         watermark_path = os.path.join(workdir, "watermark.png")
+        subscribe_badge_path = os.path.join(workdir, "subscribe_badge.png")
         try:
             build_title_card(title_card_path, script["title"], pillar)
             build_watermark_png(watermark_path)
+            build_subscribe_badge(subscribe_badge_path, pillar)
         except Exception as e:  # noqa: BLE001 - branding must never abort the run
             print(f"[pipeline] branding assets failed, continuing without them: {e}")
             title_card_path = None
             watermark_path = None
+            subscribe_badge_path = None
 
         thumbnail_path = os.path.join(workdir, "thumbnail.png")
         try:
@@ -2496,11 +2653,12 @@ def main() -> None:
             thumbnail_path = None
 
         ass_path = os.path.join(workdir, "captions.ass")
-        build_ass(script["sentences"], segment_durations, ass_path)
+        build_ass(spoken_sentences, segment_durations, ass_path)
 
         output_path = os.path.join(workdir, "final.mp4")
         assemble_video(clip_paths, segment_durations, final_audio_path, ass_path, output_path,
-                        title_card_path=title_card_path, watermark_path=watermark_path)
+                        title_card_path=title_card_path, watermark_path=watermark_path,
+                        subscribe_badge_path=subscribe_badge_path)
 
         checklist = run_prepublish_checklist(
             topic, pillar, script, quality, compliance, idea_score_avg, output_path,
@@ -2562,6 +2720,7 @@ def main() -> None:
         hook_type=script.get("hook_type", "unclassified"),
         series=(brief.get("series", "") if brief else ""),
         thumbnail_identity=os.path.basename(thumbnail_path) if thumbnail_path else "",
+        cta_style=cta_style, cta_text=script.get("cta_line", ""),
     )
     print("[pipeline] done")
 

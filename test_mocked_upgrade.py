@@ -195,9 +195,24 @@ with mock.patch.object(pl, "sheet_append") as msa2:
         args, kwargs = msa2.call_args
         row = args[-1]
         check("pipeline.log_video_meta new kwargs land in the appended row (hook_type/series/thumb)",
-              row[-3] == "question" and row[-2] == "Weird Minds" and row[-1] == "thumb.png")
+              row[-5] == "question" and row[-4] == "Weird Minds" and row[-3] == "thumb.png")
     except Exception as e:
         check(f"pipeline.log_video_meta new kwargs land correctly ({e})", False)
+
+with mock.patch.object(pl, "sheet_append") as msa3:
+    msa3.return_value = None
+    try:
+        pl.log_video_meta(
+            "fake-token", "vid3", "Title", "topic", "pillar",
+            "short", "hook text", "structure", 150, 17, 55.0, ["tag1"],
+            cta_style="curiosity", cta_text="Subscribe for the next one.",
+        )
+        args, kwargs = msa3.call_args
+        row = args[-1]
+        check("pipeline.log_video_meta CTA kwargs land in the appended row (cta_style/cta_text)",
+              row[-2] == "curiosity" and row[-1] == "Subscribe for the next one.")
+    except Exception as e:
+        check(f"pipeline.log_video_meta CTA kwargs land correctly ({e})", False)
 
 
 # --- summary -----------------------------------------------------------

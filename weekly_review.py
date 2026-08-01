@@ -326,15 +326,17 @@ def load_analytics_history_latest(token: str) -> dict:
 
 
 def load_video_meta(token: str) -> dict:
-    """Reads VideoMeta!A2:Q (extended from A2:N 2026-07-31 with HookType,
-    Series, ThumbnailIdentity appended at the end). Rows written before the
-    upgrade will simply be shorter than 17 cells - the padding below fills
-    those with "" so hook_type/series gracefully read as unset ("") rather
-    than raising, exactly as the spec requires."""
-    rows = sheet_get(token, "VideoMeta!A2:Q")
+    """Reads VideoMeta!A2:S (extended from A2:N 2026-07-31 with HookType,
+    Series, ThumbnailIdentity appended at the end; extended again 2026-08-01
+    with CTAStyle, CTAText for the subscriber-conversion feature). Rows
+    written before either upgrade will simply be shorter than 19 cells - the
+    padding below fills those with "" so hook_type/series/cta_style
+    gracefully read as unset ("") rather than raising, exactly as the spec
+    requires."""
+    rows = sheet_get(token, "VideoMeta!A2:S")
     meta = {}
     for row in rows:
-        row = row + [""] * (17 - len(row))
+        row = row + [""] * (19 - len(row))
         video_id = row[0].strip()
         if not video_id:
             continue
@@ -346,6 +348,8 @@ def load_video_meta(token: str) -> dict:
             "tags": [t.strip() for t in row[12].split(",") if t.strip()],
             "hook_type": (row[14] or "").strip(),
             "series": (row[15] or "").strip(),
+            "cta_style": (row[17] or "").strip(),
+            "cta_text": (row[18] or "").strip(),
         }
     return meta
 
@@ -394,6 +398,10 @@ def merge_records(videos: list, history: dict, meta: dict) -> list:
             # New pattern dimensions (2026-07-31) - blank/absent for older
             "hook_type": m.get("hook_type", "") or "",
             "series": m.get("series", "") or "",
+            # Subscriber-conversion CTA style (2026-08-01) - blank/absent
+            # for videos published before this feature shipped.
+            "cta_style": m.get("cta_style", "") or "",
+            "cta_text": m.get("cta_text", "") or "",
         }
         merged.append(rec)
     return merged
@@ -580,6 +588,20 @@ def detect_patterns(records: list) -> dict:
     if any(r.get("series") for r in records):
         add("series", lambda r: r["series"] or "(none)")
 
+    # CTA style pattern (2026-08-01, subscriber-conversion feature): tracks
+    # which spoken-CTA style (curiosity/series/value/question, see
+    # brand_rules.CTA_STYLES) correlates with better outcomes, so
+    # build_groq_prompt()/the weekly brief can eventually recommend a
+    # highest-converting style once there's enough data - same
+    # gracefully-skipped-if-no-data pattern as hook_type/series above.
+    # Uses composite_score (views/retention/duration/engagement) as the
+    # signal until real subscriber data exists; the subscriber_cta_style
+    # block just below switches to true subscriber-conversion rate once it
+    # does, per the spec's "rotate until data exists, then recommend"
+    # requirement.
+    if any(r.get("cta_style") for r in records):
+        add("cta_style", lambda r: r["cta_style"] or "(none)")
+
     # Keyword/tag-level pattern: a video can carry many tags, so this is a
     # one-to-many expansion rather than a straight groupby.
     tag_records = []
@@ -601,6 +623,9 @@ def detect_patterns(records: list) -> dict:
         add("subscriber_pillar", lambda r: r["pillar"], value_fn=lambda r: r["subscriber_conversion_rate"])
         add("subscriber_hook", lambda r: r["hook_opener"] or "(unknown)", value_fn=lambda r: r["subscriber_conversion_rate"])
         add("subscriber_length_band", lambda r: length_bucket(r["length_sec"]), value_fn=lambda r: r["subscriber_conversion_rate"])
+        if any(r.get("cta_style") for r in records):
+            add("subscriber_cta_style", lambda r: r["cta_style"] or "(none)",
+                value_fn=lambda r: r["subscriber_conversion_rate"])
 
     return patterns, has_subscriber_data
 

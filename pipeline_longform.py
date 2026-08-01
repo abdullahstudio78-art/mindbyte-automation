@@ -61,6 +61,7 @@ from pipeline import (
     # Google OAuth / Sheets
     get_access_token,
     sheet_append,
+    sheet_get,
     ensure_sheet_tab,
     # Topic selection (shared pool + shared UsedTopics tab across both
     # Shorts and long-form - a topic covered in either format is still
@@ -102,6 +103,10 @@ from pipeline import (
     _brand_font,
     _draw_logo_mark,
     build_watermark_png,
+    # Subscriber-conversion CTA system (2026-08-01) - the badge builder is
+    # reused as-is with LF_SUBSCRIBE_BADGE_WIDTH/HEIGHT passed in below,
+    # since it already accepts width/height overrides for exactly this.
+    build_subscribe_badge,
 )
 
 # ---------------------------------------------------------------------------
@@ -144,7 +149,7 @@ LF_MAX_VIDEO_DURATION_SEC = 920   # ~15.3 minutes (small margin over 15:00)
 LF_REQUIRED_WIDTH = LF_VIDEO_WIDTH
 LF_REQUIRED_HEIGHT = LF_VIDEO_HEIGHT
 
-LF_VIDEOS_SHEET_TAB = "LongformVideos!A:N"
+LF_VIDEOS_SHEET_TAB = "LongformVideos!A:O"
 LF_CHECKLIST_SHEET_TAB = "LongformChecklist!A:O"
 
 # Phase 4 polish pass (2026-07-20): a beat longer than Shorts' 1.1s title
@@ -155,12 +160,25 @@ LF_TITLE_CARD_SECONDS = 2.2
 # with pipeline.py) - imported under the same names so nothing below that
 # references FORBIDDEN_HOOK_OPENERS/GENERIC_PHRASES has to change.
 from brand_rules import FORBIDDEN_HOOK_OPENERS, GENERIC_PHRASES  # noqa: E402
+# Subscriber-conversion CTA system (2026-08-01) - same shared styles/rotation
+# used by pipeline.py, so Shorts and long-form draw from one source of truth.
+from brand_rules import CTA_STYLES, pick_next_cta_style  # noqa: E402
+
+# Small on-brand landscape "Subscribe" badge shown in the last few seconds
+# of a long-form video (2026-08-01 subscriber-conversion feature). Kept
+# short/unobtrusive relative to Shorts' SUBSCRIBE_BADGE_SECONDS=2.5 since a
+# long-form video's pacing is slower - this is a tasteful reminder, not a
+# hard cut-in.
+LF_SUBSCRIBE_BADGE_SECONDS = 4.0
+LF_SUBSCRIBE_BADGE_WIDTH = 640
+LF_SUBSCRIBE_BADGE_HEIGHT = 150
 
 # ---------------------------------------------------------------------------
 # Script generation (Groq) - paragraph-structured, not sentence-structured
 # ---------------------------------------------------------------------------
 
-def generate_longform_script(topic: str, pillar: str, feedback: str = "", brief: dict = None) -> dict:
+def generate_longform_script(topic: str, pillar: str, feedback: str = "", brief: dict = None,
+                              cta_style: str = None) -> dict:
     """Generate a long-form (8-15 min) documentary-style script as a list of
     PARAGRAPHS rather than individual sentences (see module docstring for
     why - this drives paragraph-level TTS/B-roll chunking downstream).
@@ -212,6 +230,21 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "", brief:
         """)
 
     tone = CONTENT_PILLARS[pillar]["tone"]
+
+    # Subscriber-conversion CTA style (2026-08-01): rotates the tone of the
+    # closing paragraph's subscribe mention so every video doesn't read the
+    # same way, without changing anything about the STORY ARC rules above
+    # or loosening the "only the closing paragraph may mention subscribing"
+    # constraint. Falls back to a generic instruction if no style was
+    # picked (keeps this parameter fully optional / backward compatible).
+    cta_instruction = (
+        f"For this subscribe mention specifically, lean into this angle: "
+        f"{CTA_STYLES[cta_style]['instruction']}"
+    ) if cta_style in CTA_STYLES else (
+        "Vary the exact wording and angle of this subscribe mention from "
+        "video to video rather than reusing the same phrasing."
+    )
+
     prompt = textwrap.dedent(f"""
     You are the writer for MindByte, a YouTube channel about why humans
     think, feel and behave the way they do. This is a LONG-FORM video
@@ -253,6 +286,7 @@ def generate_longform_script(topic: str, pillar: str, feedback: str = "", brief:
        "MindByte" inviting the viewer to keep watching/subscribe if the
        channel resonates with them - phrased originally, never a generic
        "smash that like button" / "don't forget to subscribe" line.
+       {cta_instruction}
        This is the ONLY paragraph allowed to mention the channel name,
        subscribing, or following - if any earlier paragraph does this
        too, the script is wrong and must be rewritten before returning
@@ -467,7 +501,7 @@ def expand_longform_script(script: dict, topic: str, pillar: str, words_needed: 
 
 def generate_and_score_longform_script(topic: str, pillar: str,
                                         max_attempts: int = LF_MAX_SCRIPT_ATTEMPTS,
-                                        brief: dict = None) -> tuple:
+                                        brief: dict = None, cta_style: str = None) -> tuple:
     """Mirrors pipeline.py's generate_and_score_script(), but the retry
     decision also checks the long-form word-count band (LF_MIN_WORDS /
     LF_MAX_WORDS) instead of a single floor, since a long-form script can
@@ -479,7 +513,7 @@ def generate_and_score_longform_script(topic: str, pillar: str,
     attempts = []
     feedback = ""
     for attempt in range(1, max_attempts + 1):
-        script = generate_longform_script(topic, pillar, feedback=feedback, brief=brief)
+        script = generate_longform_script(topic, pillar, feedback=feedback, brief=brief, cta_style=cta_style)
         quality = score_longform_quality(topic, pillar, script)
         word_count = sum(len(p["text"].split()) for p in script["paragraphs"])
         in_band = LF_MIN_WORDS <= word_count <= LF_MAX_WORDS
@@ -948,7 +982,8 @@ def build_thumbnail_longform(dest_path: str, title: str, pillar: str,
 
 def assemble_video_longform(clip_groups: list, segment_durations: list, audio_path: str,
                              ass_path: str, output_path: str,
-                             title_card_path: str = None, watermark_path: str = None) -> None:
+                             title_card_path: str = None, watermark_path: str = None,
+                             subscribe_badge_path: str = None) -> None:
     """Each paragraph's real measured audio duration is divided evenly
     across that paragraph's B-roll clips (clip_groups[i]), so a paragraph
     with 3 clips gets 3 roughly-equal slices covering its exact duration,
@@ -1036,40 +1071,60 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
 
     ass_escaped = ass_path.replace(":", r"\:")
     total_duration = sum(segment_durations)
-    follow_from = max(total_duration - 3.0, 0.0)
-    follow_overlay = (
-        "drawtext=text='Subscribe to MindByte for more':fontcolor=white:fontsize=48:"
-        "font=Arial:box=1:boxcolor=black@0.45:boxborderw=14:"
-        f"x=(w-text_w)/2:y=60:enable='gte(t\\,{follow_from:.3f})'"
-    )
+    # Subscribe cue window - branded badge (fade-in overlay, built below)
+    # is preferred; falls back to the original plain-text drawtext cue if
+    # badge generation failed upstream, so a Pillow hiccup never blocks a
+    # video from publishing (2026-08-01 subscriber-conversion feature).
+    follow_from = max(total_duration - LF_SUBSCRIBE_BADGE_SECONDS, 0.0)
+    if subscribe_badge_path:
+        follow_overlay = "null"
+    else:
+        follow_overlay = (
+            "drawtext=text='Subscribe to MindByte for more':fontcolor=white:fontsize=48:"
+            "font=Arial:box=1:boxcolor=black@0.45:boxborderw=14:"
+            "x=(w-text_w)/2:y=60:enable='gte(t\\,{:.3f})'"
+        ).format(follow_from)
     base_filter = f"subtitles={ass_escaped},{follow_overlay}"
 
     cmd = ["ffmpeg", "-y", "-i", silent_video, "-i", audio_path]
-    if title_card_path and watermark_path:
-        cmd += ["-loop", "1", "-t", f"{LF_TITLE_CARD_SECONDS}", "-i", title_card_path,
-                "-loop", "1", "-i", watermark_path]
-        filter_complex = (
-            f"[0:v]{base_filter}[capped];"
-            "[capped][2:v]overlay=eof_action=pass[withtitle];"
-            "[withtitle][3:v]overlay=x=40:y=40[outv]"
+    filter_stages = [f"[0:v]{base_filter}[capped]"]
+    extra_input_args = []
+    next_input_index = 2  # 0=silent_video, 1=audio_path
+    last_label = "capped"
+    if title_card_path:
+        extra_input_args += ["-loop", "1", "-t", f"{LF_TITLE_CARD_SECONDS}", "-i", title_card_path]
+        filter_stages.append(
+            f"[{last_label}][{next_input_index}:v]overlay=eof_action=pass[titled]"
         )
-        cmd += ["-filter_complex", filter_complex, "-map", "[outv]", "-map", "1:a:0"]
-    elif title_card_path:
-        cmd += ["-loop", "1", "-t", f"{LF_TITLE_CARD_SECONDS}", "-i", title_card_path]
-        filter_complex = (
-            f"[0:v]{base_filter}[capped];"
-            "[capped][2:v]overlay=eof_action=pass[outv]"
+        last_label = "titled"
+        next_input_index += 1
+    if watermark_path:
+        extra_input_args += ["-loop", "1", "-i", watermark_path]
+        filter_stages.append(
+            f"[{last_label}][{next_input_index}:v]overlay=x=40:y=40[branded]"
         )
-        cmd += ["-filter_complex", filter_complex, "-map", "[outv]", "-map", "1:a:0"]
-    elif watermark_path:
-        cmd += ["-loop", "1", "-i", watermark_path]
-        filter_complex = (
-            f"[0:v]{base_filter}[capped];"
-            "[capped][2:v]overlay=x=40:y=40[outv]"
+        last_label = "branded"
+        next_input_index += 1
+    if subscribe_badge_path:
+        # Bottom-right corner, clear of the bottom-center captions and the
+        # top-left watermark - faded in over 0.3s so it's a genuine
+        # animation, not a hard cut, and held through the end of the clip.
+        extra_input_args += ["-loop", "1", "-i", subscribe_badge_path]
+        badge_x = LF_VIDEO_WIDTH - LF_SUBSCRIBE_BADGE_WIDTH - 60
+        badge_y = LF_VIDEO_HEIGHT - LF_SUBSCRIBE_BADGE_HEIGHT - 60
+        filter_stages.append(
+            f"[{next_input_index}:v]fade=t=in:st={follow_from:.3f}:d=0.3:alpha=1[badge]"
         )
-        cmd += ["-filter_complex", filter_complex, "-map", "[outv]", "-map", "1:a:0"]
-    else:
-        cmd += ["-vf", base_filter, "-map", "0:v:0", "-map", "1:a:0"]
+        filter_stages.append(
+            f"[{last_label}][badge]overlay={badge_x}:{badge_y}:"
+            f"enable='gte(t\\,{follow_from:.3f})'[subbed]"
+        )
+        last_label = "subbed"
+        next_input_index += 1
+
+    cmd += extra_input_args
+    filter_complex = ";".join(filter_stages)
+    cmd += ["-filter_complex", filter_complex, "-map", f"[{last_label}]", "-map", "1:a:0"]
 
     cmd += [
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
@@ -1169,6 +1224,21 @@ def log_longform_checklist(access_token: str, topic: str, pillar: str, result: d
             )
 
 
+def get_recent_cta_styles_longform(access_token: str, limit: int = 4) -> list:
+    """Long-form mirror of pipeline.py's get_recent_cta_styles(), reading
+    the CTAStyle column back out of the LongformVideos tab (column O, once
+    appended below) instead of VideoMeta, so Shorts and long-form each
+    rotate CTA styles independently against their own recent history.
+    Best-effort: any failure (tab/column doesn't exist yet) degrades to
+    "no history, pick anything", same as the Shorts version."""
+    try:
+        rows = sheet_get(access_token, "LongformVideos!O2:O")
+    except Exception:
+        return []
+    styles = [row[0].strip() for row in rows if row and row[0].strip()]
+    return styles[-limit:]
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1182,7 +1252,10 @@ def main() -> None:
     print(f"[pipeline_longform] topic: {topic} (pillar: {pillar}) - idea score avg {idea_score_avg:.1f}"
           + (" [from weekly self-improvement queue]" if brief else ""))
 
-    script, quality = generate_and_score_longform_script(topic, pillar, brief=brief)
+    cta_style = pick_next_cta_style(get_recent_cta_styles_longform(access_token))
+    print(f"[pipeline_longform] CTA style this run: {cta_style}")
+
+    script, quality = generate_and_score_longform_script(topic, pillar, brief=brief, cta_style=cta_style)
     word_count = sum(len(p["text"].split()) for p in script["paragraphs"])
     print(f"[pipeline_longform] title: {script['title']}")
     print(
@@ -1197,11 +1270,14 @@ def main() -> None:
     created_date = datetime.now(timezone.utc).isoformat()
     # LongformVideos columns: video_id, title, topic, status, created_date,
     # publish_at, quality_score, compliance_notes, duration_sec,
-    # paragraph_count, word_count, idea_score_avg, url, notes  (A:N)
+    # paragraph_count, word_count, idea_score_avg, url, notes,
+    # cta_style (A:O - CTAStyle appended 2026-08-01, read back by
+    # get_recent_cta_styles_longform() for rotation)
     sheet_row_base = [
         "", script["title"], topic, "", created_date, "",
         quality["score"], compliance["notes"], 0,
         len(script["paragraphs"]), word_count, round(idea_score_avg, 1), "", "",
+        cta_style,
     ]
 
     def log_video_row():
@@ -1212,6 +1288,7 @@ def main() -> None:
                 "VideoID", "Title", "Topic", "Status", "CreatedDate",
                 "PublishAt", "QualityScore", "ComplianceNotes", "DurationSec",
                 "ParagraphCount", "WordCount", "IdeaScoreAvg", "URL", "Notes",
+                "CTAStyle",
             ]
             healed = False
             try:
@@ -1277,20 +1354,28 @@ def main() -> None:
         # must never abort the run, same pattern as pipeline.py's main().
         title_card_path = None
         watermark_path = None
+        subscribe_badge_path = None
         try:
             title_card_path = os.path.join(workdir, "title_card_lf.png")
             build_title_card_longform(title_card_path, script["title"], pillar)
             watermark_path = os.path.join(workdir, "watermark_lf.png")
             build_watermark_png(watermark_path)
+            subscribe_badge_path = os.path.join(workdir, "subscribe_badge_lf.png")
+            build_subscribe_badge(
+                subscribe_badge_path, pillar,
+                width=LF_SUBSCRIBE_BADGE_WIDTH, height=LF_SUBSCRIBE_BADGE_HEIGHT,
+            )
         except Exception as e:  # noqa: BLE001 - branding is a bonus, never abort the run
             print(f"[pipeline_longform] branding overlay generation failed, continuing without it: {e}")
             title_card_path = None
             watermark_path = None
+            subscribe_badge_path = None
 
         output_path = os.path.join(workdir, "final_lf.mp4")
         assemble_video_longform(
             clip_groups, segment_durations, final_audio_path, ass_path, output_path,
             title_card_path=title_card_path, watermark_path=watermark_path,
+            subscribe_badge_path=subscribe_badge_path,
         )
 
         checklist = run_prepublish_checklist_longform(
@@ -1340,6 +1425,7 @@ def main() -> None:
             hook_type=script.get("hook_type", "unclassified"),
             series=(brief.get("series", "") if brief else ""),
             thumbnail_identity=os.path.basename(thumb_path) if thumb_path else "",
+            cta_style=cta_style,
         )
         print("[pipeline_longform] done")
 
