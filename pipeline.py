@@ -1594,12 +1594,30 @@ def fetch_background_music(dest_path: str, pillar: str) -> dict | None:
                 print(f"[pipeline] music search failed for '{query}': {resp.status_code} {resp.text[:200]}")
                 continue
             results = resp.json().get("results", [])
+            # SAFETY FIX (2026-08-01): a CC-BY/CC-BY-SA license on Openverse
+            # only means the track is LEGAL to use with attribution - it says
+            # nothing about whether the artist/label has *also* separately
+            # enrolled that same track with a YouTube Content ID rights-
+            # management partner (e.g. HAAWK), which happens often and is
+            # invisible in Openverse's own metadata. That enrollment can
+            # still globally block the video on YouTube even though using
+            # the track was fully legal. Real incident: "Inspiring Ambient
+            # Motivation" by Dope (CC-BY, run #56, 2026-08-01) got blocked
+            # globally on upload via a HAAWK Content ID claim. Restricting
+            # to CC0/public-domain-only tracks doesn't guarantee zero risk
+            # (false-positive Content ID matches are rare but possible even
+            # on PD audio), but it removes the specific "artist has a CMS
+            # deal on top of their CC license" risk this incident showed,
+            # which is the dominant real-world cause of these claims.
+            SAFE_MUSIC_LICENSES = {"cc0", "pdm"}
             candidates = [
                 r for r in results
-                if r.get("url") and (r.get("duration") or 0) >= MIN_MUSIC_DURATION_MS
+                if r.get("url")
+                and (r.get("duration") or 0) >= MIN_MUSIC_DURATION_MS
+                and (r.get("license") or "").lower() in SAFE_MUSIC_LICENSES
             ]
             if not candidates:
-                print(f"[pipeline] no suitable music candidates for query '{query}', trying next query")
+                print(f"[pipeline] no CC0/public-domain music candidates for query '{query}', trying next query")
                 continue
             track = random.choice(candidates)
             download_file(track["url"], dest_path)
