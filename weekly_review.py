@@ -93,7 +93,13 @@ COMPETITOR_TRENDS_HEADER = [
 
 MIN_GROUP_SAMPLE = 2          # don't call something a "pattern" off one video
 RECENCY_HALF_LIFE_DAYS = 30   # recent performance counts more, nothing decided off one video
-NEW_SHORTS_IDEAS_PER_WEEK = 5
+# Raised from 5 to 14 on 2026-08-01 when publish.yml moved from 1/day to
+# 2/day Shorts (14/week). Keep this in sync with the Shorts publish cadence -
+# if it falls behind weekly consumption again, pipeline.py's fallback to the
+# original random/idea-scored topic picker kicks in silently for the
+# uncovered days, which is safe but means those days skip the weekly-review
+# briefs entirely.
+NEW_SHORTS_IDEAS_PER_WEEK = 14
 NEW_LONGFORM_IDEAS_PER_WEEK = 1
 
 # --- Confidence rule (documented here, used by confidence_for_group()) ---

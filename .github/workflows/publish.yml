@@ -4,9 +4,20 @@ on:
   # Daily auto-schedule enabled 2026-07-19 - user approved quality after runs
   # #22 and #23 passed the full pipeline (idea-scoring, storytelling script,
   # pillar-matched voice/music, pre-publish checklist) and were reviewed and
-  # published by the user. Starting at 1/day per the posting-frequency
-  # research; re-evaluate after 2-3 weeks before considering 2/day.
+  # published by the user. Ran at 1/day for the first ~2 weeks per the
+  # posting-frequency research's re-evaluation window.
+  #
+  # BUMPED TO 2/DAY on 2026-08-01 (user's explicit decision, after the
+  # 1/day trial period) - two runs 12h apart (02:00 and 14:00 UTC) rather
+  # than back-to-back, so the two videos land at different points in the
+  # day for a global audience instead of clustering together. Paired with
+  # raising NEW_SHORTS_IDEAS_PER_WEEK in weekly_review.py from 5 to 14 so
+  # the self-improving queue can actually keep up with 2/day consumption -
+  # doubling the publish rate without doubling the brief supply would have
+  # meant most videos silently fell back to the original random topic
+  # picker instead of using the weekly-informed briefs.
   schedule:
+    - cron: '0 2 * * *'
     - cron: '0 14 * * *'
   workflow_dispatch: {}
 
