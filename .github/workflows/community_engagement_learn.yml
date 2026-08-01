@@ -1,0 +1,31 @@
+name: Community Engagement - Learning Sync
+
+on:
+  # Weekly, Sundays 11:00 UTC - after external_trends.yml (10:00) and
+  # before weekly_review.yml (12:00), so any engagement signal collected
+  # here is available in time for that week's Groq report.
+  schedule:
+    - cron: '0 11 * * 0'
+  workflow_dispatch: {}
+
+jobs:
+  learn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Check engagement on previously-posted comments
+        env:
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python community_engagement.py learn
