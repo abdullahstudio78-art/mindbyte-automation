@@ -1446,51 +1446,76 @@ def build_watermark_png(dest_path: str) -> None:
 # video, replacing the old plain static drawtext "Follow MindByte for
 # more" cue with a proper branded, animated (fade-in) graphic. See
 # assemble_video()'s subscribe_badge_path wiring for the fade + timing.
-SUBSCRIBE_BADGE_SECONDS = 2.5
+SUBSCRIBE_BADGE_SECONDS = 2.0
+
+# Kept as the historical corner-badge size (no longer used for the default
+# full-screen end card below, but still passed explicitly by
+# pipeline_longform.py's SUBSCRIBE_BADGE_WIDTH/HEIGHT override if a caller
+# wants the small pill style instead of a full-frame card).
 SUBSCRIBE_BADGE_WIDTH = 460
 SUBSCRIBE_BADGE_HEIGHT = 120
 
 
 def build_subscribe_badge(dest_path: str, pillar: str,
-                           width: int = SUBSCRIBE_BADGE_WIDTH,
-                           height: int = SUBSCRIBE_BADGE_HEIGHT) -> None:
-    """Small, modern, on-brand "Subscribe for More" pill badge: rounded
-    dark-brand background (semi-transparent, so it never fully blocks the
-    footage behind it), the MindByte logo mark, "SUBSCRIBE" wordmark, and
-    a thin pillar-accent underline so it still reads as MindByte's own
-    branding regardless of which pillar the video belongs to (same accent-
-    color system used by the title card/thumbnail). Deliberately reuses
-    the exact same brand primitives (_draw_logo_mark, BRAND_BG_TOP,
-    PILLAR_ACCENT_COLORS, _brand_font) as the rest of the branding system
-    so this cue is instantly recognizable as "the same channel" rather
-    than a bolted-on generic subscribe button. Sized to stay well under
-    half the frame width - small enough to never cover captions or the
-    Shorts UI's own bottom safe zone (it's positioned near the TOP of the
-    frame by assemble_video(), same spot the old text cue used)."""
-    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                           width: int = VIDEO_WIDTH,
+                           height: int = VIDEO_HEIGHT) -> None:
+    """Full-screen, on-brand "Subscribe for More" end card, shown for the
+    last SUBSCRIBE_BADGE_SECONDS of every video (2026-08-01, revised same
+    day after user feedback that the original small corner badge didn't
+    fit well on screen - a full-frame card, same visual treatment as
+    build_title_card(), reads far cleaner than a small overlay competing
+    with B-roll and captions). Same brand-color gradient background, the
+    MindByte logo mark + wordmark, and a pillar-accent divider as the
+    title card, with "SUBSCRIBE FOR MORE" as the headline instead of the
+    episode title - so it's instantly recognizable as bookending the same
+    branded intro/outro pair. Still takes explicit width/height so a
+    caller (e.g. pipeline_longform.py) can size it to a different frame,
+    or even request the old small pill size via
+    SUBSCRIBE_BADGE_WIDTH/SUBSCRIBE_BADGE_HEIGHT if a corner badge is ever
+    wanted again - but defaults to the full Shorts frame."""
+    img = Image.new("RGB", (width, height), BRAND_BG_TOP)
     draw = ImageDraw.Draw(img)
+    for y in range(height):
+        t = y / height
+        r = int(BRAND_BG_TOP[0] + (BRAND_BG_BOTTOM[0] - BRAND_BG_TOP[0]) * t)
+        g = int(BRAND_BG_TOP[1] + (BRAND_BG_BOTTOM[1] - BRAND_BG_TOP[1]) * t)
+        b = int(BRAND_BG_TOP[2] + (BRAND_BG_BOTTOM[2] - BRAND_BG_TOP[2]) * t)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+    # Scale off min(width, height), not width alone - build_title_card()
+    # (portrait-only) can safely use width-relative sizing, but this
+    # function is shared with pipeline_longform.py's landscape frame,
+    # where width >> height. Width-relative sizing there produced text
+    # tall enough to overlap itself vertically (found + fixed same day
+    # via a synthetic landscape render).
+    scale = min(width, height)
     accent = PILLAR_ACCENT_COLORS.get(pillar, (255, 255, 255))
-    pad = 6
-    draw.rounded_rectangle(
-        [pad, pad, width - pad, height - pad], radius=(height - 2 * pad) / 2,
-        fill=(*BRAND_BG_TOP, 225), outline=(*accent, 255), width=3,
-    )
-    logo_r = (height - 2 * pad) * 0.30
-    logo_cx = pad + logo_r + 22
-    logo_cy = height / 2
-    _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255, 255))
-    font = _brand_font(int(height * 0.30))
-    text = "SUBSCRIBE FOR MORE"
-    tb = draw.textbbox((0, 0), text, font=font)
-    text_w, text_h = tb[2] - tb[0], tb[3] - tb[1]
-    text_x = logo_cx + logo_r + 18
-    text_y = height / 2 - text_h / 2 - tb[1]
-    draw.text((text_x, text_y), text, font=font, fill=(255, 255, 255, 255))
-    underline_y = text_y + text_h + 8
-    draw.line(
-        [(text_x, underline_y), (min(text_x + text_w, width - pad - 10), underline_y)],
-        fill=(*accent, 255), width=3,
-    )
+    logo_cy = int(height * 0.34)
+    _draw_logo_mark(draw, width / 2, logo_cy, scale * 0.09, color=(255, 255, 255))
+
+    wordmark_font = _brand_font(int(scale * 0.075))
+    wm_bbox = draw.textbbox((0, 0), BRAND_NAME, font=wordmark_font)
+    wm_w = wm_bbox[2] - wm_bbox[0]
+    draw.text((width / 2 - wm_w / 2, logo_cy + scale * 0.13), BRAND_NAME,
+              font=wordmark_font, fill=BRAND_TEXT_COLOR)
+
+    bar_y = int(height * 0.58)
+    bar_w = int(scale * 0.32)
+    draw.rectangle([width / 2 - bar_w / 2, bar_y, width / 2 + bar_w / 2, bar_y + 6], fill=accent)
+
+    headline_font = _brand_font(int(scale * 0.09))
+    headline = "SUBSCRIBE"
+    hb = draw.textbbox((0, 0), headline, font=headline_font)
+    hw = hb[2] - hb[0]
+    draw.text((width / 2 - hw / 2, bar_y + int(scale * 0.04)), headline, font=headline_font, fill=(255, 255, 255))
+
+    subline_font = _brand_font(int(scale * 0.045))
+    subline = "For More"
+    sb = draw.textbbox((0, 0), subline, font=subline_font)
+    sw = sb[2] - sb[0]
+    draw.text((width / 2 - sw / 2, bar_y + int(scale * 0.04) + int(scale * 0.13)), subline,
+              font=subline_font, fill=BRAND_TEXT_COLOR)
+
     img.save(dest_path)
 
 
@@ -2194,19 +2219,21 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
         last_label = "branded"
         next_input_index += 1
     if subscribe_badge_path:
-        # Small on-brand "Subscribe for More" badge, bottom-right corner
-        # (clear of the bottom-center captions and the top-left watermark),
-        # faded in over 0.3s starting at follow_from and held through the
-        # end of the clip - a genuine animation rather than a hard cut, per
-        # the 2026-08-01 subscriber-conversion feature spec.
+        # Full-screen "Subscribe for More" end card, replacing the raw
+        # footage entirely for the last SUBSCRIBE_BADGE_SECONDS (revised
+        # 2026-08-01 same day after user feedback that the original small
+        # corner badge didn't fit well on screen - a full-frame card,
+        # bookending the intro title card, reads far cleaner than a
+        # small overlay competing with B-roll/captions). Faded in over
+        # 0.3s starting at follow_from so it's a genuine transition, not
+        # a hard cut, then held through the end of the clip.
         extra_input_args += ["-loop", "1", "-i", subscribe_badge_path]
-        badge_x = VIDEO_WIDTH - SUBSCRIBE_BADGE_WIDTH - 40
-        badge_y = VIDEO_HEIGHT - SUBSCRIBE_BADGE_HEIGHT - 420
         filter_stages.append(
-            f"[{next_input_index}:v]fade=t=in:st={follow_from:.3f}:d=0.3:alpha=1[badge]"
+            f"[{next_input_index}:v]format=yuva420p,"
+            f"fade=t=in:st={follow_from:.3f}:d=0.3:alpha=1[badge]"
         )
         filter_stages.append(
-            f"[{last_label}][badge]overlay={badge_x}:{badge_y}:"
+            f"[{last_label}][badge]overlay=0:0:"
             f"enable='gte(t\\,{follow_from:.3f})'[subbed]"
         )
         last_label = "subbed"

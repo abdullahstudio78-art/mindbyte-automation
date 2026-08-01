@@ -169,9 +169,12 @@ from brand_rules import CTA_STYLES, pick_next_cta_style  # noqa: E402
 # short/unobtrusive relative to Shorts' SUBSCRIBE_BADGE_SECONDS=2.5 since a
 # long-form video's pacing is slower - this is a tasteful reminder, not a
 # hard cut-in.
-LF_SUBSCRIBE_BADGE_SECONDS = 4.0
-LF_SUBSCRIBE_BADGE_WIDTH = 640
-LF_SUBSCRIBE_BADGE_HEIGHT = 150
+LF_SUBSCRIBE_BADGE_SECONDS = 2.0
+# Full-frame end card (revised 2026-08-01 same day after user feedback that
+# the original small corner badge didn't fit well on screen) - sized to the
+# full long-form frame rather than a small pill.
+LF_SUBSCRIBE_BADGE_WIDTH = LF_VIDEO_WIDTH
+LF_SUBSCRIBE_BADGE_HEIGHT = LF_VIDEO_HEIGHT
 
 # ---------------------------------------------------------------------------
 # Script generation (Groq) - paragraph-structured, not sentence-structured
@@ -1106,17 +1109,18 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
         last_label = "branded"
         next_input_index += 1
     if subscribe_badge_path:
-        # Bottom-right corner, clear of the bottom-center captions and the
-        # top-left watermark - faded in over 0.3s so it's a genuine
+        # Full-screen end card replacing the footage for the last
+        # LF_SUBSCRIBE_BADGE_SECONDS (revised 2026-08-01 same day after
+        # user feedback that the original small corner badge didn't fit
+        # well on screen) - faded in over 0.3s so it's a genuine
         # animation, not a hard cut, and held through the end of the clip.
         extra_input_args += ["-loop", "1", "-i", subscribe_badge_path]
-        badge_x = LF_VIDEO_WIDTH - LF_SUBSCRIBE_BADGE_WIDTH - 60
-        badge_y = LF_VIDEO_HEIGHT - LF_SUBSCRIBE_BADGE_HEIGHT - 60
         filter_stages.append(
-            f"[{next_input_index}:v]fade=t=in:st={follow_from:.3f}:d=0.3:alpha=1[badge]"
+            f"[{next_input_index}:v]format=yuva420p,"
+            f"fade=t=in:st={follow_from:.3f}:d=0.3:alpha=1[badge]"
         )
         filter_stages.append(
-            f"[{last_label}][badge]overlay={badge_x}:{badge_y}:"
+            f"[{last_label}][badge]overlay=0:0:"
             f"enable='gte(t\\,{follow_from:.3f})'[subbed]"
         )
         last_label = "subbed"
