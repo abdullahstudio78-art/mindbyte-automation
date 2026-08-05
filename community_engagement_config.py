@@ -131,8 +131,8 @@ BATCH_TARGET_SIZE = DAILY_COMMENT_LIMIT * BATCH_DAYS  # 150 at defaults
 # same constant anywhere else in the codebase that needs the channel link
 # (channel About section, video descriptions, cross-platform bios) so it
 # can never drift into an inconsistent or stale URL.
-CHANNEL_HANDLE = "@MindByteFacts"  # confirm/replace with your real handle
-SUBSCRIBE_URL = "https://www.youtube.com/@MindByteFacts?sub_confirmation=1"
+CHANNEL_HANDLE = "@mindbytefacts-s2b"
+SUBSCRIBE_URL = "https://www.youtube.com/@mindbytefacts-s2b?sub_confirmation=1"
 
 # ---------------------------------------------------------------------------
 # Sheet tabs used by this pipeline (self-healing, same pattern as the rest
