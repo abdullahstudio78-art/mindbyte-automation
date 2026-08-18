@@ -66,7 +66,10 @@ OAUTH_REFRESH_TOKEN = os.environ["OAUTH_REFRESH_TOKEN"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 YOUTUBE_CHANNEL_ID = os.environ.get("YOUTUBE_CHANNEL_ID", "")
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# 2026-08-18: llama-3.3-70b-versatile was decommissioned by Groq (404
+# model_not_found). Switched to the current production model + fallback.
+GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_MODEL_FALLBACKS = ["openai/gpt-oss-20b"]
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 SHEETS_BASE = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}"
 SESSION = requests.Session()
@@ -192,27 +195,35 @@ def log_action(token: str, action: str, video_id: str, query: str, details: str)
 
 
 def call_groq(prompt: str, _retries: int = 2) -> str:
-    for attempt in range(_retries + 1):
-        resp = SESSION.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.7,
-            },
-            timeout=60,
-        )
-        if resp.status_code == 429 and attempt < _retries:
-            wait_s = 5.0
-            match = re.search(r"try again in ([\d.]+)s", resp.text)
-            if match:
-                wait_s = float(match.group(1)) + 1.0
-            print(f"[community] Groq rate-limited - waiting {wait_s:.1f}s and retrying")
-            time.sleep(wait_s)
-            continue
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+    models_to_try = [GROQ_MODEL] + list(GROQ_MODEL_FALLBACKS)
+    for model in models_to_try:
+        for attempt in range(_retries + 1):
+            resp = SESSION.post(
+                GROQ_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.7,
+                },
+                timeout=60,
+            )
+            if resp.status_code == 429 and attempt < _retries:
+                wait_s = 5.0
+                match = re.search(r"try again in ([\d.]+)s", resp.text)
+                if match:
+                    wait_s = float(match.group(1)) + 1.0
+                print(f"[community] Groq rate-limited - waiting {wait_s:.1f}s and retrying")
+                time.sleep(wait_s)
+                continue
+            if resp.status_code == 404 and model != models_to_try[-1]:
+                print(f"[community] Groq model '{model}' unavailable (404) - falling back")
+                break
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError:
+                break
+            return resp.json()["choices"][0]["message"]["content"].strip()
     return ""
 
 

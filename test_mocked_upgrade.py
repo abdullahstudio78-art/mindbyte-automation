@@ -2,10 +2,14 @@
 Mocked-call smoke test for the 2026-07-31 upgrade. No real network/API
 access - every HTTP call is mocked. Run with: python test_mocked_upgrade.py
 """
+import json
 import os
 import sys
 import types
+from datetime import datetime, timezone
 from unittest import mock
+
+import requests
 
 os.environ.setdefault("OAUTH_CLIENT_ID", "x")
 os.environ.setdefault("OAUTH_CLIENT_SECRET", "x")
@@ -213,6 +217,108 @@ with mock.patch.object(pl, "sheet_append") as msa3:
               row[-2] == "curiosity" and row[-1] == "Subscribe for the next one.")
     except Exception as e:
         check(f"pipeline.log_video_meta CTA kwargs land correctly ({e})", False)
+
+
+# --- Groq model-fallback (2026-08-18 outage fix) ------------------------
+# llama-3.3-70b-versatile was decommissioned by Groq (404 model_not_found),
+# which silently broke every Publish Video / Publish Long-Form Video /
+# Weekly Content Review run for ~2 weeks. Verifies call_groq() now falls
+# back to the next configured model on a 404 instead of crashing the whole
+# pipeline the same way again.
+class _FakeGroqResp:
+    def __init__(self, status, payload):
+        self.status_code = status
+        self.text = json.dumps(payload)
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"{self.status_code} error", response=self)
+
+
+for mod, label in ((pl, "pipeline"), (wr, "weekly_review")):
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None, _calls=calls):
+        _calls.append(json["model"])
+        if json["model"] == mod.GROQ_MODEL:
+            return _FakeGroqResp(404, {"error": {"message": "does not exist", "code": "model_not_found"}})
+        return _FakeGroqResp(200, {"choices": [{"message": {"content": "OK from fallback"}}]})
+
+    with mock.patch.object(mod.SESSION, "post", side_effect=fake_post):
+        try:
+            result = mod.call_groq("test prompt")
+            check(f"{label}.call_groq falls back to next model on 404 model_not_found",
+                  result == "OK from fallback" and calls == [mod.GROQ_MODEL] + list(mod.GROQ_MODEL_FALLBACKS))
+        except Exception as e:
+            check(f"{label}.call_groq falls back on 404 ({e})", False)
+
+
+# --- Winning Content Profile (2026-08-18 historical intelligence) -------
+def _mk_record(topic, hook, score, days_ago):
+    from datetime import timedelta
+    return {
+        "topic": topic, "hook_opener": hook, "pillar": "Social Psychology",
+        "structure": "hook-explain-reveal", "word_count": 120, "length_sec": 45,
+        "upload_hour": "14", "tags": [], "subs_gained": 0, "views": 1000,
+        "composite_score": score, "recency_weight": 1.0,
+        "publish_at": (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat(),
+        "cta_style": "curiosity",
+    }
+
+
+try:
+    records = (
+        [_mk_record("Winning Topic", "curiosity_question", 0.9, i) for i in range(9)]
+        + [_mk_record("Weak Topic", "generic_intro", 0.1, i) for i in range(3)]
+    )
+    patterns, _ = wr.detect_patterns(records)
+    profile = wr.build_winning_content_profile(records, patterns)
+    check("weekly_review.build_winning_content_profile classifies a strong, well-sampled "
+          "topic as winning",
+          any(t["key"] == "Winning Topic" for t in profile["winning_topics"]))
+    check("weekly_review.build_winning_content_profile classifies a below-baseline topic as weak",
+          any(t["key"] == "Weak Topic" for t in profile["weak_topics"]))
+    check("weekly_review.build_winning_content_profile sets last_updated", bool(profile.get("last_updated")))
+except Exception as e:
+    check(f"build_winning_content_profile classification ({e})", False)
+
+try:
+    fatigue_records = [_mk_record("Repeaty Topic", "curiosity_question", 0.5, i) for i in range(10)]
+    warnings_found = wr.detect_fatigue(fatigue_records)
+    check("weekly_review.detect_fatigue flags a topic repeated in all recent videos",
+          any("Repeaty Topic" in w for w in warnings_found))
+    check("weekly_review.detect_fatigue flags a hook repeated in all recent videos",
+          any("curiosity_question" in w for w in warnings_found))
+except Exception as e:
+    check(f"detect_fatigue ({e})", False)
+
+try:
+    empty_profile = wr.build_winning_content_profile([], {})
+    check("weekly_review.build_winning_content_profile handles an empty dataset without raising",
+          empty_profile == {})
+except Exception as e:
+    check(f"build_winning_content_profile empty dataset ({e})", False)
+
+with mock.patch.object(pl, "sheet_get") as msg:
+    msg.return_value = [["2026-08-17", json.dumps({"weak_topics": [{"key": "Weak Topic", "score": 0.1, "n": 3}]}), "x"]]
+    try:
+        weak = pl.load_weak_topics("fake-token")
+        check("pipeline.load_weak_topics parses the latest WinningContentProfile row",
+              weak == {"weak topic"})
+    except Exception as e:
+        check(f"pipeline.load_weak_topics parsing ({e})", False)
+
+with mock.patch.object(pl, "sheet_get") as msg_fail:
+    msg_fail.side_effect = RuntimeError("Sheets down")
+    try:
+        weak = pl.load_weak_topics("fake-token")
+        check("pipeline.load_weak_topics degrades cleanly (empty set) on a Sheets failure", weak == set())
+    except Exception as e:
+        check(f"pipeline.load_weak_topics degrades on failure ({e})", False)
 
 
 # --- summary -----------------------------------------------------------

@@ -66,7 +66,11 @@ OAUTH_CLIENT_SECRET = os.environ["OAUTH_CLIENT_SECRET"]
 OAUTH_REFRESH_TOKEN = os.environ["OAUTH_REFRESH_TOKEN"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# 2026-08-18: llama-3.3-70b-versatile was decommissioned by Groq (404
+# model_not_found), which broke the weekly review's Groq-backed analysis
+# steps. Switched to the current production model + fallback list.
+GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_MODEL_FALLBACKS = ["openai/gpt-oss-20b"]
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 SHEETS_BASE = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}"
 SESSION = requests.Session()
@@ -221,29 +225,40 @@ def append_with_selfheal(token: str, tab_name: str, a1_range: str, header: list,
 
 
 def call_groq(prompt: str, _retries: int = 2) -> str:
-    for attempt in range(_retries + 1):
-        resp = SESSION.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.4,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=60,
-        )
-        if resp.status_code == 429 and attempt < _retries:
-            wait_s = 5.0
-            match = re.search(r"try again in ([\d.]+)s", resp.text)
-            if match:
-                wait_s = float(match.group(1)) + 1.0
-            print(f"[weekly] Groq rate-limited - waiting {wait_s:.1f}s and retrying")
-            import time
-            time.sleep(wait_s)
-            continue
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+    import time
+    models_to_try = [GROQ_MODEL] + list(GROQ_MODEL_FALLBACKS)
+    last_exc = None
+    for model in models_to_try:
+        for attempt in range(_retries + 1):
+            resp = SESSION.post(
+                GROQ_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.4,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=60,
+            )
+            if resp.status_code == 429 and attempt < _retries:
+                wait_s = 5.0
+                match = re.search(r"try again in ([\d.]+)s", resp.text)
+                if match:
+                    wait_s = float(match.group(1)) + 1.0
+                print(f"[weekly] Groq rate-limited - waiting {wait_s:.1f}s and retrying")
+                time.sleep(wait_s)
+                continue
+            if resp.status_code == 404 and model != models_to_try[-1]:
+                print(f"[weekly] Groq model '{model}' unavailable (404) - falling back")
+                break
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                last_exc = exc
+                break
+            return resp.json()["choices"][0]["message"]["content"].strip()
+    raise last_exc
 
 
 def safe_int(v) -> int:
@@ -692,6 +707,115 @@ def detect_patterns(records: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Winning Content Profile (2026-08-18)
+#
+# `patterns` above already finds the best/worst group per dimension, but it
+# doesn't persist a single consolidated, machine-readable artifact that
+# other scripts (or a human) can load without re-deriving it from Sheets
+# rows. This builds that artifact: topics bucketed into WINNING / EMERGING /
+# WEAK (not just best-vs-worst), a winning-hook list, best duration/
+# structure, and content-fatigue warnings (same topic/hook repeated too
+# often in the most recent videos) - then persists it as one JSON row per
+# week to a new "WinningContentProfile" tab (self-healing, like every other
+# tab in this file). pick_topic()'s random-fallback path in pipeline.py
+# reads this to avoid WEAK topics even when NextWeekQueue is empty.
+# ---------------------------------------------------------------------------
+
+WINNING_CONTENT_PROFILE_TAB = "WinningContentProfile"
+WINNING_CONTENT_PROFILE_HEADER = ["WeekOf", "ProfileJSON", "LastUpdated"]
+FATIGUE_LOOKBACK = 10   # most-recent N videos considered for repetition
+FATIGUE_REPEAT_THRESHOLD = 3  # same topic/hook this many times in that window -> warn
+
+
+def classify_topic_tiers(groups: dict, baseline: float, min_n: int = MIN_GROUP_SAMPLE) -> dict:
+    """Buckets every group (not just the single best/worst) into WINNING /
+    EMERGING / WEAK relative to the channel's own baseline composite score,
+    per spec section 9/18 - "repeatedly strong" vs "promising but thin
+    evidence" vs "repeatedly below baseline". Never classifies off a
+    single video."""
+    tiers = {"winning": [], "emerging": [], "weak": []}
+    for key, g in groups.items():
+        entry = {"key": key, "score": round(g["score"], 4), "n": g["n"]}
+        if g["n"] < min_n:
+            continue  # not enough evidence to classify at all yet
+        if g["score"] >= baseline and g["n"] >= CONFIDENCE_HIGH_ESS:
+            tiers["winning"].append(entry)
+        elif g["score"] >= baseline:
+            tiers["emerging"].append(entry)
+        else:
+            tiers["weak"].append(entry)
+    for tier in tiers.values():
+        tier.sort(key=lambda e: e["score"], reverse=True)
+    return tiers
+
+
+def detect_fatigue(records: list) -> list:
+    """Flags topics/hooks repeated FATIGUE_REPEAT_THRESHOLD+ times among the
+    most recent FATIGUE_LOOKBACK videos - i.e. content that's at risk of
+    audience fatigue right now, independent of whether it historically
+    performed well."""
+    recent = sorted(records, key=lambda r: r.get("publish_at") or "", reverse=True)[:FATIGUE_LOOKBACK]
+    warnings = []
+    for dim, key_fn in (("topic", lambda r: r["topic"] or "(untitled)"),
+                         ("hook_opener", lambda r: r["hook_opener"] or "(unknown)")):
+        counts = defaultdict(int)
+        for r in recent:
+            counts[key_fn(r)] += 1
+        for key, n in counts.items():
+            if n >= FATIGUE_REPEAT_THRESHOLD:
+                warnings.append(f"{dim} '{key}' used {n}/{len(recent)} of the most recent videos - vary it")
+    return warnings
+
+
+def build_winning_content_profile(records: list, patterns: dict) -> dict:
+    if not records:
+        return {}
+    baseline = sorted(r["composite_score"] for r in records)[len(records) // 2]  # median
+
+    topic_groups = weighted_group_average(records, lambda r: r["topic"] or "(untitled)")
+    hook_groups = weighted_group_average(records, lambda r: r["hook_opener"] or "(unknown)")
+    topic_tiers = classify_topic_tiers(topic_groups, baseline)
+
+    profile = {
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "sample_size": len(records),
+        "baseline_composite_score": round(baseline, 4),
+        "winning_topics": topic_tiers["winning"],
+        "emerging_topics": topic_tiers["emerging"],
+        "weak_topics": topic_tiers["weak"],
+        "winning_hooks": sorted(
+            ({"key": k, "score": round(v["score"], 4), "n": v["n"]} for k, v in hook_groups.items()
+             if v["n"] >= MIN_GROUP_SAMPLE and v["score"] >= baseline),
+            key=lambda e: e["score"], reverse=True,
+        ),
+        "best_video_length_band": (patterns.get("video_length_band") or {}).get("best"),
+        "best_structure": (patterns.get("script_structure") or {}).get("best"),
+        "best_upload_hour_band": (patterns.get("upload_hour_band") or {}).get("best"),
+        "best_cta_style": (patterns.get("cta_style") or {}).get("best"),
+        "fatigue_warnings": detect_fatigue(records),
+        "confidence_by_dimension": {dim: data.get("confidence", "Low") for dim, data in patterns.items()},
+    }
+    return profile
+
+
+def save_winning_content_profile(token: str, profile: dict) -> None:
+    if not profile:
+        return
+    week_of = datetime.now(timezone.utc).date().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    row = [week_of, json.dumps(profile), now_iso]
+    append_with_selfheal(
+        token, WINNING_CONTENT_PROFILE_TAB, f"{WINNING_CONTENT_PROFILE_TAB}!A:C",
+        WINNING_CONTENT_PROFILE_HEADER, row,
+    )
+    print(f"[weekly] WinningContentProfile written: "
+          f"{len(profile.get('winning_topics', []))} winning / "
+          f"{len(profile.get('emerging_topics', []))} emerging / "
+          f"{len(profile.get('weak_topics', []))} weak topics, "
+          f"{len(profile.get('fatigue_warnings', []))} fatigue warnings")
+
+
+# ---------------------------------------------------------------------------
 # Report + next-week content brief generation
 # ---------------------------------------------------------------------------
 
@@ -880,6 +1004,17 @@ def main() -> None:
     print(f"[weekly] subscriber data available: {has_subscriber_data}")
     for dim, data in patterns.items():
         print(f"[weekly] pattern - {format_pattern_line(dim, data)}")
+
+    # Persist the consolidated Winning Content Profile regardless of whether
+    # the Groq call below succeeds - it's derived purely from the records/
+    # patterns already computed, so a Groq outage shouldn't also take down
+    # this week's profile update (pipeline.py's topic fallback depends on it
+    # staying current).
+    try:
+        profile = build_winning_content_profile(records, patterns)
+        save_winning_content_profile(token, profile)
+    except Exception as e:  # noqa: BLE001
+        print(f"[weekly] could not build/save WinningContentProfile (non-fatal): {e}")
 
     prompt = build_groq_prompt(records, patterns, has_subscriber_data, competitor_trends, community_insights)
     try:

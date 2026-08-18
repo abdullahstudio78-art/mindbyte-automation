@@ -68,7 +68,14 @@ OAUTH_CLIENT_SECRET = os.environ["OAUTH_CLIENT_SECRET"]
 OAUTH_REFRESH_TOKEN = os.environ["OAUTH_REFRESH_TOKEN"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# 2026-08-18: llama-3.3-70b-versatile was decommissioned by Groq (calls
+# started failing with 404 model_not_found), which silently broke every
+# Shorts/long-form publish run for ~2 weeks (runs #91-#93). Switched to
+# the current production text model, and added GROQ_MODEL_FALLBACKS so a
+# future single-model deprecation degrades gracefully instead of crashing
+# the whole pipeline again.
+GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_MODEL_FALLBACKS = ["openai/gpt-oss-20b"]
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 PUBLISH_DELAY_HOURS = 18  # rolling safety delay before a video goes public
@@ -298,17 +305,40 @@ def sheet_update(access_token: str, a1_range: str, row: list) -> None:
 # Topic selection
 # ---------------------------------------------------------------------------
 
+def load_weak_topics(access_token: str) -> set:
+    """Reads the most recent WinningContentProfile row (written weekly by
+    weekly_review.py) and returns the set of topic strings classified as
+    WEAK, so the random-fallback topic picker below can steer away from
+    them even when NextWeekQueue is empty. Returns an empty set (no-op) on
+    any failure - this is a nice-to-have bias, never a hard requirement."""
+    try:
+        rows = sheet_get(access_token, "WinningContentProfile!A2:C")
+        if not rows:
+            return set()
+        profile = json.loads(rows[-1][1])
+        return {w["key"].strip().lower() for w in profile.get("weak_topics", []) if w.get("key")}
+    except Exception as e:
+        print(f"[pipeline] could not read WinningContentProfile (non-fatal): {e}")
+        return set()
+
+
 def pick_topic(access_token: str) -> tuple:
     """Return a (topic, pillar_name) pair not yet used, or a random one if
-    every topic in the pool has been used at least once already."""
+    every topic in the pool has been used at least once already. Prefers
+    topics NOT flagged WEAK in the latest Winning Content Profile, but
+    never lets that filter leave zero candidates."""
     rows = sheet_get(access_token, "UsedTopics!A2:A")
     used = {r[0].strip().lower() for r in rows if r}
+    weak = load_weak_topics(access_token)
     available = [(t, p) for t, p in TOPIC_POOL if t.lower() not in used]
-    if available:
-        return random.choice(available)
-    # Every topic has been used at least once - recycle randomly rather than
-    # stalling the channel forever.
-    return random.choice(TOPIC_POOL)
+    if not available:
+        # Every topic has been used at least once - recycle randomly rather
+        # than stalling the channel forever.
+        available = list(TOPIC_POOL)
+    non_weak = [(t, p) for t, p in available if t.lower() not in weak]
+    if non_weak:
+        return random.choice(non_weak)
+    return random.choice(available)
 
 def mark_topic_used(access_token: str, topic: str, video_id: str) -> None:
     sheet_append(
@@ -526,35 +556,51 @@ def call_groq(prompt: str, _retries: int = 2) -> str:
     try again in Xs") - honor that (plus a small safety margin) instead
     of giving up immediately. Any other error status still raises
     right away, unchanged from before."""
-    for attempt in range(_retries + 1):
-        resp = SESSION.post(
-            GROQ_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.9,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=60,
-        )
-        if resp.status_code == 429 and attempt < _retries:
-            wait_s = 5.0
-            match = re.search(r"try again in ([\d.]+)s", resp.text)
-            if match:
-                wait_s = float(match.group(1)) + 1.0
-            print(f"[pipeline] Groq rate-limited (429) - waiting {wait_s:.1f}s and retrying "
-                  f"(attempt {attempt + 1}/{_retries})")
-            time.sleep(wait_s)
-            continue
-        if resp.status_code != 200:
-            print(f"[pipeline] Groq call failed: {resp.status_code} {resp.text}")
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+    models_to_try = [GROQ_MODEL] + list(GROQ_MODEL_FALLBACKS)
+    last_exc = None
+    for model in models_to_try:
+        for attempt in range(_retries + 1):
+            resp = SESSION.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.9,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=60,
+            )
+            if resp.status_code == 429 and attempt < _retries:
+                wait_s = 5.0
+                match = re.search(r"try again in ([\d.]+)s", resp.text)
+                if match:
+                    wait_s = float(match.group(1)) + 1.0
+                print(f"[pipeline] Groq rate-limited (429) on {model} - waiting {wait_s:.1f}s "
+                      f"and retrying (attempt {attempt + 1}/{_retries})")
+                time.sleep(wait_s)
+                continue
+            # 404 model_not_found (e.g. a model gets decommissioned by Groq)
+            # is not worth retrying on the same model - move to the next
+            # configured fallback model instead, so the whole pipeline
+            # doesn't go down the way it did on 2026-08-18.
+            if resp.status_code == 404 and model != models_to_try[-1]:
+                print(f"[pipeline] Groq model '{model}' unavailable (404) - "
+                      f"falling back to next configured model")
+                break
+            if resp.status_code != 200:
+                print(f"[pipeline] Groq call failed: {resp.status_code} {resp.text}")
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                last_exc = exc
+                break
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
