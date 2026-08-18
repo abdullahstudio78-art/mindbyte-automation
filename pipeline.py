@@ -961,7 +961,11 @@ def generate_storyboard(sentences: list) -> list:
         ]
 
 
-def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = None, cta_style: str = None) -> dict:
+def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = None, cta_style: str = None,
+                     structure_tag: str = None) -> dict:
+    from brand_rules import SCRIPT_STRUCTURES
+    structure_tag = structure_tag if structure_tag in SCRIPT_STRUCTURES else "hook_problem_reveal"
+    structure_instruction = SCRIPT_STRUCTURES[structure_tag]["instruction"]
     feedback_block = ""
     if feedback:
         feedback_block = textwrap.dedent(f"""
@@ -1022,13 +1026,7 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
         "{topic}", from the "{pillar}" pillar. Tone for this pillar: {tone}.
         {feedback_block}{brief_block}{cta_block}
         STRUCTURE - tell one small story, do not dump facts:
-        1. HOOK (first 1-3 seconds) - grab attention instantly.
-        2. Introduce a relatable human problem or moment tied to the topic.
-        3. Create a curiosity gap - make the viewer need the explanation.
-        4. Explain the actual psychological reason WHY this happens.
-        5. Ground it with a concrete example or situation.
-        6. End on one memorable, quotable insight - not "thanks for
-           watching."
+        {structure_instruction}
 
         HOOK RULES - the first sentence decides whether anyone stays:
         Never start with "Welcome back", "Today we will discuss", "Did you
@@ -1187,7 +1185,7 @@ MIN_SCRIPT_WORDS = 130  # keeps narration filling the 45-55s target instead of d
 
 def generate_and_score_script(
     topic: str, pillar: str, max_attempts: int = MAX_SCRIPT_ATTEMPTS, brief: dict = None,
-    cta_style: str = None,
+    cta_style: str = None, structure_tag: str = None,
 ) -> tuple:
     """Generate + score a script, retrying with feedback if it falls short
     of the quality bar OR is too short to fill the target duration, so a
@@ -1213,7 +1211,8 @@ def generate_and_score_script(
     )
     feedback = ""
     for attempt in range(1, max_attempts + 1):
-        script = generate_script(topic, pillar, feedback=feedback, brief=brief, cta_style=cta_style)
+        script = generate_script(topic, pillar, feedback=feedback, brief=brief, cta_style=cta_style,
+                                  structure_tag=structure_tag)
         quality = score_quality(topic, pillar, script)
         word_count = sum(len(s.split()) for s in script["sentences"])
         meets_bar = quality["score"] >= QUALITY_THRESHOLD and word_count >= MIN_SCRIPT_WORDS
@@ -2755,6 +2754,19 @@ def get_recent_cta_styles(access_token: str, limit: int = 4) -> list:
     return styles[-limit:]
 
 
+def get_recent_structures(access_token: str, limit: int = 4) -> list:
+    """Same rotation-history read as get_recent_cta_styles() above, for
+    script structure (VideoMeta column H). Added 2026-08-19 alongside
+    SCRIPT_STRUCTURES/pick_next_structure() in brand_rules.py - see that
+    module's docstring for why structure previously never varied."""
+    try:
+        rows = sheet_get(access_token, "VideoMeta!H2:H")
+    except Exception:
+        return []
+    structures = [row[0].strip() for row in rows if row and row[0].strip()]
+    return structures[-limit:]
+
+
 def main() -> None:
     access_token = get_access_token()
     # Closed self-improvement loop (2026-07-30): try a weekly-generated,
@@ -2766,11 +2778,14 @@ def main() -> None:
     print(f"[pipeline] topic: {topic} (pillar: {pillar}) - idea score avg {idea_score_avg:.1f}"
           + (" [from weekly self-improvement queue]" if brief else ""))
 
-    from brand_rules import pick_next_cta_style
+    from brand_rules import pick_next_cta_style, pick_next_structure
     cta_style = pick_next_cta_style(get_recent_cta_styles(access_token))
     print(f"[pipeline] CTA style this run: {cta_style}")
+    structure_tag = pick_next_structure(get_recent_structures(access_token))
+    print(f"[pipeline] script structure this run: {structure_tag}")
 
-    script, quality = generate_and_score_script(topic, pillar, brief=brief, cta_style=cta_style)
+    script, quality = generate_and_score_script(topic, pillar, brief=brief, cta_style=cta_style,
+                                                  structure_tag=structure_tag)
     print(f"[pipeline] title: {script['title']}")
     if script.get("cta_line"):
         print(f"[pipeline] CTA line: {script['cta_line']}")
@@ -2963,7 +2978,7 @@ def main() -> None:
     log_video_meta(
         access_token, video_id, script["title"], topic, pillar, "short",
         script["sentences"][0] if script.get("sentences") else "",
-        "story_short_v1", word_count, len(script["sentences"]),
+        structure_tag, word_count, len(script["sentences"]),
         checklist["duration"], script.get("tags", []),
         hook_type=script.get("hook_type", "unclassified"),
         series=(brief.get("series", "") if brief else ""),

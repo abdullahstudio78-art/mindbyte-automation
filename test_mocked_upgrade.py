@@ -436,6 +436,62 @@ try:
 except Exception as e:
     check(f"title style correlation end-to-end ({e})", False)
 
+# --- ScriptStructure now actually varies (2026-08-19) --------------------
+# Previously every single video logged the same hardcoded structure_tag
+# ("story_short_v1"), so weekly_review.py's script_structure pattern
+# dimension had zero real variation to compare - the audit's last
+# remaining gap. Verifies generate_script() actually injects a different
+# STRUCTURE section per structure_tag, and that the rotation/history
+# helpers behave correctly.
+from brand_rules import SCRIPT_STRUCTURES, SCRIPT_STRUCTURE_KEYS, pick_next_structure
+
+try:
+    check("brand_rules.SCRIPT_STRUCTURES defines more than one real variant",
+          len(SCRIPT_STRUCTURE_KEYS) >= 2)
+    picked = pick_next_structure(["hook_problem_reveal", "hook_problem_reveal"])
+    check("brand_rules.pick_next_structure avoids repeating the last two structures",
+          picked != "hook_problem_reveal")
+    check("brand_rules.pick_next_structure falls back to any structure when history is empty",
+          pick_next_structure([]) in SCRIPT_STRUCTURE_KEYS)
+except Exception as e:
+    check(f"brand_rules structure rotation ({e})", False)
+
+captured_prompts = {}
+
+
+def _fake_call_groq_capture(prompt):
+    captured_prompts["last"] = prompt
+    return json.dumps({
+        "title": "Test Title", "description": "desc", "sentences": ["a sentence " * 3] * 16,
+        "visual_keywords": ["x"] * 16, "tags": ["t"] * 10, "hook_type": "question", "cta_line": "",
+    })
+
+
+with mock.patch.object(pl, "call_groq", side_effect=_fake_call_groq_capture):
+    try:
+        pl.generate_script("Some Topic", "Social Psychology", structure_tag="hook_story_twist")
+        check("pipeline.generate_script injects the hook_story_twist STRUCTURE text when requested",
+              "twist" in captured_prompts["last"].lower())
+        pl.generate_script("Some Topic", "Social Psychology", structure_tag="hook_question_payoff")
+        check("pipeline.generate_script injects a DIFFERENT STRUCTURE text for a different tag",
+              "direct payoff" in captured_prompts["last"].lower()
+              or "no more stalling" in captured_prompts["last"].lower())
+        pl.generate_script("Some Topic", "Social Psychology", structure_tag="not_a_real_tag")
+        check("pipeline.generate_script falls back to hook_problem_reveal for an unknown/missing structure_tag",
+              "curiosity gap" in captured_prompts["last"].lower())
+    except Exception as e:
+        check(f"pipeline.generate_script structure_tag injection ({e})", False)
+
+with mock.patch.object(pl, "sheet_get") as msg_struct_hist:
+    msg_struct_hist.return_value = [["hook_problem_reveal"], ["hook_story_twist"], ["hook_problem_reveal"]]
+    try:
+        recent = pl.get_recent_structures("fake-token")
+        check("pipeline.get_recent_structures reads structure history from VideoMeta column H",
+              recent == ["hook_problem_reveal", "hook_story_twist", "hook_problem_reveal"])
+    except Exception as e:
+        check(f"pipeline.get_recent_structures ({e})", False)
+
+
 with mock.patch.object(pl, "sheet_get") as msg_title_profile:
     msg_title_profile.return_value = [["2026-08-19", json.dumps({
         "best_title_style": "question",

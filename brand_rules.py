@@ -137,3 +137,77 @@ def pick_next_cta_style(recent_styles: list) -> str:
     if not candidates:
         candidates = CTA_STYLE_KEYS
     return random.choice(candidates)
+
+
+# ---------------------------------------------------------------------------
+# Script structure variants (2026-08-19)
+# ---------------------------------------------------------------------------
+# Before this, generate_script()/generate_longform_script() logged a single
+# HARDCODED structure_tag ("story_short_v1"/its long-form equivalent) to
+# VideoMeta on every single video - the tag never varied, so
+# weekly_review.py's "script_structure" pattern dimension had zero real
+# variation to compare and could never produce a meaningful signal, exactly
+# as the growth-system audit flagged ("ScriptStructure field: exists in
+# schema but is a hardcoded literal - currently cannot produce a real
+# pattern signal since there's no variation to compare"). These three named
+# Shorts structure variants give the writer prompt an actual STRUCTURE
+# section that varies run-to-run, while every hard requirement elsewhere in
+# the prompt (word count, sentence count, hook rules, compliance) stays
+# completely unchanged - only the storytelling shape/ordering varies.
+
+SCRIPT_STRUCTURES = {
+    "hook_problem_reveal": {
+        "label": "Hook -> Problem -> Reveal",
+        "instruction": (
+            "1. HOOK (first 1-3 seconds) - grab attention instantly.\n"
+            "        2. Introduce a relatable human problem or moment tied to the topic.\n"
+            "        3. Create a curiosity gap - make the viewer need the explanation.\n"
+            "        4. Explain the actual psychological reason WHY this happens.\n"
+            "        5. Ground it with a concrete example or situation.\n"
+            "        6. End on one memorable, quotable insight - not \"thanks for\n"
+            "           watching.\""
+        ),
+    },
+    "hook_story_twist": {
+        "label": "Hook -> Mini-Story -> Twist -> Explanation",
+        "instruction": (
+            "1. HOOK (first 1-3 seconds) - grab attention instantly.\n"
+            "        2. Tell it through a specific, relatable mini-story - \"someone\"\n"
+            "           in a concrete situation tied to the topic, not an abstract claim.\n"
+            "        3. Midway through, reveal a twist or common misconception about\n"
+            "           that situation - something the viewer probably assumed wrong.\n"
+            "        4. Explain the actual psychological reason behind the twist.\n"
+            "        5. Tie it back directly to the viewer's own life (\"you've probably...\").\n"
+            "        6. End on one memorable, quotable insight - not \"thanks for\n"
+            "           watching.\""
+        ),
+    },
+    "hook_question_payoff": {
+        "label": "Hook Question -> Stakes -> Direct Payoff",
+        "instruction": (
+            "1. HOOK (first 1-3 seconds) - open with a direct, provocative question\n"
+            "           the viewer can't help but want answered.\n"
+            "        2. Raise the stakes - why this question actually matters to them.\n"
+            "        3. Build one more beat of curiosity before answering.\n"
+            "        4. Deliver the psychological explanation head-on, no more stalling.\n"
+            "        5. Ground it with a concrete example or situation.\n"
+            "        6. Close with a practical, actionable insight (\"so next time...\") -\n"
+            "           not \"thanks for watching.\""
+        ),
+    },
+}
+
+SCRIPT_STRUCTURE_KEYS = list(SCRIPT_STRUCTURES.keys())
+
+
+def pick_next_structure(recent_structures: list) -> str:
+    """Same rotation logic as pick_next_cta_style() above, applied to
+    script structure: avoid repeating either of the last two structures
+    back-to-back where possible, fall back to fully random once every
+    variant has been seen recently or there's no history yet."""
+    import random
+    recent_tail = [s for s in (recent_structures or [])[-2:] if s in SCRIPT_STRUCTURES]
+    candidates = [k for k in SCRIPT_STRUCTURE_KEYS if k not in recent_tail]
+    if not candidates:
+        candidates = SCRIPT_STRUCTURE_KEYS
+    return random.choice(candidates)
