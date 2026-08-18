@@ -1102,6 +1102,17 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
         someone...", "The reason confident people seem attractive isn't
         what you think...".
 
+        PREFERRED HOOK STYLE (2026-08-19, from weekly trend research):
+        when it fits the topic naturally, favor a direct, second-person,
+        assumptive claim that tells the viewer they ALREADY do the thing
+        being described - not a question they can mentally opt out of by
+        deciding "that's not me." Example shape only (write your own):
+        "You do this every time someone goes quiet on you, and you don't
+        even notice." This framing removes the viewer's easy exit and
+        should be your first instinct over a pure question-hook, though a
+        genuine question/mystery/emotional hook is still fine when it's a
+        stronger fit for the specific angle.
+
         Requirements:
         - ORIGINAL wording throughout - your own framing, not copied
           phrasing from any single source.
@@ -1156,9 +1167,10 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
           of broad terms ("psychology facts", "human behavior", "why
           people", "self improvement"), terms specific to "{topic}", and
           the channel name "MindByte".
-        - Also classify "hook_type" as exactly one of: "question",
-          "mystery", "emotional", "story" - whichever best describes the
-          opening hook you actually wrote.
+        - Also classify "hook_type" as exactly one of: "assumptive",
+          "question", "mystery", "emotional", "story" - whichever best
+          describes the opening hook you actually wrote. Use "assumptive"
+          for the direct "you already do this" style described above.
 
         Return ONLY valid JSON with this exact shape:
         {{
@@ -1167,7 +1179,7 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
         "sentences": ["...", "..."],
         "visual_keywords": ["...", "..."],
         "tags": ["...", "..."],
-        "hook_type": "question|mystery|emotional|story",
+        "hook_type": "assumptive|question|mystery|emotional|story",
         "cta_line": "..."
         }}
     """).strip()
@@ -1175,7 +1187,7 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
     data = json.loads(raw)
     # Defensive: never raise on a missing/unexpected hook_type - default to
     # "unclassified" rather than blocking the run.
-    valid_hook_types = {"question", "mystery", "emotional", "story"}
+    valid_hook_types = {"assumptive", "question", "mystery", "emotional", "story"}
     if str(data.get("hook_type", "")).strip().lower() not in valid_hook_types:
         data["hook_type"] = "unclassified"
     else:

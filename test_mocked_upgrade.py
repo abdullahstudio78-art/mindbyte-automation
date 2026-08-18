@@ -706,6 +706,37 @@ with mock.patch.object(pl, "sheet_get", return_value=[]), \
         check(f"pipeline.pick_topic non-exhausted pool skips generation ({e})", False)
 
 
+# --- Assumptive second-person hook style (2026-08-19, from trend research) -
+# Weekly trend research found direct "you already do this" hooks outperform
+# question-based hooks (removes the viewer's mental opt-out). Prompt now
+# instructs this as the preferred style, and "assumptive" is a trackable
+# hook_type so weekly_review can eventually correlate it against retention.
+with mock.patch.object(pl, "call_groq", side_effect=_fake_call_groq_capture):
+    try:
+        pl.generate_script("Some Topic", "Social Psychology")
+        check("pipeline.generate_script prompt instructs the assumptive second-person hook style",
+              "assumptive" in captured_prompts["last"].lower()
+              and "opt out" in captured_prompts["last"].lower())
+    except Exception as e:
+        check(f"pipeline.generate_script assumptive hook style prompt ({e})", False)
+
+
+def _fake_call_groq_assumptive(prompt):
+    return json.dumps({
+        "title": "Test Title", "description": "desc", "sentences": ["a sentence " * 3] * 16,
+        "visual_keywords": ["x"] * 16, "tags": ["t"] * 10, "hook_type": "assumptive", "cta_line": "",
+    })
+
+
+with mock.patch.object(pl, "call_groq", side_effect=_fake_call_groq_assumptive):
+    try:
+        script = pl.generate_script("Some Topic", "Social Psychology")
+        check("pipeline.generate_script accepts 'assumptive' as a valid hook_type (not coerced to unclassified)",
+              script.get("hook_type") == "assumptive")
+    except Exception as e:
+        check(f"pipeline.generate_script assumptive hook_type acceptance ({e})", False)
+
+
 # --- summary -----------------------------------------------------------
 print("\n=== SUMMARY ===")
 n_pass = sum(1 for _, ok in results if ok)
