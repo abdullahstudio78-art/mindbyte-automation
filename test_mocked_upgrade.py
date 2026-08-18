@@ -327,6 +327,47 @@ try:
 except Exception as e:
     check(f"build_winning_content_profile classification ({e})", False)
 
+
+# --- Thumbnail-performance correlation (2026-08-18) ----------------------
+# ThumbnailIdentity has been WRITTEN to VideoMeta since 2026-07-31, but
+# load_video_meta() never read it back - it was silently dropped, so it
+# could never be correlated against outcomes. Verifies the full path:
+# load_video_meta reads it, merge_records carries it, detect_patterns
+# scores it, and build_winning_content_profile surfaces the best one.
+try:
+    thumb_records = (
+        [{**_mk_record("Topic A", "hook a", 0.9, i), "thumbnail_identity": "bold_text_closeup"} for i in range(5)]
+        + [{**_mk_record("Topic B", "hook b", 0.2, i), "thumbnail_identity": "plain_frame"} for i in range(5)]
+    )
+    thumb_patterns, _ = wr.detect_patterns(thumb_records)
+    check("weekly_review.detect_patterns adds a thumbnail_identity dimension when data exists",
+          "thumbnail_identity" in thumb_patterns)
+    thumb_profile = wr.build_winning_content_profile(thumb_records, thumb_patterns)
+    check("weekly_review.build_winning_content_profile surfaces the best-performing thumbnail identity",
+          thumb_profile.get("best_thumbnail_identity") == "bold_text_closeup")
+except Exception as e:
+    check(f"thumbnail-performance correlation ({e})", False)
+
+try:
+    no_thumb_patterns, _ = wr.detect_patterns([_mk_record("Topic C", "hook c", 0.5, i) for i in range(3)])
+    check("weekly_review.detect_patterns skips thumbnail_identity dimension when no record has one",
+          "thumbnail_identity" not in no_thumb_patterns)
+except Exception as e:
+    check(f"thumbnail_identity dimension gracefully skipped ({e})", False)
+
+with mock.patch.object(wr, "sheet_get") as msg_meta:
+    msg_meta.return_value = [
+        ["vid1", "Title", "Topic", "Social Psychology", "short", "Hook text here",
+         "Hook text", "hook-explain-reveal", "150", "17", "55.0", "14", "tag1,tag2",
+         "2026-08-18T00:00:00+00:00", "question", "", "bold_text_closeup", "curiosity", "Sub now"],
+    ]
+    try:
+        meta = wr.load_video_meta("fake-token")
+        check("weekly_review.load_video_meta reads ThumbnailIdentity back out (previously silently dropped)",
+              meta.get("vid1", {}).get("thumbnail_identity") == "bold_text_closeup")
+    except Exception as e:
+        check(f"load_video_meta thumbnail_identity read ({e})", False)
+
 try:
     fatigue_records = [_mk_record("Repeaty Topic", "curiosity_question", 0.5, i) for i in range(10)]
     warnings_found = wr.detect_fatigue(fatigue_records)

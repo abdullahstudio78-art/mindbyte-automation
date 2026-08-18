@@ -410,6 +410,7 @@ def load_video_meta(token: str) -> dict:
             "tags": [t.strip() for t in row[12].split(",") if t.strip()],
             "hook_type": (row[14] or "").strip(),
             "series": (row[15] or "").strip(),
+            "thumbnail_identity": (row[16] or "").strip(),
             "cta_style": (row[17] or "").strip(),
             "cta_text": (row[18] or "").strip(),
         }
@@ -521,6 +522,10 @@ def merge_records(videos: list, history: dict, meta: dict) -> list:
             # New pattern dimensions (2026-07-31) - blank/absent for older
             "hook_type": m.get("hook_type", "") or "",
             "series": m.get("series", "") or "",
+            # Logged since 2026-07-31 but never actually read back or
+            # correlated against performance until now (2026-08-18) - the
+            # sheet write existed, this consuming read didn't.
+            "thumbnail_identity": m.get("thumbnail_identity", "") or "",
             # Subscriber-conversion CTA style (2026-08-01) - blank/absent
             # for videos published before this feature shipped.
             "cta_style": m.get("cta_style", "") or "",
@@ -711,6 +716,14 @@ def detect_patterns(records: list) -> dict:
     if any(r.get("series") for r in records):
         add("series", lambda r: r["series"] or "(none)")
 
+    # Thumbnail-performance correlation (2026-08-18): ThumbnailIdentity has
+    # been logged to VideoMeta since 2026-07-31 but was never read back or
+    # correlated against outcomes - the audit's "thumbnails generated and
+    # uploaded, but never tracked, never correlated against any metric"
+    # gap. Same gracefully-skipped-if-no-data pattern as hook_type/series.
+    if any(r.get("thumbnail_identity") for r in records):
+        add("thumbnail_identity", lambda r: r["thumbnail_identity"] or "(unlabeled)")
+
     # CTA style pattern (2026-08-01, subscriber-conversion feature): tracks
     # which spoken-CTA style (curiosity/series/value/question, see
     # brand_rules.CTA_STYLES) correlates with better outcomes, so
@@ -814,6 +827,21 @@ def detect_fatigue(records: list) -> list:
     return warnings
 
 
+def _best_key(patterns: dict, dimension: str):
+    """detect_patterns() stores 'best' as a {"key","score","n"} dict (see
+    add() inside detect_patterns), not a bare string. build_winning_content_
+    profile() previously stored that whole dict under each best_* field
+    (e.g. best_cta_style ended up as {"key": "curiosity", "score": 0.8,
+    "n": 5} instead of just "curiosity") - found 2026-08-18 while wiring up
+    thumbnail-performance correlation. Any code reading best_cta_style/
+    best_structure/etc. as a plain string (e.g. pipeline.py's
+    build_fallback_brief_from_profile) would silently get the wrong type.
+    This helper extracts just the key, consistently, for every best_*
+    field below."""
+    best = (patterns.get(dimension) or {}).get("best")
+    return best.get("key") if isinstance(best, dict) else best
+
+
 def build_winning_content_profile(records: list, patterns: dict) -> dict:
     if not records:
         return {}
@@ -835,10 +863,11 @@ def build_winning_content_profile(records: list, patterns: dict) -> dict:
              if v["n"] >= MIN_GROUP_SAMPLE and v["score"] >= baseline),
             key=lambda e: e["score"], reverse=True,
         ),
-        "best_video_length_band": (patterns.get("video_length_band") or {}).get("best"),
-        "best_structure": (patterns.get("script_structure") or {}).get("best"),
-        "best_upload_hour_band": (patterns.get("upload_hour_band") or {}).get("best"),
-        "best_cta_style": (patterns.get("cta_style") or {}).get("best"),
+        "best_video_length_band": _best_key(patterns, "video_length_band"),
+        "best_structure": _best_key(patterns, "script_structure"),
+        "best_upload_hour_band": _best_key(patterns, "upload_hour_band"),
+        "best_cta_style": _best_key(patterns, "cta_style"),
+        "best_thumbnail_identity": _best_key(patterns, "thumbnail_identity"),
         "fatigue_warnings": detect_fatigue(records),
         "confidence_by_dimension": {dim: data.get("confidence", "Low") for dim, data in patterns.items()},
     }
