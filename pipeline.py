@@ -265,24 +265,61 @@ def google_headers(access_token: str) -> dict:
 
 SHEETS_BASE = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}"
 
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _api_call_with_retry(fn, _retries: int = 2, _label: str = "Sheets"):
+    """2026-08-19: Sheets calls in this file had zero rate-limit/backoff
+    protection before this - a transient 429/5xx just raised immediately
+    and could crash an otherwise-successful publish run over a blip, the
+    same class of gap the growth-system audit flagged ("no retry/backoff
+    on Sheets or YouTube Analytics calls anywhere"). Mirrors the existing
+    Groq 429-backoff pattern (call_groq(..., _retries=2)) and the same
+    helper added to analytics_sync.py the same day."""
+    last_exc = None
+    for attempt in range(_retries + 1):
+        try:
+            resp = fn()
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt < _retries:
+                wait_s = 1.5 * (attempt + 1)
+                print(f"[pipeline] {_label} call network error ({e}) - retrying in {wait_s:.1f}s")
+                time.sleep(wait_s)
+                continue
+            raise
+        if resp.status_code in RETRYABLE_STATUSES and attempt < _retries:
+            wait_s = 1.5 * (attempt + 1)
+            print(f"[pipeline] {_label} call got {resp.status_code} - retrying in {wait_s:.1f}s")
+            time.sleep(wait_s)
+            continue
+        return resp
+    if last_exc:
+        raise last_exc
+    return resp
+
 
 def sheet_get(access_token: str, a1_range: str) -> list:
-    resp = SESSION.get(
-        f"{SHEETS_BASE}/values/{a1_range}",
-        headers=google_headers(access_token),
-        timeout=30,
+    resp = _api_call_with_retry(
+        lambda: SESSION.get(
+            f"{SHEETS_BASE}/values/{a1_range}",
+            headers=google_headers(access_token),
+            timeout=30,
+        )
     )
     resp.raise_for_status()
     return resp.json().get("values", [])
 
 
 def sheet_append(access_token: str, a1_range: str, row: list) -> None:
-    resp = SESSION.post(
-        f"{SHEETS_BASE}/values/{a1_range}:append",
-        headers=google_headers(access_token),
-        params={"valueInputOption": "USER_ENTERED"},
-        json={"values": [row]},
-        timeout=30,
+    resp = _api_call_with_retry(
+        lambda: SESSION.post(
+            f"{SHEETS_BASE}/values/{a1_range}:append",
+            headers=google_headers(access_token),
+            params={"valueInputOption": "USER_ENTERED"},
+            json={"values": [row]},
+            timeout=30,
+        )
     )
     resp.raise_for_status()
 
@@ -291,12 +328,14 @@ def sheet_update(access_token: str, a1_range: str, row: list) -> None:
     """Overwrite a specific cell range (as opposed to sheet_append, which
     always adds a new row). Used by the self-improvement loop to mark a
     single NextWeekQueue row as consumed without touching any other row."""
-    resp = SESSION.put(
-        f"{SHEETS_BASE}/values/{a1_range}",
-        headers=google_headers(access_token),
-        params={"valueInputOption": "USER_ENTERED"},
-        json={"values": [row]},
-        timeout=30,
+    resp = _api_call_with_retry(
+        lambda: SESSION.put(
+            f"{SHEETS_BASE}/values/{a1_range}",
+            headers=google_headers(access_token),
+            params={"valueInputOption": "USER_ENTERED"},
+            json={"values": [row]},
+            timeout=30,
+        )
     )
     resp.raise_for_status()
 

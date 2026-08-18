@@ -83,7 +83,45 @@ LONGFORM_NEW_COLS = ["Views", "Likes", "Comments", "Shares", "LastSynced"]
 CHANNEL_AUDIENCE_TAB = "ChannelAudienceSnapshot"
 CHANNEL_AUDIENCE_HEADER = ["Date", "SubscribedViews", "UnsubscribedViews", "SubscribedSharePct"]
 
-SHEETS_RETRY_STATUSES = {429, 500, 502, 503, 504}
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _api_call_with_retry(fn, _retries: int = 2, _label: str = "API"):
+    """Same 429/5xx retry-with-backoff idea already used for Groq calls
+    (call_groq(..., _retries=2) in pipeline.py/weekly_review.py): catch a
+    rate-limit/server error, sleep with a short backoff, retry up to
+    `_retries` times, then let the final exception propagate as before.
+
+    2026-08-19: generalized from the Sheets-only `_sheets_call_with_retry`
+    to cover the YouTube Data/Analytics API calls too
+    (get_video_stats/get_video_analytics/get_early_retention_pct/
+    get_channel_audience_snapshot) - those run once (or twice, with the
+    retention-curve call) per video in a loop, so they're the highest-
+    volume, most rate-limit-exposed calls in this file, and previously had
+    ZERO retry protection: a transient 429/500 there just silently
+    degraded to zero/None data instead of being recovered, quietly
+    understating real analytics rather than actually failing loudly. Named
+    generically now since it's used for both Sheets and YouTube API
+    calls."""
+    last_exc = None
+    for attempt in range(_retries + 1):
+        try:
+            resp = fn()
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < _retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+        if resp.status_code in RETRYABLE_STATUSES and attempt < _retries:
+            wait_s = 1.5 * (attempt + 1)
+            print(f"[analytics] {_label} call got {resp.status_code} - retrying in {wait_s:.1f}s")
+            time.sleep(wait_s)
+            continue
+        return resp
+    if last_exc:
+        raise last_exc
+    return resp
 
 
 def get_access_token() -> str:
@@ -106,11 +144,14 @@ def headers(token: str) -> dict:
 
 
 def get_video_stats(token: str, video_id: str) -> dict:
-    resp = SESSION.get(
-        "https://www.googleapis.com/youtube/v3/videos",
-        headers=headers(token),
-        params={"part": "statistics", "id": video_id},
-        timeout=30,
+    resp = _api_call_with_retry(
+        lambda: SESSION.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            headers=headers(token),
+            params={"part": "statistics", "id": video_id},
+            timeout=30,
+        ),
+        _label="YouTube Data API (video stats)",
     )
     resp.raise_for_status()
     items = resp.json().get("items", [])
@@ -128,17 +169,20 @@ def get_video_analytics(token: str, video_id: str) -> dict:
     call per video, not four. Falls back to all-zero on any failure
     (e.g. video too new for Analytics data to have landed yet) rather
     than ever raising, since this must never break the daily sync."""
-    resp = SESSION.get(
-        "https://youtubeanalytics.googleapis.com/v2/reports",
-        headers=headers(token),
-        params={
-            "ids": f"channel=={YOUTUBE_CHANNEL_ID}",
-            "startDate": "2020-01-01",
-            "endDate": datetime.now(timezone.utc).date().isoformat(),
-            "metrics": "shares,averageViewDuration,averageViewPercentage,subscribersGained",
-            "filters": f"video=={video_id}",
-        },
-        timeout=30,
+    resp = _api_call_with_retry(
+        lambda: SESSION.get(
+            "https://youtubeanalytics.googleapis.com/v2/reports",
+            headers=headers(token),
+            params={
+                "ids": f"channel=={YOUTUBE_CHANNEL_ID}",
+                "startDate": "2020-01-01",
+                "endDate": datetime.now(timezone.utc).date().isoformat(),
+                "metrics": "shares,averageViewDuration,averageViewPercentage,subscribersGained",
+                "filters": f"video=={video_id}",
+            },
+            timeout=30,
+        ),
+        _label="YouTube Analytics API (video metrics)",
     )
     if resp.status_code != 200:
         return {"shares": 0, "avg_view_duration": 0, "avg_view_pct": 0.0, "subs_gained": 0}
@@ -154,34 +198,6 @@ def get_video_analytics(token: str, video_id: str) -> dict:
     }
 
 
-def _sheets_call_with_retry(fn, _retries: int = 2):
-    """Same 429/5xx retry-with-backoff idea already used for Groq calls
-    (call_groq(..., _retries=2) in pipeline.py/weekly_review.py), applied
-    to Sheets HTTP calls: catch a rate-limit/server error, sleep with a
-    short backoff, retry up to `_retries` times, then let the final
-    exception propagate as before (callers already handle failures via
-    their existing try/except self-heal patterns)."""
-    last_exc = None
-    for attempt in range(_retries + 1):
-        try:
-            resp = fn()
-        except requests.RequestException as e:
-            last_exc = e
-            if attempt < _retries:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            raise
-        if resp.status_code in SHEETS_RETRY_STATUSES and attempt < _retries:
-            wait_s = 1.5 * (attempt + 1)
-            print(f"[analytics] Sheets call got {resp.status_code} - retrying in {wait_s:.1f}s")
-            time.sleep(wait_s)
-            continue
-        resp.raise_for_status()
-        return resp
-    if last_exc:
-        raise last_exc
-
-
 def get_early_retention_pct(token: str, video_id: str, is_longform: bool) -> float | None:
     """Best-effort retention-curve summary: a SEPARATE YouTube Analytics API
     v2 report per video, dimensioned by elapsedVideoTimeRatio (metrics=
@@ -190,19 +206,22 @@ def get_early_retention_pct(token: str, video_id: str, is_longform: bool) -> flo
     Wrapped end-to-end in try/except: missing data is very likely for
     low-view videos, and a None here must never block the row write."""
     try:
-        resp = SESSION.get(
-            "https://youtubeanalytics.googleapis.com/v2/reports",
-            headers=headers(token),
-            params={
-                "ids": f"channel=={YOUTUBE_CHANNEL_ID}",
-                "startDate": "2020-01-01",
-                "endDate": datetime.now(timezone.utc).date().isoformat(),
-                "metrics": "audienceWatchRatio",
-                "dimensions": "elapsedVideoTimeRatio",
-                "filters": f"video=={video_id}",
-                "sort": "elapsedVideoTimeRatio",
-            },
-            timeout=30,
+        resp = _api_call_with_retry(
+            lambda: SESSION.get(
+                "https://youtubeanalytics.googleapis.com/v2/reports",
+                headers=headers(token),
+                params={
+                    "ids": f"channel=={YOUTUBE_CHANNEL_ID}",
+                    "startDate": "2020-01-01",
+                    "endDate": datetime.now(timezone.utc).date().isoformat(),
+                    "metrics": "audienceWatchRatio",
+                    "dimensions": "elapsedVideoTimeRatio",
+                    "filters": f"video=={video_id}",
+                    "sort": "elapsedVideoTimeRatio",
+                },
+                timeout=30,
+            ),
+            _label="YouTube Analytics API (retention curve)",
         )
         if resp.status_code != 200:
             return None
@@ -229,17 +248,20 @@ def get_channel_audience_snapshot(token: str) -> dict | None:
     multiplication) channel-level subscribedStatus report - a simple
     "returning viewers" proxy signal. Returns None on any failure."""
     try:
-        resp = SESSION.get(
-            "https://youtubeanalytics.googleapis.com/v2/reports",
-            headers=headers(token),
-            params={
-                "ids": f"channel=={YOUTUBE_CHANNEL_ID}",
-                "startDate": "2020-01-01",
-                "endDate": datetime.now(timezone.utc).date().isoformat(),
-                "metrics": "views",
-                "dimensions": "subscribedStatus",
-            },
-            timeout=30,
+        resp = _api_call_with_retry(
+            lambda: SESSION.get(
+                "https://youtubeanalytics.googleapis.com/v2/reports",
+                headers=headers(token),
+                params={
+                    "ids": f"channel=={YOUTUBE_CHANNEL_ID}",
+                    "startDate": "2020-01-01",
+                    "endDate": datetime.now(timezone.utc).date().isoformat(),
+                    "metrics": "views",
+                    "dimensions": "subscribedStatus",
+                },
+                timeout=30,
+            ),
+            _label="YouTube Analytics API (channel audience)",
         )
         if resp.status_code != 200:
             return None
@@ -263,34 +285,40 @@ def get_channel_audience_snapshot(token: str) -> dict | None:
 
 
 def sheet_get(token: str, a1_range: str) -> list:
-    resp = _sheets_call_with_retry(
-        lambda: SESSION.get(f"{SHEETS_BASE}/values/{a1_range}", headers=headers(token), timeout=30)
+    resp = _api_call_with_retry(
+        lambda: SESSION.get(f"{SHEETS_BASE}/values/{a1_range}", headers=headers(token), timeout=30),
+        _label="Sheets",
     )
+    resp.raise_for_status()
     return resp.json().get("values", [])
 
 
 def sheet_update(token: str, a1_range: str, row: list) -> None:
-    _sheets_call_with_retry(
+    resp = _api_call_with_retry(
         lambda: SESSION.put(
             f"{SHEETS_BASE}/values/{a1_range}",
             headers=headers(token),
             params={"valueInputOption": "USER_ENTERED"},
             json={"values": [row]},
             timeout=30,
-        )
+        ),
+        _label="Sheets",
     )
+    resp.raise_for_status()
 
 
 def sheet_append(token: str, a1_range: str, row: list) -> None:
-    _sheets_call_with_retry(
+    resp = _api_call_with_retry(
         lambda: SESSION.post(
             f"{SHEETS_BASE}/values/{a1_range}:append",
             headers=headers(token),
             params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
             json={"values": [row]},
             timeout=30,
-        )
+        ),
+        _label="Sheets",
     )
+    resp.raise_for_status()
 
 
 def ensure_sheet_tab(token: str, tab_name: str, header_row: list) -> bool:

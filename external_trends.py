@@ -31,6 +31,7 @@ zero rows written, never fail a workflow run it's part of.
 
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -79,6 +80,37 @@ def headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _api_call_with_retry(fn, _retries: int = 2, _label: str = "API"):
+    """Same 429/5xx retry-with-backoff pattern added to pipeline.py and
+    analytics_sync.py on 2026-08-19. This script already degrades to
+    "zero rows written" on any failure, so this isn't about preventing a
+    crash - it's about not silently discarding real competitor-trend data
+    over a transient rate limit that a short retry would have recovered
+    from."""
+    last_exc = None
+    for attempt in range(_retries + 1):
+        try:
+            resp = fn()
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt < _retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+        if resp.status_code in RETRYABLE_STATUSES and attempt < _retries:
+            wait_s = 1.5 * (attempt + 1)
+            print(f"[external_trends] {_label} call got {resp.status_code} - retrying in {wait_s:.1f}s")
+            time.sleep(wait_s)
+            continue
+        return resp
+    if last_exc:
+        raise last_exc
+    return resp
+
+
 def _iso8601_duration_to_seconds(duration: str) -> int:
     """Parses YouTube's ISO-8601 duration format (e.g. 'PT4M13S') into
     seconds. Returns 0 on anything unparseable - never raises."""
@@ -103,18 +135,21 @@ def search_top_videos(token: str, query: str) -> list:
         datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
     ).isoformat().replace("+00:00", "Z")
     try:
-        search_resp = SESSION.get(
-            "https://www.googleapis.com/youtube/v3/search",
-            headers=headers(token),
-            params={
-                "part": "snippet",
-                "type": "video",
-                "q": query,
-                "order": "viewCount",
-                "publishedAfter": published_after,
-                "maxResults": MAX_RESULTS_PER_QUERY,
-            },
-            timeout=30,
+        search_resp = _api_call_with_retry(
+            lambda: SESSION.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                headers=headers(token),
+                params={
+                    "part": "snippet",
+                    "type": "video",
+                    "q": query,
+                    "order": "viewCount",
+                    "publishedAfter": published_after,
+                    "maxResults": MAX_RESULTS_PER_QUERY,
+                },
+                timeout=30,
+            ),
+            _label="search.list",
         )
         if search_resp.status_code != 200:
             print(f"[external_trends] search failed for '{query}': {search_resp.status_code}")
@@ -124,14 +159,17 @@ def search_top_videos(token: str, query: str) -> list:
         if not video_ids:
             return []
 
-        videos_resp = SESSION.get(
-            "https://www.googleapis.com/youtube/v3/videos",
-            headers=headers(token),
-            params={
-                "part": "statistics,contentDetails,snippet",
-                "id": ",".join(video_ids),
-            },
-            timeout=30,
+        videos_resp = _api_call_with_retry(
+            lambda: SESSION.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                headers=headers(token),
+                params={
+                    "part": "statistics,contentDetails,snippet",
+                    "id": ",".join(video_ids),
+                },
+                timeout=30,
+            ),
+            _label="videos.list",
         )
         if videos_resp.status_code != 200:
             print(f"[external_trends] videos.list failed for '{query}': {videos_resp.status_code}")
@@ -169,12 +207,15 @@ def title_pattern_notes(title: str) -> str:
 
 
 def sheet_append(token: str, a1_range: str, row: list) -> None:
-    resp = SESSION.post(
-        f"{SHEETS_BASE}/values/{a1_range}:append",
-        headers=headers(token),
-        params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
-        json={"values": [row]},
-        timeout=30,
+    resp = _api_call_with_retry(
+        lambda: SESSION.post(
+            f"{SHEETS_BASE}/values/{a1_range}:append",
+            headers=headers(token),
+            params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+            json={"values": [row]},
+            timeout=30,
+        ),
+        _label="Sheets",
     )
     resp.raise_for_status()
 

@@ -173,9 +173,56 @@ with mock.patch.object(wr, "get_access_token", return_value="fake-token"), \
         check(f"weekly_review.main() degrades cleanly on a Groq outage ({e})", False)
 
 
-# --- 4. pipeline.py log_video_meta() backward compatibility ----------------
+# --- Sheets/YouTube API rate-limit backoff (2026-08-19) ------------------
+# Groq calls already retried on 429; Sheets and the per-video YouTube Data/
+# Analytics calls had zero protection - a transient rate limit either
+# crashed a publish run (Sheets) or silently degraded real data to zeros
+# (YouTube Analytics), per the growth-system audit's explicitly flagged
+# gap. Verifies the new _api_call_with_retry() helpers actually retry
+# instead of giving up on the first 429/5xx.
 import pipeline as pl
 import community_engagement as ce
+
+def _fake_resp(status, payload):
+    r = mock.Mock(status_code=status)
+    r.json.return_value = payload
+    if status >= 400:
+        r.raise_for_status.side_effect = requests.exceptions.HTTPError(f"{status} error", response=r)
+    else:
+        r.raise_for_status.return_value = None
+    return r
+
+
+with mock.patch.object(pl.SESSION, "get") as mget, mock.patch("time.sleep"):
+    mget.side_effect = [_fake_resp(429, {}), _fake_resp(200, {"values": [["a", "b"]]})]
+    try:
+        rows = pl.sheet_get("fake-token", "Videos!A2:B")
+        check("pipeline.sheet_get retries once on a 429 and succeeds on the next attempt",
+              rows == [["a", "b"]] and mget.call_count == 2)
+    except Exception as e:
+        check(f"pipeline.sheet_get 429 retry ({e})", False)
+
+with mock.patch.object(pl.SESSION, "get") as mget_exhaust, mock.patch("time.sleep"):
+    mget_exhaust.return_value = _fake_resp(500, {})
+    try:
+        pl.sheet_get("fake-token", "Videos!A2:B")
+        check("pipeline.sheet_get raises after exhausting retries on persistent 500s", False)
+    except requests.exceptions.HTTPError:
+        check("pipeline.sheet_get raises after exhausting retries on persistent 500s", True)
+    except Exception as e:
+        check(f"pipeline.sheet_get persistent-500 behavior ({e})", False)
+
+with mock.patch.object(asy.SESSION, "get") as mget_yt, mock.patch("time.sleep"):
+    mget_yt.side_effect = [_fake_resp(429, {}), _fake_resp(200, {"rows": [[5, 42.0, 71.5, 2]]})]
+    try:
+        result = asy.get_video_analytics("fake-token", "vid1")
+        check("analytics_sync.get_video_analytics retries on 429 instead of silently returning zeros",
+              result["shares"] == 5 and mget_yt.call_count == 2)
+    except Exception as e:
+        check(f"analytics_sync.get_video_analytics 429 retry ({e})", False)
+
+
+# --- 4. pipeline.py log_video_meta() backward compatibility ----------------
 
 with mock.patch.object(pl, "sheet_append") as msa:
     msa.return_value = None
