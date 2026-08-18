@@ -1,0 +1,50 @@
+name: "Alert on workflow failure"
+description: >
+  Opens (or comments on an already-open) GitHub Issue when the calling job
+  fails, so a broken publish/analytics/review run can never again go
+  unnoticed for weeks the way the 2026-08 Groq outage did. Uses the
+  built-in GITHUB_TOKEN - no new secret, no cost. Add
+  `if: failure()` on the step that uses this action, as the LAST step in
+  the job, after every other step.
+
+inputs:
+  workflow-name:
+    description: "Human-readable name of the failed workflow, e.g. 'Publish Video'"
+    required: true
+  github-token:
+    description: "Token with issues:write permission (pass secrets.GITHUB_TOKEN)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Open or update a failure issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        WORKFLOW_NAME: ${{ inputs.workflow-name }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -u
+        LABEL="pipeline-failure"
+        TITLE="Automated: ${WORKFLOW_NAME} failed"
+
+        # Label may not exist yet on a fresh repo - create it, ignore if it already does.
+        gh label create "$LABEL" --color "D93F0B" \
+          --description "Auto-filed by a failed MindByte automation run" \
+          --force >/dev/null 2>&1 || true
+
+        EXISTING=$(gh issue list --label "$LABEL" --state open --search "in:title \"$TITLE\"" \
+          --json number --jq '.[0].number' 2>/dev/null || true)
+
+        BODY="The **${WORKFLOW_NAME}** workflow failed.
+
+        Run: ${RUN_URL}
+
+        This issue was filed automatically so a failure can't silently go unnoticed for weeks (this is exactly what happened during the 2026-08 Groq outage, which broke publishing for ~2 weeks before anyone caught it). Check the run log above for the actual error. Once fixed, close this issue - it will reopen (as a new comment on the same issue) if the same workflow fails again."
+
+        if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+          gh issue comment "$EXISTING" --body "$BODY" || true
+        else
+          gh issue create --title "$TITLE" --label "$LABEL" --body "$BODY" || true
+        fi

@@ -12,6 +12,9 @@ jobs:
   review:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
 
@@ -30,3 +33,10 @@ jobs:
           OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
         run: python weekly_review.py
+
+      - name: Alert on failure (2026-08-18 permanent fix - no more silent outages)
+        if: failure()
+        uses: ./.github/actions/alert-on-failure
+        with:
+          workflow-name: "Weekly Content Review"
+          github-token: ${{ secrets.GITHUB_TOKEN }}

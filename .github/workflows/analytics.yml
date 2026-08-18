@@ -9,6 +9,9 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
 
@@ -27,3 +30,10 @@ jobs:
           YOUTUBE_CHANNEL_ID: ${{ secrets.YOUTUBE_CHANNEL_ID }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
         run: python analytics_sync.py
+
+      - name: Alert on failure (2026-08-18 permanent fix - no more silent outages)
+        if: failure()
+        uses: ./.github/actions/alert-on-failure
+        with:
+          workflow-name: "Analytics Sync"
+          github-token: ${{ secrets.GITHUB_TOKEN }}

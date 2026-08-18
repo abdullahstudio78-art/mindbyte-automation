@@ -21,6 +21,9 @@ jobs:
     # 8-15 minute video means more TTS calls, more Pexels downloads, and a
     # much longer ffmpeg render/concat than a 30-60 second Short.
     timeout-minutes: 75
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
 
@@ -44,3 +47,10 @@ jobs:
           YOUTUBE_CHANNEL_ID: ${{ secrets.YOUTUBE_CHANNEL_ID }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
         run: python pipeline_longform.py
+
+      - name: Alert on failure (2026-08-18 permanent fix - no more silent outages)
+        if: failure()
+        uses: ./.github/actions/alert-on-failure
+        with:
+          workflow-name: "Publish Long-Form Video"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
