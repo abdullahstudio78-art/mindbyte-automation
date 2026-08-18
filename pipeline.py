@@ -547,6 +547,42 @@ def select_topic_for_run(access_token: str, fmt: str = "short") -> tuple:
     return topic, pillar, idea_score_avg, brief
 
 
+def discover_live_groq_fallback_model(exclude: set) -> str:
+    """2026-08-18: GROQ_MODEL_FALLBACKS is a fixed list, so it can go stale
+    the exact same way GROQ_MODEL itself just did (Groq decommissioned
+    llama-3.3-70b-versatile with no warning, breaking every publish run for
+    ~2 weeks until a human noticed and patched the model name). This is the
+    permanent fix for that failure class: if every configured model 404s,
+    ask Groq's own /models endpoint what's currently live and try the first
+    real text-generation chat model found, instead of requiring another
+    manual code change + redeploy the next time a model is retired.
+    Returns "" (never raises) if discovery itself fails - callers treat
+    that as "no live fallback available" and surface the original error."""
+    try:
+        resp = SESSION.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        model_ids = [m.get("id", "") for m in resp.json().get("data", [])]
+        # Filter out non-chat models (speech/moderation/guardrail models,
+        # which share the same /models listing) and anything already tried.
+        skip_markers = ("whisper", "tts", "guard", "orpheus", "prompt-guard")
+        candidates = [
+            mid for mid in model_ids
+            if mid and mid not in exclude and not any(s in mid.lower() for s in skip_markers)
+        ]
+        # Prefer another gpt-oss model (known to work with this file's
+        # reasoning_effort/max_completion_tokens handling) if one exists;
+        # otherwise take whatever chat model is left.
+        candidates.sort(key=lambda mid: (0 if "gpt-oss" in mid else 1, mid))
+        return candidates[0] if candidates else ""
+    except Exception as e:  # noqa: BLE001 - discovery is best-effort only
+        print(f"[pipeline] live Groq model discovery failed (non-fatal): {e}")
+        return ""
+
+
 def call_groq(prompt: str, _retries: int = 2) -> str:
     """Same Groq call as before, now with retry-with-backoff on a 429
     (added 2026-07-19 after long-form run #2: the free/on-demand tier's
@@ -558,7 +594,10 @@ def call_groq(prompt: str, _retries: int = 2) -> str:
     right away, unchanged from before."""
     models_to_try = [GROQ_MODEL] + list(GROQ_MODEL_FALLBACKS)
     last_exc = None
-    for model in models_to_try:
+    model_index = 0
+    while model_index < len(models_to_try):
+        model = models_to_try[model_index]
+        model_index += 1
         for attempt in range(_retries + 1):
             resp = SESSION.post(
                 GROQ_URL,
@@ -598,9 +637,22 @@ def call_groq(prompt: str, _retries: int = 2) -> str:
             # is not worth retrying on the same model - move to the next
             # configured fallback model instead, so the whole pipeline
             # doesn't go down the way it did on 2026-08-18.
-            if resp.status_code == 404 and model != models_to_try[-1]:
-                print(f"[pipeline] Groq model '{model}' unavailable (404) - "
-                      f"falling back to next configured model")
+            if resp.status_code == 404:
+                if model_index >= len(models_to_try):
+                    # Every configured model is gone. Rather than crash the
+                    # whole pipeline again, ask Groq what's actually live
+                    # right now and try that once before giving up.
+                    live_model = discover_live_groq_fallback_model(exclude=set(models_to_try))
+                    if live_model:
+                        print(f"[pipeline] all configured Groq models unavailable (404) - "
+                              f"auto-discovered live fallback model '{live_model}' via /models")
+                        models_to_try.append(live_model)
+                    else:
+                        print(f"[pipeline] Groq model '{model}' unavailable (404) and no live "
+                              f"fallback could be discovered")
+                else:
+                    print(f"[pipeline] Groq model '{model}' unavailable (404) - "
+                          f"falling back to next configured model")
                 break
             if resp.status_code != 200:
                 print(f"[pipeline] Groq call failed: {resp.status_code} {resp.text}")

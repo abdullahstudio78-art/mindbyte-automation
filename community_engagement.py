@@ -194,9 +194,37 @@ def log_action(token: str, action: str, video_id: str, query: str, details: str)
     print(f"[community] {action}: video={video_id} query={query} :: {details}")
 
 
+def discover_live_groq_fallback_model(exclude: set) -> str:
+    """See pipeline.py's discover_live_groq_fallback_model for the full
+    rationale - permanent fix so GROQ_MODEL_FALLBACKS going stale (a model
+    Groq decommissions) doesn't need another manual patch. Best-effort,
+    never raises."""
+    try:
+        resp = SESSION.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        model_ids = [m.get("id", "") for m in resp.json().get("data", [])]
+        skip_markers = ("whisper", "tts", "guard", "orpheus", "prompt-guard")
+        candidates = [
+            mid for mid in model_ids
+            if mid and mid not in exclude and not any(s in mid.lower() for s in skip_markers)
+        ]
+        candidates.sort(key=lambda mid: (0 if "gpt-oss" in mid else 1, mid))
+        return candidates[0] if candidates else ""
+    except Exception as e:  # noqa: BLE001 - discovery is best-effort only
+        print(f"[community] live Groq model discovery failed (non-fatal): {e}")
+        return ""
+
+
 def call_groq(prompt: str, _retries: int = 2) -> str:
     models_to_try = [GROQ_MODEL] + list(GROQ_MODEL_FALLBACKS)
-    for model in models_to_try:
+    model_index = 0
+    while model_index < len(models_to_try):
+        model = models_to_try[model_index]
+        model_index += 1
         for attempt in range(_retries + 1):
             resp = SESSION.post(
                 GROQ_URL,
@@ -223,8 +251,18 @@ def call_groq(prompt: str, _retries: int = 2) -> str:
                 print(f"[community] Groq rate-limited - waiting {wait_s:.1f}s and retrying")
                 time.sleep(wait_s)
                 continue
-            if resp.status_code == 404 and model != models_to_try[-1]:
-                print(f"[community] Groq model '{model}' unavailable (404) - falling back")
+            if resp.status_code == 404:
+                if model_index >= len(models_to_try):
+                    live_model = discover_live_groq_fallback_model(exclude=set(models_to_try))
+                    if live_model:
+                        print(f"[community] all configured Groq models unavailable (404) - "
+                              f"auto-discovered live fallback model '{live_model}' via /models")
+                        models_to_try.append(live_model)
+                    else:
+                        print(f"[community] Groq model '{model}' unavailable (404) and no live "
+                              f"fallback could be discovered")
+                else:
+                    print(f"[community] Groq model '{model}' unavailable (404) - falling back")
                 break
             try:
                 resp.raise_for_status()

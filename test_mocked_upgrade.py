@@ -175,6 +175,7 @@ with mock.patch.object(wr, "get_access_token", return_value="fake-token"), \
 
 # --- 4. pipeline.py log_video_meta() backward compatibility ----------------
 import pipeline as pl
+import community_engagement as ce
 
 with mock.patch.object(pl, "sheet_append") as msa:
     msa.return_value = None
@@ -255,6 +256,46 @@ for mod, label in ((pl, "pipeline"), (wr, "weekly_review")):
                   result == "OK from fallback" and calls == [mod.GROQ_MODEL] + list(mod.GROQ_MODEL_FALLBACKS))
         except Exception as e:
             check(f"{label}.call_groq falls back on 404 ({e})", False)
+
+
+# --- Permanent fix: live model discovery when ALL configured models 404 ---
+# (2026-08-18) GROQ_MODEL_FALLBACKS is itself a fixed list, so it can go
+# stale exactly the way GROQ_MODEL did. Verifies that when every configured
+# model 404s, call_groq() queries Groq's /models endpoint and retries with
+# whatever it finds live, instead of requiring another manual code patch
+# the next time a model is decommissioned.
+for mod, label in ((pl, "pipeline"), (wr, "weekly_review"), (ce, "community_engagement")):
+    calls = []
+
+    def fake_post_all_dead(url, headers=None, json=None, timeout=None, _calls=calls):
+        _calls.append(json["model"])
+        if json["model"] == "brand/new-live-model":
+            return _FakeGroqResp(200, {"choices": [{"message": {"content": "OK from live discovery"}}]})
+        return _FakeGroqResp(404, {"error": {"message": "does not exist", "code": "model_not_found"}})
+
+    def fake_get_models(url, headers=None, timeout=None):
+        return _FakeGroqResp(200, {"data": [
+            {"id": "whisper-large-v3"},  # should be filtered out (not a chat model)
+            {"id": "brand/new-live-model"},
+        ]})
+
+    with mock.patch.object(mod.SESSION, "post", side_effect=fake_post_all_dead), \
+         mock.patch.object(mod.SESSION, "get", side_effect=fake_get_models):
+        try:
+            result = mod.call_groq("test prompt")
+            expected_result = "OK from live discovery" if mod is not ce else "OK from live discovery"
+            check(f"{label}.call_groq discovers and uses a live model when every configured model 404s",
+                  result == expected_result and "brand/new-live-model" in calls)
+        except Exception as e:
+            check(f"{label}.call_groq live discovery fallback ({e})", False)
+
+with mock.patch.object(pl.SESSION, "get", side_effect=RuntimeError("network down")):
+    try:
+        found = pl.discover_live_groq_fallback_model(exclude=set())
+        check("pipeline.discover_live_groq_fallback_model degrades cleanly (empty string) on failure",
+              found == "")
+    except Exception as e:
+        check(f"pipeline.discover_live_groq_fallback_model degrades on failure ({e})", False)
 
 
 # --- Winning Content Profile (2026-08-18 historical intelligence) -------
