@@ -238,6 +238,14 @@ def call_groq(prompt: str, _retries: int = 2) -> str:
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.4,
                     "response_format": {"type": "json_object"},
+                    # 2026-08-18: see pipeline.py's call_groq for why this is
+                    # needed - openai/gpt-oss-* burns part of the completion
+                    # budget on hidden reasoning, and Groq's default
+                    # max_completion_tokens (1024) isn't enough for a full
+                    # multi-section weekly report. Higher cap than
+                    # pipeline.py's since this report has many more fields.
+                    "reasoning_effort": "low",
+                    "max_completion_tokens": 8192,
                 },
                 timeout=60,
             )

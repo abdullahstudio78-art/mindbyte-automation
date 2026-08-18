@@ -205,6 +205,13 @@ def call_groq(prompt: str, _retries: int = 2) -> str:
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.7,
+                    # 2026-08-18: see pipeline.py's call_groq for why this is
+                    # needed - openai/gpt-oss-* burns part of the completion
+                    # budget on hidden reasoning, and Groq's default
+                    # max_completion_tokens (1024) left too little room for
+                    # even a short comment once reasoning is subtracted.
+                    "reasoning_effort": "low",
+                    "max_completion_tokens": 2048,
                 },
                 timeout=60,
             )

@@ -571,6 +571,17 @@ def call_groq(prompt: str, _retries: int = 2) -> str:
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.9,
                     "response_format": {"type": "json_object"},
+                    # 2026-08-18: openai/gpt-oss-* models spend part of the
+                    # completion budget on hidden reasoning before the JSON
+                    # answer - Groq's default max_completion_tokens (1024)
+                    # left no room left for the actual script, so every
+                    # call was failing 400 json_validate_failed /
+                    # "max completion tokens reached before generating a
+                    # valid document". reasoning_effort=low keeps that
+                    # reasoning overhead small, and the explicit token cap
+                    # leaves plenty of room for a full script/JSON payload.
+                    "reasoning_effort": "low",
+                    "max_completion_tokens": 4096,
                 },
                 timeout=60,
             )
