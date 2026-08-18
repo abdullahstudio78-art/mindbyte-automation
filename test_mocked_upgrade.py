@@ -402,6 +402,52 @@ try:
 except Exception as e:
     check(f"thumbnail_identity dimension gracefully skipped ({e})", False)
 
+
+# --- Title style/length correlation, independent of topic (2026-08-19) ---
+# Title text has been stored since day one but never correlated against
+# performance independent of topic - the audit's explicitly flagged gap.
+try:
+    check("weekly_review.title_style_bucket classifies a question title",
+          wr.title_style_bucket("Why Do We Fall For This?") == "question")
+    check("weekly_review.title_style_bucket classifies a colon/subtitle title",
+          wr.title_style_bucket("The Mirror Effect: Why You Copy Others") == "colon/subtitle")
+    check("weekly_review.title_style_bucket classifies a number title",
+          wr.title_style_bucket("5 Reasons Your Brain Lies To You") == "number")
+    check("weekly_review.title_style_bucket classifies a plain statement title",
+          wr.title_style_bucket("The Hidden Psychology Behind Attraction") == "plain statement")
+    check("weekly_review.title_length_bucket buckets a short title",
+          wr.title_length_bucket("Why You Overthink") == "short (<=6 words)")
+    check("weekly_review.title_length_bucket buckets a long title",
+          wr.title_length_bucket("The Hidden Psychological Reason Why You Can't Stop Thinking About That One Person") == "long (11+ words)")
+except Exception as e:
+    check(f"title_style_bucket/title_length_bucket ({e})", False)
+
+try:
+    title_records = (
+        [{**_mk_record("Topic A", "hook a", 0.9, i), "title": "Why Does This Happen To You?"} for i in range(5)]
+        + [{**_mk_record("Topic B", "hook b", 0.2, i), "title": "The Psychology Of Emotions"} for i in range(5)]
+    )
+    title_patterns, _ = wr.detect_patterns(title_records)
+    check("weekly_review.detect_patterns adds a title_style dimension when titles exist",
+          "title_style" in title_patterns)
+    title_profile = wr.build_winning_content_profile(title_records, title_patterns)
+    check("weekly_review.build_winning_content_profile surfaces the best-performing title style",
+          title_profile.get("best_title_style") == "question")
+except Exception as e:
+    check(f"title style correlation end-to-end ({e})", False)
+
+with mock.patch.object(pl, "sheet_get") as msg_title_profile:
+    msg_title_profile.return_value = [["2026-08-19", json.dumps({
+        "best_title_style": "question",
+        "weak_topics": [],
+    }), "x"]]
+    try:
+        fb = pl.build_fallback_brief_from_profile("fake-token")
+        check("pipeline.build_fallback_brief_from_profile folds best_title_style into angle guidance",
+              "question" in (fb.get("angle") or ""))
+    except Exception as e:
+        check(f"pipeline.build_fallback_brief_from_profile title style ({e})", False)
+
 with mock.patch.object(wr, "sheet_get") as msg_meta:
     msg_meta.return_value = [
         ["vid1", "Title", "Topic", "Social Psychology", "short", "Hook text here",

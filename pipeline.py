@@ -391,10 +391,18 @@ def build_fallback_brief_from_profile(access_token: str) -> dict:
     top_hook = winning_hooks[0]["key"] if winning_hooks else None
     best_cta = profile.get("best_cta_style")
     best_structure = profile.get("best_structure")
-    if not (top_hook or best_cta or best_structure):
+    best_title_style = profile.get("best_title_style")
+    if not (top_hook or best_cta or best_structure or best_title_style):
         return {}
+    angle = None
+    if best_title_style:
+        # 2026-08-19: title style (question / colon-subtitle / number /
+        # plain statement) is now tracked independent of topic - fold the
+        # top performer into "angle" guidance, since generate_script()'s
+        # title requirement reads that field for creative direction.
+        angle = f"When writing the title, lean toward a '{best_title_style}' style - it has performed best recently."
     return {
-        "angle": None,
+        "angle": angle,
         "hook": f"Something in the style of a past top-performing opener: \"{top_hook}\"" if top_hook else None,
         "hook_type": None,
         "cta_style": best_cta,

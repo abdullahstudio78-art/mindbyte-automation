@@ -658,6 +658,44 @@ def length_bucket(sec: float) -> str:
     return "8min+ (long-form)"
 
 
+def title_style_bucket(title: str) -> str:
+    """2026-08-19: title text has been stored in every Videos/LongformVideos
+    row since day one, but was never correlated against performance
+    independent of topic - the growth-system audit's explicitly flagged
+    gap ('title analysis: title text is stored everywhere but never
+    correlated against performance independent of topic'). Same lightweight,
+    defensible regex-heuristic approach already used in external_trends.py's
+    title_pattern_notes() for competitor titles - question mark / number /
+    colon presence, not NLP - applied here to MindByte's OWN titles so it
+    becomes a real pattern dimension. A title can match multiple styles;
+    bucketed into one label (question > colon > number > plain) so it still
+    works as a single categorical pattern-detection dimension rather than
+    needing multi-label grouping."""
+    if not title:
+        return "unknown"
+    if "?" in title:
+        return "question"
+    if ":" in title:
+        return "colon/subtitle"
+    if re.search(r"\d", title):
+        return "number"
+    return "plain statement"
+
+
+def title_length_bucket(title: str) -> str:
+    """Word count of the title itself (distinct from word_count_bucket,
+    which buckets the SCRIPT's word count) - short/punchy vs. long/
+    descriptive titles, as their own independent pattern dimension."""
+    if not title:
+        return "unknown"
+    n = len(title.split())
+    if n <= 6:
+        return "short (<=6 words)"
+    if n <= 10:
+        return "medium (7-10 words)"
+    return "long (11+ words)"
+
+
 def hour_bucket(hour_str: str) -> str:
     try:
         h = int(hour_str)
@@ -707,6 +745,14 @@ def detect_patterns(records: list) -> dict:
     add("word_count_band", lambda r: word_count_bucket(r["word_count"]))
     add("video_length_band", lambda r: length_bucket(r["length_sec"]))
     add("upload_hour_band", lambda r: hour_bucket(r["upload_hour"]))
+
+    # Title style/length, independent of topic (2026-08-19) - see
+    # title_style_bucket()/title_length_bucket() docstrings above for why.
+    # Skipped gracefully (same as every other optional dimension here) if
+    # no record has a title yet.
+    if any(r.get("title") for r in records):
+        add("title_style", lambda r: title_style_bucket(r.get("title", "")))
+        add("title_length_band", lambda r: title_length_bucket(r.get("title", "")))
 
     # New pattern dimensions (2026-07-31): hook_type and series, read from
     # VideoMeta's new columns. Gracefully skipped (not added to `patterns`
@@ -868,6 +914,8 @@ def build_winning_content_profile(records: list, patterns: dict) -> dict:
         "best_upload_hour_band": _best_key(patterns, "upload_hour_band"),
         "best_cta_style": _best_key(patterns, "cta_style"),
         "best_thumbnail_identity": _best_key(patterns, "thumbnail_identity"),
+        "best_title_style": _best_key(patterns, "title_style"),
+        "best_title_length_band": _best_key(patterns, "title_length_band"),
         "fatigue_warnings": detect_fatigue(records),
         "confidence_by_dimension": {dim: data.get("confidence", "Low") for dim, data in patterns.items()},
     }
