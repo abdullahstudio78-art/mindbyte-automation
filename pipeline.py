@@ -2363,7 +2363,7 @@ MIN_VIDEO_DURATION_SEC = 40
 MAX_VIDEO_DURATION_SEC = 80
 REQUIRED_WIDTH = 1080
 REQUIRED_HEIGHT = 1920
-QUALITY_SHEET_TAB = "QualityChecklist!A:N"
+QUALITY_SHEET_TAB = "QualityChecklist!A:O"
 
 
 def set_youtube_thumbnail(access_token: str, video_id: str, thumbnail_path: str) -> None:
@@ -2556,6 +2556,11 @@ def log_quality_checklist(
         "Y" if checks.get("audio_ok") else "N",
         "Y" if checks.get("tags_ok") else "N",
         ", ".join(result["failed"]) if result["failed"] else "",
+        # 2026-08-18: previously only DurationOK's Y/N was logged here, so a
+        # rejection gave no way to tell how far off the render was (39.9s vs
+        # 15s are both "N" but very different problems) without pulling the
+        # Actions run log. Log the actual measured seconds too.
+        f"{result.get('duration', 0):.1f}",
     ]
     try:
         sheet_append(access_token, QUALITY_SHEET_TAB, row)
@@ -2564,6 +2569,7 @@ def log_quality_checklist(
             "Timestamp", "VideoID", "Topic", "Pillar", "OverallResult",
             "HookOK", "IdeaScoreOK", "ScriptQualityOK", "ComplianceOK",
             "DurationOK", "ResolutionOK", "AudioOK", "TagsOK", "FailedChecks",
+            "MeasuredDurationSec",
         ]
         healed = False
         try:
@@ -2747,7 +2753,15 @@ def main() -> None:
         checklist = run_prepublish_checklist(
             topic, pillar, script, quality, compliance, idea_score_avg, output_path,
         )
-        print(f"[pipeline] pre-publish checklist: {checklist['checks']}")
+        # 2026-08-18: the checklist previously only logged pass/fail
+        # booleans, so a duration_ok/resolution_ok rejection gave no way to
+        # tell HOW far off the render was without re-downloading the run's
+        # artifact. Log the actual measured values alongside the checks.
+        print(f"[pipeline] pre-publish checklist: {checklist['checks']} "
+              f"(measured: duration={checklist['duration']:.1f}s "
+              f"[{MIN_VIDEO_DURATION_SEC}-{MAX_VIDEO_DURATION_SEC}s required], "
+              f"resolution={checklist['width']}x{checklist['height']} "
+              f"[{REQUIRED_WIDTH}x{REQUIRED_HEIGHT} required])")
         if not checklist["overall_pass"]:
             sheet_row_base[3] = "Failed"
             sheet_row_base[14] = f"Failed pre-publish checklist: {', '.join(checklist['failed'])}"

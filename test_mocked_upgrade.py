@@ -321,6 +321,34 @@ with mock.patch.object(pl, "sheet_get") as msg_fail:
         check(f"pipeline.load_weak_topics degrades on failure ({e})", False)
 
 
+# --- Quality checklist logs the measured value, not just Y/N (2026-08-18) -
+# Found while diagnosing a live duration_ok rejection during verification:
+# the checklist log only recorded Y/N, so a rejection gave no way to tell
+# how far off the render was without pulling the raw Actions log.
+with mock.patch.object(pl, "sheet_append") as msa4:
+    msa4.return_value = None
+    try:
+        result = {
+            "checks": {
+                "hook_ok": True, "idea_score_ok": True, "script_quality_ok": True,
+                "compliance_ok": True, "duration_ok": False, "resolution_ok": True,
+                "audio_ok": True, "tags_ok": True,
+            },
+            "failed": ["duration_ok"],
+            "overall_pass": False,
+            "duration": 33.7,
+            "width": 1080,
+            "height": 1920,
+        }
+        pl.log_quality_checklist("fake-token", "Some Topic", "Some Pillar", result)
+        args, kwargs = msa4.call_args
+        row = args[-1]
+        check("pipeline.log_quality_checklist logs the measured duration in seconds, not just DurationOK=N",
+              row[-1] == "33.7")
+    except Exception as e:
+        check(f"pipeline.log_quality_checklist measured duration ({e})", False)
+
+
 # --- summary -----------------------------------------------------------
 print("\n=== SUMMARY ===")
 n_pass = sum(1 for _, ok in results if ok)
