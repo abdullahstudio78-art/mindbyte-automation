@@ -414,18 +414,81 @@ def build_fallback_brief_from_profile(access_token: str) -> dict:
     }
 
 
+def generate_fresh_topic(pillar: str, avoid_topics: set) -> str:
+    """2026-08-19: TOPIC_POOL is a finite, hardcoded list (52 topics across
+    6 pillars) - the growth-system audit flagged this as an eventual
+    certainty: "will eventually need AI-generated new topics beyond the
+    static list as UsedTopics fills up". At 2 Shorts/day + 1 long-form/week
+    consumption, the full pool gets exhausted in well under a month, after
+    which pick_topic() below previously had no option but to silently
+    RECYCLE an already-used topic forever - a quality regression (repeat
+    content) that would have been invisible until someone noticed the
+    channel repeating itself. This asks Groq for ONE genuinely new topic
+    in the existing pool's exact style/scope, given what's already been
+    covered, so the channel keeps growing its own topic list instead of
+    looping a fixed one. Returns "" (never raises) on any failure - the
+    caller degrades to the pre-existing recycle behavior, so this is a
+    pure quality upgrade, never a new failure mode."""
+    try:
+        pillar_tone = CONTENT_PILLARS[pillar]["tone"]
+        # Cap the avoid-list length in the prompt - with hundreds of used
+        # topics eventually, sending all of them would bloat the prompt for
+        # diminishing returns; a recent-ish sample is enough steering.
+        sample_avoid = list(avoid_topics)[:60]
+        prompt = textwrap.dedent(f"""
+            You are the topic strategist for MindByte, a psychology
+            documentary YouTube channel. The "{pillar}" pillar (tone:
+            {pillar_tone}) has used every topic in its current list. Propose
+            ONE brand-new topic for this pillar, in the exact same style as
+            real MindByte topics - a short, specific psychological
+            phenomenon or behavior (NOT a broad subject, NOT a listicle
+            title, NOT a question) - e.g. "Why We Trust Confident People
+            More" or "The Bystander Effect".
+
+            Topics already covered in this pillar (do not repeat or
+            closely rephrase any of these): {json.dumps(sample_avoid)}
+
+            Return ONLY valid JSON: {{"topic": "<the new topic, 3-8 words,
+            title case, no trailing punctuation>"}}
+        """).strip()
+        raw = call_groq(prompt)
+        data = json.loads(raw)
+        topic = str(data.get("topic", "")).strip()
+        if not topic or topic.lower() in avoid_topics:
+            return ""
+        return topic
+    except Exception as e:  # noqa: BLE001 - this is a nice-to-have, never fatal
+        print(f"[pipeline] generate_fresh_topic failed for pillar '{pillar}' (non-fatal): {e}")
+        return ""
+
+
 def pick_topic(access_token: str) -> tuple:
-    """Return a (topic, pillar_name) pair not yet used, or a random one if
-    every topic in the pool has been used at least once already. Prefers
-    topics NOT flagged WEAK in the latest Winning Content Profile, but
-    never lets that filter leave zero candidates."""
+    """Return a (topic, pillar_name) pair not yet used. Prefers topics NOT
+    flagged WEAK in the latest Winning Content Profile, but never lets that
+    filter leave zero candidates.
+
+    2026-08-19: when the entire static TOPIC_POOL has been used at least
+    once, this now tries generate_fresh_topic() first (a genuinely new,
+    AI-generated topic in the same style) before falling back to the old
+    behavior of recycling an already-used topic - see that function's
+    docstring for why. The recycle fallback is kept exactly as before for
+    when generation fails (e.g. Groq is down), so this never introduces a
+    new way for the run to stall."""
     rows = sheet_get(access_token, "UsedTopics!A2:A")
     used = {r[0].strip().lower() for r in rows if r}
     weak = load_weak_topics(access_token)
     available = [(t, p) for t, p in TOPIC_POOL if t.lower() not in used]
     if not available:
-        # Every topic has been used at least once - recycle randomly rather
-        # than stalling the channel forever.
+        # Every topic in the static pool has been used at least once.
+        # Try generating a genuinely new one before falling back to
+        # recycling an already-used topic.
+        pillar = random.choice(list(CONTENT_PILLARS.keys()))
+        fresh_topic = generate_fresh_topic(pillar, used)
+        if fresh_topic:
+            print(f"[pipeline] TOPIC_POOL exhausted for now - generated a fresh topic: '{fresh_topic}' ({pillar})")
+            return fresh_topic, pillar
+        # Generation failed (or Groq unavailable) - recycle randomly rather
+        # than stalling the channel forever, same as before this change.
         available = list(TOPIC_POOL)
     non_weak = [(t, p) for t, p in available if t.lower() not in weak]
     if non_weak:

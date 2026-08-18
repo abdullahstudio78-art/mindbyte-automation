@@ -638,6 +638,74 @@ with mock.patch.object(pl, "sheet_append") as msa4:
         check(f"pipeline.log_quality_checklist measured duration ({e})", False)
 
 
+# --- AI-generated topic pool replenishment (2026-08-19) -----------------
+# Closes the last audit-flagged gap: TOPIC_POOL is finite and will run out
+# at the current publish cadence; after that pick_topic() used to silently
+# recycle already-used topics forever.
+with mock.patch.object(pl, "call_groq", return_value=json.dumps({"topic": "Why We Trust Confident People More"})):
+    try:
+        topic = pl.generate_fresh_topic("Social Psychology", {"some old topic"})
+        check("pipeline.generate_fresh_topic returns a Groq-generated topic string",
+              topic == "Why We Trust Confident People More")
+    except Exception as e:
+        check(f"pipeline.generate_fresh_topic happy path ({e})", False)
+
+with mock.patch.object(pl, "call_groq", return_value="not valid json"):
+    try:
+        topic = pl.generate_fresh_topic("Social Psychology", set())
+        check("pipeline.generate_fresh_topic degrades to '' on malformed Groq output, never raises",
+              topic == "")
+    except Exception as e:
+        check(f"pipeline.generate_fresh_topic malformed-output degrade ({e})", False)
+
+with mock.patch.object(pl, "call_groq", side_effect=RuntimeError("groq down")):
+    try:
+        topic = pl.generate_fresh_topic("Social Psychology", set())
+        check("pipeline.generate_fresh_topic degrades to '' when call_groq raises, never raises",
+              topic == "")
+    except Exception as e:
+        check(f"pipeline.generate_fresh_topic exception degrade ({e})", False)
+
+with mock.patch.object(pl, "call_groq", return_value=json.dumps({"topic": "Some Old Topic"})):
+    try:
+        topic = pl.generate_fresh_topic("Social Psychology", {"some old topic"})
+        check("pipeline.generate_fresh_topic rejects a topic that duplicates an already-used one (case-insensitive)",
+              topic == "")
+    except Exception as e:
+        check(f"pipeline.generate_fresh_topic dedup-against-avoid_topics ({e})", False)
+
+all_used_rows = [[t] for t, _ in pl.TOPIC_POOL]
+with mock.patch.object(pl, "sheet_get", return_value=all_used_rows), \
+     mock.patch.object(pl, "load_weak_topics", return_value=set()), \
+     mock.patch.object(pl, "generate_fresh_topic", return_value="A Brand New Fresh Topic") as gft:
+    try:
+        topic, pillar = pl.pick_topic("fake-token")
+        check("pipeline.pick_topic calls generate_fresh_topic() once TOPIC_POOL is fully exhausted, and returns it",
+              topic == "A Brand New Fresh Topic" and gft.called)
+    except Exception as e:
+        check(f"pipeline.pick_topic exhausted-pool -> fresh topic ({e})", False)
+
+with mock.patch.object(pl, "sheet_get", return_value=all_used_rows), \
+     mock.patch.object(pl, "load_weak_topics", return_value=set()), \
+     mock.patch.object(pl, "generate_fresh_topic", return_value=""):
+    try:
+        topic, pillar = pl.pick_topic("fake-token")
+        check("pipeline.pick_topic falls back to recycling the static pool when generate_fresh_topic() fails",
+              any(topic == t for t, _ in pl.TOPIC_POOL))
+    except Exception as e:
+        check(f"pipeline.pick_topic exhausted-pool -> recycle fallback ({e})", False)
+
+with mock.patch.object(pl, "sheet_get", return_value=[]), \
+     mock.patch.object(pl, "load_weak_topics", return_value=set()), \
+     mock.patch.object(pl, "generate_fresh_topic") as gft_unused:
+    try:
+        topic, pillar = pl.pick_topic("fake-token")
+        check("pipeline.pick_topic does NOT call generate_fresh_topic() while the static pool still has candidates",
+              not gft_unused.called and any(topic == t for t, _ in pl.TOPIC_POOL))
+    except Exception as e:
+        check(f"pipeline.pick_topic non-exhausted pool skips generation ({e})", False)
+
+
 # --- summary -----------------------------------------------------------
 print("\n=== SUMMARY ===")
 n_pass = sum(1 for _, ok in results if ok)
