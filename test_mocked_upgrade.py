@@ -362,6 +362,64 @@ with mock.patch.object(pl, "sheet_get") as msg_fail:
         check(f"pipeline.load_weak_topics degrades on failure ({e})", False)
 
 
+# --- Winning Content Profile now steers generation, not just topic pick --
+# (2026-08-18) Previously the profile only filtered out WEAK topics; a run
+# with no queued NextWeekQueue brief (or a low-scoring one) got zero benefit
+# from anything weekly_review.py had learned about winning hooks/structure/
+# CTA. build_fallback_brief_from_profile() closes that gap.
+with mock.patch.object(pl, "sheet_get") as msg_profile:
+    msg_profile.return_value = [["2026-08-17", json.dumps({
+        "winning_hooks": [{"key": "There's a reason you can't stop...", "score": 0.9, "n": 5}],
+        "best_structure": "hook-explain-reveal",
+        "best_cta_style": "curiosity",
+        "weak_topics": [],
+    }), "x"]]
+    try:
+        fb = pl.build_fallback_brief_from_profile("fake-token")
+        check("pipeline.build_fallback_brief_from_profile surfaces the top winning hook",
+              "There's a reason you can't stop" in (fb.get("hook") or ""))
+        check("pipeline.build_fallback_brief_from_profile surfaces the best CTA style",
+              fb.get("cta_style") == "curiosity")
+        check("pipeline.build_fallback_brief_from_profile surfaces the best structure",
+              "hook-explain-reveal" in (fb.get("loyalty_angle") or ""))
+    except Exception as e:
+        check(f"pipeline.build_fallback_brief_from_profile ({e})", False)
+
+with mock.patch.object(pl, "sheet_get") as msg_empty_profile:
+    msg_empty_profile.return_value = []
+    try:
+        fb = pl.build_fallback_brief_from_profile("fake-token")
+        check("pipeline.build_fallback_brief_from_profile returns {} when no profile exists yet", fb == {})
+    except Exception as e:
+        check(f"pipeline.build_fallback_brief_from_profile empty profile ({e})", False)
+
+with mock.patch.object(pl, "get_next_queue_brief", return_value=None), \
+     mock.patch.object(pl, "pick_topic_with_idea_score", return_value=("Some Topic", "Social Psychology", 8.0)), \
+     mock.patch.object(pl, "sheet_get") as msg_select:
+    msg_select.return_value = [["2026-08-17", json.dumps({
+        "winning_hooks": [{"key": "A proven opener", "score": 0.9, "n": 5}],
+        "best_structure": "hook-explain-reveal",
+        "best_cta_style": "value",
+        "weak_topics": [],
+    }), "x"]]
+    try:
+        topic, pillar, score, brief = pl.select_topic_for_run("fake-token", fmt="short")
+        check("pipeline.select_topic_for_run injects a profile-based fallback brief when the queue is empty",
+              brief is not None and brief.get("cta_style") == "value")
+    except Exception as e:
+        check(f"pipeline.select_topic_for_run fallback brief injection ({e})", False)
+
+with mock.patch.object(pl, "get_next_queue_brief", return_value=None), \
+     mock.patch.object(pl, "pick_topic_with_idea_score", return_value=("Some Topic", "Social Psychology", 8.0)), \
+     mock.patch.object(pl, "sheet_get", return_value=[]):
+    try:
+        topic, pillar, score, brief = pl.select_topic_for_run("fake-token", fmt="short")
+        check("pipeline.select_topic_for_run still returns brief=None when no profile exists (unchanged behavior)",
+              brief is None)
+    except Exception as e:
+        check(f"pipeline.select_topic_for_run no-profile behavior ({e})", False)
+
+
 # --- Quality checklist logs the measured value, not just Y/N (2026-08-18) -
 # Found while diagnosing a live duration_ok rejection during verification:
 # the checklist log only recorded Y/N, so a rejection gave no way to tell

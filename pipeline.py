@@ -305,21 +305,66 @@ def sheet_update(access_token: str, a1_range: str, row: list) -> None:
 # Topic selection
 # ---------------------------------------------------------------------------
 
-def load_weak_topics(access_token: str) -> set:
-    """Reads the most recent WinningContentProfile row (written weekly by
-    weekly_review.py) and returns the set of topic strings classified as
-    WEAK, so the random-fallback topic picker below can steer away from
-    them even when NextWeekQueue is empty. Returns an empty set (no-op) on
-    any failure - this is a nice-to-have bias, never a hard requirement."""
+def load_winning_content_profile(access_token: str) -> dict:
+    """Reads and parses the most recent WinningContentProfile row (written
+    weekly by weekly_review.py's build_winning_content_profile()). Returns
+    {} on any failure or if no profile has been written yet - every caller
+    treats an empty dict as "no signal available", never a hard failure."""
     try:
         rows = sheet_get(access_token, "WinningContentProfile!A2:C")
         if not rows:
-            return set()
-        profile = json.loads(rows[-1][1])
-        return {w["key"].strip().lower() for w in profile.get("weak_topics", []) if w.get("key")}
+            return {}
+        return json.loads(rows[-1][1])
     except Exception as e:
         print(f"[pipeline] could not read WinningContentProfile (non-fatal): {e}")
-        return set()
+        return {}
+
+
+def load_weak_topics(access_token: str) -> set:
+    """Returns the set of topic strings classified as WEAK in the latest
+    Winning Content Profile, so the random-fallback topic picker below can
+    steer away from them even when NextWeekQueue is empty. Returns an
+    empty set (no-op) on any failure - this is a nice-to-have bias, never
+    a hard requirement."""
+    profile = load_winning_content_profile(access_token)
+    return {w["key"].strip().lower() for w in profile.get("weak_topics", []) if w.get("key")}
+
+
+def build_fallback_brief_from_profile(access_token: str) -> dict:
+    """2026-08-18: closes the other half of the Winning Content Profile
+    loop. Previously the profile only steered topic SELECTION away from
+    weak topics (see load_weak_topics above) - it never touched actual
+    script generation unless a weekly_review.py-queued NextWeekQueue brief
+    happened to be consumed that run. Most runs (queue empty, or the
+    queued idea scored below IDEA_SCORE_AVG_THRESHOLD) got zero benefit
+    from everything weekly_review.py has learned about what hooks,
+    structure, and CTA style actually perform. This builds a lightweight
+    brief-shaped dict from the profile's winning_hooks/best_structure/
+    best_cta_style so generate_script()/generate_longform_script() get
+    that steering even outside the queue path. Returns {} (treated as "no
+    brief") when the profile is empty or has no usable signal yet - e.g.
+    a brand-new channel with too little history - never fabricates
+    guidance from nothing."""
+    profile = load_winning_content_profile(access_token)
+    if not profile:
+        return {}
+    winning_hooks = profile.get("winning_hooks") or []
+    top_hook = winning_hooks[0]["key"] if winning_hooks else None
+    best_cta = profile.get("best_cta_style")
+    best_structure = profile.get("best_structure")
+    if not (top_hook or best_cta or best_structure):
+        return {}
+    return {
+        "angle": None,
+        "hook": f"Something in the style of a past top-performing opener: \"{top_hook}\"" if top_hook else None,
+        "hook_type": None,
+        "cta_style": best_cta,
+        "series": None,
+        "loyalty_angle": (
+            f"Recent data shows the '{best_structure}' structure has performed best - "
+            f"favor that shape for this video's flow." if best_structure else None
+        ),
+    }
 
 
 def pick_topic(access_token: str) -> tuple:
@@ -514,7 +559,10 @@ def select_topic_for_run(access_token: str, fmt: str = "short") -> tuple:
     brief = get_next_queue_brief(access_token, fmt=fmt)
     if brief is None:
         topic, pillar, idea_score_avg = pick_topic_with_idea_score(access_token)
-        return topic, pillar, idea_score_avg, None
+        fallback_brief = build_fallback_brief_from_profile(access_token) or None
+        if fallback_brief:
+            print("[pipeline] no queued brief - using Winning Content Profile signal as generation guidance")
+        return topic, pillar, idea_score_avg, fallback_brief
 
     topic, pillar = brief["title"], brief["pillar"] if brief["pillar"] in CONTENT_PILLARS else None
     if pillar is None:
@@ -541,7 +589,10 @@ def select_topic_for_run(access_token: str, fmt: str = "short") -> tuple:
             f"(below {IDEA_SCORE_AVG_THRESHOLD}) - falling back to normal topic selection"
         )
         topic, pillar, idea_score_avg = pick_topic_with_idea_score(access_token)
-        return topic, pillar, idea_score_avg, None
+        fallback_brief = build_fallback_brief_from_profile(access_token) or None
+        if fallback_brief:
+            print("[pipeline] queued brief scored too low - using Winning Content Profile signal as generation guidance")
+        return topic, pillar, idea_score_avg, fallback_brief
 
     print(f"[pipeline] using queued weekly-plan brief: '{topic}' ({pillar}) - idea score {idea_score_avg:.1f}")
     return topic, pillar, idea_score_avg, brief
