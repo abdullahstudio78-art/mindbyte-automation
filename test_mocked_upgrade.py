@@ -4,12 +4,15 @@ access - every HTTP call is mocked. Run with: python test_mocked_upgrade.py
 """
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import types
 from datetime import datetime, timezone
 from unittest import mock
 
 import requests
+from PIL import Image
 
 os.environ.setdefault("OAUTH_CLIENT_ID", "x")
 os.environ.setdefault("OAUTH_CLIENT_SECRET", "x")
@@ -735,6 +738,66 @@ with mock.patch.object(pl, "call_groq", side_effect=_fake_call_groq_assumptive):
               script.get("hook_type") == "assumptive")
     except Exception as e:
         check(f"pipeline.generate_script assumptive hook_type acceptance ({e})", False)
+
+
+# --- Bold thumbnail text/branding overlay (2026-08-19) -------------------
+# Competitor research found every studied channel uses bold thumbnail text
+# and a fixed-position logo, calling MindByte's plain-frame thumbnail the
+# single biggest growth gap. Reintroduces bold text (short caption + fixed
+# logo badge + pillar accent bar) over the real cinematic frame.
+try:
+    check("pipeline.thumbnail_caption shortens a title to <=4 ALL-CAPS words",
+          pl.thumbnail_caption("The Reason You Can't Stop Overthinking At Night") == "THE REASON YOU CAN'T")
+    check("pipeline.thumbnail_caption prefers text after a colon when present",
+          pl.thumbnail_caption("Attachment Styles: Why You Pick The Same Partner") == "WHY YOU PICK THE")
+    check("pipeline.thumbnail_caption degrades to a safe default on empty input",
+          pl.thumbnail_caption("") == "MINDBYTE")
+except Exception as e:
+    check(f"pipeline.thumbnail_caption ({e})", False)
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    dest = os.path.join(tmpdir, "thumb.png")
+    try:
+        pl.build_thumbnail(dest, "Why We Trust Confident People More", "Brain & Neuroscience",
+                            clip_paths=None, storyboard=None)
+        img = Image.open(dest)
+        check("pipeline.build_thumbnail (no clip - fallback path) produces a correctly-sized image",
+              img.size == (pl.VIDEO_WIDTH, pl.VIDEO_HEIGHT))
+        # A blank brand-gradient background would have very few distinct
+        # colors; the bold caption + logo + accent bar overlay should push
+        # this well past that, confirming the overlay actually drew
+        # something rather than silently no-op'ing.
+        distinct_colors = len(img.convert("RGB").getcolors(maxcolors=256 * 256 * 256) or [])
+        check("pipeline.build_thumbnail fallback path actually draws the bold text/logo overlay",
+              distinct_colors > 20)
+    except Exception as e:
+        check(f"pipeline.build_thumbnail fallback path ({e})", False)
+
+    clip_path = os.path.join(tmpdir, "clip.mp4")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=size=320x568:duration=1:rate=5", clip_path],
+            check=True, capture_output=True,
+        )
+        dest2 = os.path.join(tmpdir, "thumb2.png")
+        pl.build_thumbnail(dest2, "Some Real Video Title Here", "Relationship Psychology",
+                            clip_paths=[clip_path], storyboard=None)
+        img2 = Image.open(dest2)
+        check("pipeline.build_thumbnail (real clip path) produces a correctly-sized branded image",
+              img2.size == (pl.VIDEO_WIDTH, pl.VIDEO_HEIGHT))
+    except Exception as e:
+        check(f"pipeline.build_thumbnail real-clip path ({e})", False)
+
+    try:
+        import pipeline_longform as plf
+        dest3 = os.path.join(tmpdir, "thumb_lf.png")
+        plf.build_thumbnail_longform(dest3, "The Apology Your Brain Won't Let You Give",
+                                      "Relationship Psychology", clip_groups=None)
+        img3 = Image.open(dest3)
+        check("pipeline_longform.build_thumbnail_longform gets the same bold-text/logo overlay treatment",
+              img3.size == (plf.LF_VIDEO_WIDTH, plf.LF_VIDEO_HEIGHT))
+    except Exception as e:
+        check(f"pipeline_longform.build_thumbnail_longform overlay ({e})", False)
 
 
 # --- summary -----------------------------------------------------------

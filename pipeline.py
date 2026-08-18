@@ -1857,24 +1857,106 @@ def build_title_card(dest_path: str, title: str, pillar: str) -> None:
     img.save(dest_path)
 
 
+def thumbnail_caption(title: str, max_words: int = 4) -> str:
+    """Shrinks a full video title down to a short (<=max_words), punchy,
+    ALL-CAPS thumbnail caption - competitor research (2026-08-19,
+    claude/competitor-research.md) found every single one of 8 studied
+    channels uses bold graphic text on its thumbnail, and called it the
+    single biggest, most obvious gap vs. MindByte's plain frame. Prefers
+    the words after a colon (titles are often "Hook: Specific Claim") or
+    otherwise the first max_words words - never raises, degrades to a
+    truncated title on anything unexpected."""
+    try:
+        text = (title or "").strip()
+        if ":" in text:
+            after = text.split(":", 1)[1].strip()
+            if after:
+                text = after
+        words = text.split()
+        caption = " ".join(words[:max_words])
+        return caption.upper().strip() or "MINDBYTE"
+    except Exception:
+        return "MINDBYTE"
+
+
 def build_thumbnail(dest_path: str, title: str, pillar: str,
                      clip_paths: list = None, storyboard: list = None) -> None:
-    """Generates the cinematic emotional-image thumbnail (2026-07-23
-    footage-only pivot, per MINDBYTE_CINEMATIC_PIPELINE_V2_SPEC.md section
-    7 - REPLACES the old bold-title-block style entirely: no big text, no
-    color-block background, no pointing-arrow device. The user explicitly
-    banned that style: a thumbnail should be a single powerful cinematic
-    emotional image that makes a viewer ask "what happened here?", with
-    minimal-to-no text.
+    """Generates MindByte's thumbnail: a cinematic frame pulled from the
+    video's own footage (2026-07-23 footage-only pivot - honest about what
+    the video actually looks like, not a separately posed shot), now with
+    a bold branded text/logo overlay reintroduced on 2026-08-19.
+
+    Reversal note: the 2026-07-23 version deliberately used NO text at all
+    ("a thumbnail should be a single powerful cinematic emotional image...
+    minimal-to-no text"). Competitor research done independently after that
+    (claude/competitor-research.md) found EVERY one of 8 studied channels
+    - including the two highest performers, TED-Ed and Kurzgesagt - uses
+    bold, large graphic text and a fixed-position logo/brand element on
+    every thumbnail, and flagged MindByte's plain-frame approach as the
+    single biggest, most obvious growth gap. Asked directly, the channel
+    owner deferred to whichever choice best serves growth (2026-08-19), so
+    this reintroduces bold text - but as a short (<=4 word) caption over a
+    bottom gradient scrim on the SAME real cinematic frame, not a full
+    color-block takeover - keeping the "honest about the footage" value
+    from the earlier pivot while fixing the "every competitor has bold
+    text and we have none" gap.
 
     Picks the strongest available frame from the video's own footage (the
     scene whose storyboard `emotion` field is non-empty and, failing that,
-    just the first clip) rather than a separately posed/generated shot, so
-    the thumbnail is honest about what the video actually looks like.
-    Applies the same subtle color grade as the rest of the video. Falls
-    back to a plain dark still with a small MindByte watermark (still no
-    big text) if no clip is available at all, so this never crashes a run."""
+    just the first clip). Falls back to a plain brand-gradient still with
+    the same text/logo treatment if no clip is available, so this never
+    crashes a run."""
     width, height = VIDEO_WIDTH, VIDEO_HEIGHT
+    caption = thumbnail_caption(title)
+    accent = PILLAR_ACCENT_COLORS.get(pillar, (255, 255, 255))
+
+    def _apply_brand_overlay(img: "Image.Image") -> "Image.Image":
+        """Bottom gradient scrim (for legibility over any footage) + bold
+        ALL-CAPS caption + pillar accent bar + fixed-corner logo badge -
+        shared by both the real-frame and fallback paths so the two never
+        drift out of sync visually."""
+        img = img.convert("RGB")
+        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        odraw = ImageDraw.Draw(overlay)
+        scrim_top = int(height * 0.62)
+        for y in range(scrim_top, height):
+            t = (y - scrim_top) / max(1, height - scrim_top)
+            odraw.line([(0, y), (width, y)], fill=(0, 0, 0, int(190 * t)))
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(img)
+
+        bar_y = int(height * 0.665)
+        bar_w = int(width * 0.16)
+        draw.rectangle([width * 0.06, bar_y, width * 0.06 + bar_w, bar_y + 8], fill=accent)
+
+        cap_font = _brand_font(int(width * 0.095))
+        words = caption.split()
+        lines, cur = [], ""
+        for w in words:
+            trial = (cur + " " + w).strip()
+            if draw.textbbox((0, 0), trial, font=cap_font)[2] > width * 0.88 and cur:
+                lines.append(cur)
+                cur = w
+            else:
+                cur = trial
+        if cur:
+            lines.append(cur)
+        lines = lines[:2]
+        ty = bar_y + int(height * 0.025)
+        line_h = int(width * 0.11)
+        for line in lines:
+            draw.text((width * 0.06, ty), line, font=cap_font, fill=(255, 255, 255))
+            ty += line_h
+
+        # Fixed-position logo badge, same corner every time (TED-Ed's
+        # single most replicable finding, per the competitor research).
+        logo_cx, logo_cy, logo_r = width * 0.10, height * 0.075, width * 0.045
+        draw.ellipse(
+            [logo_cx - logo_r * 1.6, logo_cy - logo_r * 1.6, logo_cx + logo_r * 1.6, logo_cy + logo_r * 1.6],
+            fill=(20, 14, 46),
+        )
+        _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
+        return img
 
     chosen_clip = None
     if clip_paths:
@@ -1900,22 +1982,16 @@ def build_thumbnail(dest_path: str, title: str, pillar: str,
                 ],
                 check=True, capture_output=True,
             )
-            # Minimal, small, non-boxed watermark only - no title text at all,
-            # per the "let the image speak first" direction.
-            img = Image.open(dest_path).convert("RGB")
-            draw = ImageDraw.Draw(img)
-            logo_cy = int(height * 0.93)
-            logo_cx = int(width * 0.10)
-            logo_r = width * 0.02
-            _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
+            img = Image.open(dest_path)
+            img = _apply_brand_overlay(img)
             img.save(dest_path)
             return
         except Exception as e:  # noqa: BLE001 - fall through to the plain fallback below
             print(f"[pipeline] cinematic thumbnail frame extraction failed, using fallback: {e}")
 
-    # Fallback: no clip available at all - a plain dark brand-gradient still,
-    # deliberately with no title text (keeps the "minimal-to-no text" rule
-    # even in the degraded case rather than reverting to the old text block).
+    # Fallback: no clip available at all - a plain brand-gradient still,
+    # with the same bold-caption/logo treatment as the real-frame path so
+    # the channel's thumbnails always look intentional, never blank.
     img = Image.new("RGB", (width, height), BRAND_BG_TOP)
     draw = ImageDraw.Draw(img)
     for y in range(height):
@@ -1924,10 +2000,7 @@ def build_thumbnail(dest_path: str, title: str, pillar: str,
         g = int(BRAND_BG_TOP[1] + (BRAND_BG_BOTTOM[1] - BRAND_BG_TOP[1]) * f)
         b = int(BRAND_BG_TOP[2] + (BRAND_BG_BOTTOM[2] - BRAND_BG_TOP[2]) * f)
         draw.line([(0, y), (width, y)], fill=(r, g, b))
-    logo_cy = int(height * 0.5)
-    logo_cx = int(width * 0.5)
-    logo_r = width * 0.05
-    _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
+    img = _apply_brand_overlay(img)
     img.save(dest_path)
 
 

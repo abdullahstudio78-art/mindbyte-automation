@@ -103,6 +103,7 @@ from pipeline import (
     _brand_font,
     _draw_logo_mark,
     build_watermark_png,
+    thumbnail_caption,
     # Subscriber-conversion CTA system (2026-08-01) - the badge builder is
     # reused as-is with LF_SUBSCRIBE_BADGE_WIDTH/HEIGHT passed in below,
     # since it already accepts width/height overrides for exactly this.
@@ -929,13 +930,59 @@ def build_title_card_longform(dest_path: str, title: str, pillar: str) -> None:
 
 def build_thumbnail_longform(dest_path: str, title: str, pillar: str,
                               clip_groups: list = None) -> None:
-    """Landscape (1920x1080) cinematic-emotional-image thumbnail (2026-07-23
-    footage-only pivot - REPLACES the old bold-title-block style, matching
-    pipeline.py's build_thumbnail(): no big text, just the strongest real
-    frame from the video's own footage, color-graded, with at most a small
-    watermark. Falls back to a plain dark still (still no big text) if no
-    clip is available at all."""
+    """Landscape (1920x1080) thumbnail: real cinematic frame from the
+    video's own footage, color-graded, plus a bold branded text/logo
+    overlay - mirrors pipeline.py's build_thumbnail() 2026-08-19 reversal
+    (see that function's docstring for the full rationale: competitor
+    research found every studied channel uses bold thumbnail text and a
+    fixed-position logo, calling MindByte's previous plain-frame approach
+    the single biggest growth gap). Falls back to a plain brand-gradient
+    still with the same overlay if no clip is available at all."""
     width, height = LF_VIDEO_WIDTH, LF_VIDEO_HEIGHT
+    caption = thumbnail_caption(title)
+    accent = PILLAR_ACCENT_COLORS.get(pillar, (255, 255, 255))
+
+    def _apply_brand_overlay(img: "Image.Image") -> "Image.Image":
+        img = img.convert("RGB")
+        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        odraw = ImageDraw.Draw(overlay)
+        scrim_top = int(height * 0.58)
+        for y in range(scrim_top, height):
+            t = (y - scrim_top) / max(1, height - scrim_top)
+            odraw.line([(0, y), (width, y)], fill=(0, 0, 0, int(190 * t)))
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(img)
+
+        bar_y = int(height * 0.66)
+        bar_w = int(width * 0.09)
+        draw.rectangle([width * 0.045, bar_y, width * 0.045 + bar_w, bar_y + 6], fill=accent)
+
+        cap_font = _brand_font(int(height * 0.115))
+        words = caption.split()
+        lines, cur = [], ""
+        for w in words:
+            trial = (cur + " " + w).strip()
+            if draw.textbbox((0, 0), trial, font=cap_font)[2] > width * 0.7 and cur:
+                lines.append(cur)
+                cur = w
+            else:
+                cur = trial
+        if cur:
+            lines.append(cur)
+        lines = lines[:2]
+        ty = bar_y + int(height * 0.03)
+        line_h = int(height * 0.135)
+        for line in lines:
+            draw.text((width * 0.045, ty), line, font=cap_font, fill=(255, 255, 255))
+            ty += line_h
+
+        logo_cx, logo_cy, logo_r = width * 0.045, height * 0.10, height * 0.05
+        draw.ellipse(
+            [logo_cx - logo_r * 1.6, logo_cy - logo_r * 1.6, logo_cx + logo_r * 1.6, logo_cy + logo_r * 1.6],
+            fill=(20, 14, 46),
+        )
+        _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
+        return img
 
     chosen_clip = None
     if clip_groups:
@@ -957,12 +1004,8 @@ def build_thumbnail_longform(dest_path: str, title: str, pillar: str,
                 ],
                 check=True, capture_output=True,
             )
-            img = Image.open(dest_path).convert("RGB")
-            draw = ImageDraw.Draw(img)
-            logo_cy = int(height * 0.93)
-            logo_cx = int(width * 0.06)
-            logo_r = width * 0.015
-            _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
+            img = Image.open(dest_path)
+            img = _apply_brand_overlay(img)
             img.save(dest_path)
             return
         except Exception as e:  # noqa: BLE001 - fall through to the plain fallback below
@@ -976,10 +1019,7 @@ def build_thumbnail_longform(dest_path: str, title: str, pillar: str,
         g = int(BRAND_BG_TOP[1] + (BRAND_BG_BOTTOM[1] - BRAND_BG_TOP[1]) * f)
         b = int(BRAND_BG_TOP[2] + (BRAND_BG_BOTTOM[2] - BRAND_BG_TOP[2]) * f)
         draw.line([(0, y), (width, y)], fill=(r, g, b))
-    logo_cy = int(height * 0.5)
-    logo_cx = int(width * 0.5)
-    logo_r = width * 0.03
-    _draw_logo_mark(draw, logo_cx, logo_cy, logo_r, color=(255, 255, 255))
+    img = _apply_brand_overlay(img)
     img.save(dest_path)
 
 
