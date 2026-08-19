@@ -44,6 +44,7 @@ Optional (not used for posting yet, kept for future token-refresh logic):
 """
 
 import os
+import re
 import time
 
 import requests
@@ -59,6 +60,75 @@ def facebook_configured() -> bool:
     """False when the Page token/ID aren't set yet - lets pipeline.py skip
     Facebook posting cleanly instead of failing on missing secrets."""
     return bool(FACEBOOK_PAGE_ACCESS_TOKEN and FACEBOOK_PAGE_ID)
+
+
+MAX_HASHTAGS = 8
+FACEBOOK_CAPTION_LIMIT = 2200  # Meta's stated Reels description limit
+
+
+def _tag_to_hashtag(tag: str) -> str | None:
+    """'relationship psychology' -> '#RelationshipPsychology'. Drops
+    anything that doesn't reduce to at least one real word, or that would
+    make an unreasonably long/short hashtag."""
+    words = re.findall(r"[A-Za-z0-9]+", tag)
+    if not words:
+        return None
+    hashtag = "#" + "".join(w.capitalize() for w in words)
+    if len(hashtag) < 4 or len(hashtag) > 30:
+        return None
+    return hashtag
+
+
+def _build_hashtags(tags: list) -> list:
+    seen = set()
+    hashtags = []
+    for tag in tags or []:
+        hashtag = _tag_to_hashtag(str(tag))
+        if hashtag and hashtag.lower() not in seen:
+            seen.add(hashtag.lower())
+            hashtags.append(hashtag)
+        if len(hashtags) >= MAX_HASHTAGS:
+            break
+    return hashtags
+
+
+def build_facebook_caption(title: str, description: str, tags: list) -> str:
+    """Full SEO-optimized Facebook caption: the hook title, the same
+    topic description the SEO pass wrote for YouTube (stripped of any
+    YouTube-only stock-footage/music attribution lines, which don't apply
+    here and would just read as clutter), a set of hashtags derived from
+    the same search-term tags YouTube uses, and a native like/share/follow
+    line (the burned-in CTA in the video itself covers the same ground,
+    this just backs it up in text so it also surfaces in Facebook search
+    and the feed caption)."""
+    title = (title or "").strip()
+    description = (description or "").strip()
+
+    # Strip attribution lines pipeline.py appends to its LOCAL description
+    # copy before this is called elsewhere (e.g. "Music: ... by ...",
+    # credit lines) - if a caller passes the raw script description this
+    # is a no-op, but it's cheap insurance either way.
+    clean_lines = [
+        line for line in description.splitlines()
+        if not re.match(r"^\s*(Music:|Video by|Photo by)", line, re.IGNORECASE)
+    ]
+    description = "\n".join(clean_lines).strip()
+    # Collapse the blank-line gaps left behind by stripped attribution lines.
+    description = re.sub(r"\n{3,}", "\n\n", description)
+
+    hashtags = _build_hashtags(tags)
+
+    parts = []
+    if title:
+        parts.append(title)
+    if description and description != title:
+        parts.append(description)
+    if hashtags:
+        parts.append(" ".join(hashtags))
+    parts.append("\U0001F44D Like this video, share it with someone who needs it, and follow MindByte for more.")
+
+    caption = "\n\n".join(parts)
+    return caption[:FACEBOOK_CAPTION_LIMIT]
 
 
 def _start_upload_session() -> dict:
@@ -139,7 +209,7 @@ def _poll_publish_status(video_id: str, max_wait_s: int = 120) -> str:
     return "timed_out_waiting"
 
 
-def post_short_to_facebook(video_path: str, title: str, description: str) -> dict:
+def post_short_to_facebook(video_path: str, title: str, description: str, tags: list = None) -> dict:
     """Best-effort Facebook Reels upload for a finished Shorts video.
 
     Returns a dict {"posted": bool, "video_id": str|None, "status": str,
@@ -147,15 +217,22 @@ def post_short_to_facebook(video_path: str, title: str, description: str) -> dic
     unconditionally without a try/except of its own. The video must still
     exist on disk when this is called - call it before the temp dir (and
     its final.mp4) is cleaned up, same as the TikTok cross-post.
+
+    `description` should be the SAME topic-SEO description the script
+    generation step wrote (script["description"]) - not the YouTube
+    description with attribution lines already appended - and `tags`
+    should be script["tags"], the same search-term list YouTube uses.
+    build_facebook_caption() turns those into a full title + description +
+    hashtags + CTA caption (2026-08-19, "fully SEO optimized caption with
+    good topic description" per user request - previously this posted
+    with only the bare title).
     """
     if not facebook_configured():
         return {"posted": False, "video_id": None, "status": "skipped",
                  "reason": "Facebook secrets not configured yet"}
 
     try:
-        caption = title.strip()
-        if description:
-            caption = f"{title.strip()}\n\n{description.strip()}"
+        caption = build_facebook_caption(title, description, tags or [])
 
         session = _start_upload_session()
         video_id = session["video_id"]

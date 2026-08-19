@@ -3194,7 +3194,9 @@ def main() -> None:
                                 title_card_path=title_card_path, watermark_path=watermark_path,
                                 subscribe_badge_path=fb_badge_path)
 
-                facebook_result = post_short_to_facebook(fb_output_path, script["title"], "")
+                facebook_result = post_short_to_facebook(
+                    fb_output_path, script["title"], script.get("description", ""), script.get("tags", []),
+                )
                 if facebook_result["status"] == "skipped":
                     print(f"[pipeline] Facebook: skipped ({facebook_result['reason']})")
                 elif facebook_result["posted"]:
