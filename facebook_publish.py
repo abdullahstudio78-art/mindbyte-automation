@@ -9,6 +9,15 @@ upload, and ANY failure here (missing secrets, network error, API error,
 etc.) must never abort the main pipeline run. The video has already been
 safely published to YouTube by the time this runs.
 
+Note (2026-08-19): unlike the TikTok cross-post, pipeline.py does NOT pass
+this the same output_path used for YouTube. Facebook has no "subscribe"
+concept, so the YouTube cut's spoken "don't forget to subscribe" CTA and
+burned-in "SUBSCRIBE" end card would read oddly there. pipeline.py builds
+a separate video first (same story clips/voiceover, but a re-recorded
+"like, share, follow"-style closing line and a matching end card) and
+passes that file's path here instead - this module just uploads whatever
+video_path it's given.
+
 --------------------------------------------------------------------------
 Token setup (2026-08-19, done via the Meta for Developers dashboard +
 Graph API Explorer)

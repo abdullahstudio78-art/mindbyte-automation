@@ -1736,10 +1736,29 @@ SUBSCRIBE_BADGE_SECONDS = 2.0
 SUBSCRIBE_BADGE_WIDTH = 460
 SUBSCRIBE_BADGE_HEIGHT = 120
 
+# Facebook has no "subscribe" concept, so the YouTube-branded spoken CTA
+# ("don't forget to subscribe") and "SUBSCRIBE" end card read oddly there
+# (2026-08-19, user request). A handful of platform-native variants,
+# picked at random per run for some variety - same treatment "smash that
+# like button" gets flagged as generic phrasing for the main script, but
+# this is a short branding beat, not the story itself.
+FACEBOOK_CTA_LINES = [
+    "If this hit home, like this video, share it with someone who needs it, and follow MindByte for more.",
+    "Like this video, hit share, and follow MindByte so you don't miss the next one.",
+    "Give this a like, share it with a friend, and follow MindByte for more like it.",
+    "Show this some love with a like, share it around, and follow MindByte for more.",
+]
+
+
+def pick_facebook_cta_line() -> str:
+    return random.choice(FACEBOOK_CTA_LINES)
+
 
 def build_subscribe_badge(dest_path: str, pillar: str,
                            width: int = VIDEO_WIDTH,
-                           height: int = VIDEO_HEIGHT) -> None:
+                           height: int = VIDEO_HEIGHT,
+                           headline: str = "SUBSCRIBE",
+                           subline: str = "For More") -> None:
     """Full-screen, on-brand "Subscribe for More" end card, shown for the
     last SUBSCRIBE_BADGE_SECONDS of every video (2026-08-01, revised same
     day after user feedback that the original small corner badge didn't
@@ -1785,13 +1804,11 @@ def build_subscribe_badge(dest_path: str, pillar: str,
     draw.rectangle([width / 2 - bar_w / 2, bar_y, width / 2 + bar_w / 2, bar_y + 6], fill=accent)
 
     headline_font = _brand_font(int(scale * 0.09))
-    headline = "SUBSCRIBE"
     hb = draw.textbbox((0, 0), headline, font=headline_font)
     hw = hb[2] - hb[0]
     draw.text((width / 2 - hw / 2, bar_y + int(scale * 0.04)), headline, font=headline_font, fill=(255, 255, 255))
 
     subline_font = _brand_font(int(scale * 0.045))
-    subline = "For More"
     sb = draw.textbbox((0, 0), subline, font=subline_font)
     sw = sb[2] - sb[0]
     draw.text((width / 2 - sw / 2, bar_y + int(scale * 0.04) + int(scale * 0.13)), subline,
@@ -3114,18 +3131,76 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001 - TikTok posting must never abort the run
             print(f"[pipeline] TikTok posting failed unexpectedly, continuing: {e}")
 
-        # Facebook Page cross-post (added 2026-08-19) - same best-effort
-        # pattern as TikTok: never raises, must run before the temp dir
-        # (and output_path) is cleaned up.
+        # Facebook Page cross-post (added 2026-08-19, revised same day to
+        # use platform-native CTA language instead of YouTube's "Subscribe"
+        # framing - Facebook has no subscribe concept). Builds a SEPARATE
+        # Facebook variant of the video: same story clips/voiceover as the
+        # YouTube cut, but with the closing beat re-recorded as a
+        # "like/share/follow" line and a matching end card, instead of
+        # reusing the YouTube file as-is. Best-effort like every other
+        # cross-post - any failure here must never touch the YouTube
+        # upload that already succeeded above, and the extra render only
+        # happens when Facebook is actually configured.
         try:
-            from facebook_publish import post_short_to_facebook
-            facebook_result = post_short_to_facebook(output_path, script["title"], description)
-            if facebook_result["status"] == "skipped":
-                print(f"[pipeline] Facebook: skipped ({facebook_result['reason']})")
-            elif facebook_result["posted"]:
-                print(f"[pipeline] Facebook: posted (video_id={facebook_result['video_id']})")
+            from facebook_publish import facebook_configured, post_short_to_facebook
+            if not facebook_configured():
+                print("[pipeline] Facebook: skipped (secrets not configured yet)")
             else:
-                print(f"[pipeline] Facebook: not posted - status={facebook_result['status']} reason={facebook_result['reason']}")
+                story_sentence_count = len(script["sentences"])
+                fb_cta_line = pick_facebook_cta_line()
+                fb_spoken_sentences = list(script["sentences"]) + [fb_cta_line]
+                # Reuse the story's own B-roll for the CTA beat (same
+                # "continues the last shot" approach as the YouTube cta_line)
+                # instead of spending an extra gather_clips() call on a
+                # throwaway closing shot.
+                fb_clip_paths = list(clip_paths[:story_sentence_count]) + [clip_paths[-1]]
+
+                fb_audio_path, fb_segment_durations = generate_voiceover_segments(
+                    fb_spoken_sentences, workdir, pillar,
+                )
+                fb_audio_duration = ffprobe_duration(fb_audio_path)
+                fb_final_audio_path = fb_audio_path
+                fb_music_path = os.path.join(workdir, "fb_music.mp3")
+                fb_music_meta = fetch_background_music(fb_music_path, pillar)
+                if fb_music_meta:
+                    fb_mixed_path = os.path.join(workdir, "fb_voiceover_mixed.mp3")
+                    try:
+                        mix_background_music(fb_audio_path, fb_music_path, fb_audio_duration, fb_mixed_path)
+                        fb_final_audio_path = fb_mixed_path
+                    except Exception as e:  # noqa: BLE001 - music mix must never abort the run
+                        print(f"[pipeline] Facebook music mix failed, continuing without music: {e}")
+                fb_mastered_audio_path = os.path.join(workdir, "fb_voiceover_mastered.mp3")
+                try:
+                    master_audio(fb_final_audio_path, fb_mastered_audio_path, fb_audio_duration)
+                    fb_final_audio_path = fb_mastered_audio_path
+                except Exception as e:  # noqa: BLE001 - mastering must never abort the run
+                    print(f"[pipeline] Facebook audio mastering failed, continuing unmastered: {e}")
+
+                fb_badge_path = os.path.join(workdir, "fb_badge.png")
+                try:
+                    build_subscribe_badge(fb_badge_path, pillar,
+                                           headline="LIKE + SHARE",
+                                           subline="Follow @MindByte")
+                except Exception as e:  # noqa: BLE001 - branding must never abort the run
+                    print(f"[pipeline] Facebook end card failed, continuing without it: {e}")
+                    fb_badge_path = None
+
+                fb_ass_path = os.path.join(workdir, "fb_captions.ass")
+                build_ass(fb_spoken_sentences, fb_segment_durations, fb_ass_path)
+
+                fb_output_path = os.path.join(workdir, "facebook_final.mp4")
+                assemble_video(fb_clip_paths, fb_segment_durations, fb_final_audio_path,
+                                fb_ass_path, fb_output_path,
+                                title_card_path=title_card_path, watermark_path=watermark_path,
+                                subscribe_badge_path=fb_badge_path)
+
+                facebook_result = post_short_to_facebook(fb_output_path, script["title"], "")
+                if facebook_result["status"] == "skipped":
+                    print(f"[pipeline] Facebook: skipped ({facebook_result['reason']})")
+                elif facebook_result["posted"]:
+                    print(f"[pipeline] Facebook: posted (video_id={facebook_result['video_id']})")
+                else:
+                    print(f"[pipeline] Facebook: not posted - status={facebook_result['status']} reason={facebook_result['reason']}")
         except Exception as e:  # noqa: BLE001 - Facebook posting must never abort the run
             print(f"[pipeline] Facebook posting failed unexpectedly, continuing: {e}")
 
