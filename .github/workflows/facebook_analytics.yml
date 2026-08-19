@@ -1,0 +1,50 @@
+name: Facebook Analytics Sync
+
+on:
+  # Added 2026-08-19. Runs daily, offset from the YouTube Analytics Sync
+  # (06:00 UTC) so the two don't compete for the same runner slot, and
+  # after enough of the day's Facebook posts have had a few hours to
+  # accumulate plays/engagement before being snapshotted.
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        # facebook_analytics.py imports pipeline.py for its Sheets/OAuth
+        # helpers, so it needs the full dependency set, not just `requests`
+        # (unlike analytics_sync.py, which is fully self-contained).
+        run: pip install -r requirements.txt
+
+      - name: Run Facebook analytics sync
+        env:
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          YOUTUBE_CHANNEL_ID: ${{ secrets.YOUTUBE_CHANNEL_ID }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+          FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+        run: python facebook_analytics.py
+
+      - name: Alert on failure
+        if: failure()
+        uses: ./.github/actions/alert-on-failure
+        with:
+          workflow-name: "Facebook Analytics Sync"
+          github-token: ${{ secrets.GITHUB_TOKEN }}

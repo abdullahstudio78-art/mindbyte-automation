@@ -1,0 +1,88 @@
+name: Publish Facebook Reel
+
+on:
+  # Added 2026-08-19 per explicit user request: 5 Facebook Reels/day,
+  # decoupled from YouTube's own 2/day cadence. 2 of the 5 already happen
+  # "for free" as a byproduct of publish.yml's Facebook cross-post (fires
+  # at 02:00 and 14:00 UTC alongside each YouTube Short). THIS workflow
+  # supplies the other 3/day, independently - own topic, own script, own
+  # footage, own render, own post, no YouTube upload involved - so the
+  # combined schedule across both workflows is:
+  #   02:00 UTC - publish.yml (YouTube Short + Facebook cross-post)
+  #   06:00 UTC - publish_facebook.yml (Facebook only)
+  #   10:00 UTC - publish_facebook.yml (Facebook only)
+  #   14:00 UTC - publish.yml (YouTube Short + Facebook cross-post)
+  #   18:00 UTC - publish_facebook.yml (Facebook only)
+  # = 5 Facebook posts/day, spread across the day rather than clustered,
+  # same reasoning as publish.yml's own 12h-apart spacing.
+  schedule:
+    - cron: '0 6 * * *'
+    - cron: '0 10 * * *'
+    - cron: '0 18 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg
+        # Same static-binary approach as publish.yml (2026-08-19 fix for
+        # apt-mirror flakiness - see that workflow's comment for the full
+        # history/reasoning). Kept in sync between the two workflows.
+        timeout-minutes: 5
+        run: |
+          set -e
+          if curl -fL --retry 3 --retry-delay 5 -o /tmp/ffmpeg.tar.xz \
+              https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz; then
+            mkdir -p /tmp/ffmpeg-extract
+            tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
+            sudo mv /tmp/ffmpeg-extract/ffmpeg /tmp/ffmpeg-extract/ffprobe /usr/local/bin/
+            ffmpeg -version
+          else
+            echo "[ffmpeg install] static build download failed, falling back to apt"
+            for i in 1 2 3; do
+              sudo apt-get update && sudo apt-get install -y ffmpeg && exit 0
+              echo "[ffmpeg install] apt attempt $i failed, retrying in 10s"
+              sleep 10
+            done
+            echo "[ffmpeg install] all attempts failed"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Facebook-only pipeline
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          # OAuth/Sheet creds are needed even though this workflow never
+          # touches YouTube upload - facebook_pipeline.py reuses
+          # pipeline.py's Sheets-backed topic selection, VideoMeta-style
+          # logging, and CTA/structure rotation helpers, all of which read
+          # from the same Google Sheet as the YouTube pipeline.
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          YOUTUBE_CHANNEL_ID: ${{ secrets.YOUTUBE_CHANNEL_ID }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+          FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+        run: python facebook_pipeline.py
+
+      - name: Alert on failure
+        if: failure()
+        uses: ./.github/actions/alert-on-failure
+        with:
+          workflow-name: "Publish Facebook Reel"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
