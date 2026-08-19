@@ -3201,6 +3201,28 @@ def main() -> None:
                     print(f"[pipeline] Facebook: skipped ({facebook_result['reason']})")
                 elif facebook_result["posted"]:
                     print(f"[pipeline] Facebook: posted (video_id={facebook_result['video_id']})")
+                    # Log this "free" cross-post the same way facebook_pipeline.py's
+                    # dedicated Facebook-only runs do (added 2026-08-19, part of
+                    # the Facebook analytics/weekly-review loop) - so
+                    # facebook_analytics.py has a FacebookVideoID to pull
+                    # Insights for, and facebook_weekly_review.py can factor
+                    # this post into its pattern analysis exactly like the 3
+                    # dedicated Facebook-only posts/day. Deferred import (not
+                    # at module top) since facebook_pipeline.py itself imports
+                    # this module - by call time pipeline.py is already fully
+                    # loaded, so this is safe and avoids a circular import.
+                    try:
+                        from facebook_pipeline import log_facebook_video_meta
+                        try:
+                            fb_video_length_sec = ffprobe_video_info(fb_output_path).get("duration") or fb_audio_duration
+                        except Exception:
+                            fb_video_length_sec = fb_audio_duration
+                        log_facebook_video_meta(
+                            access_token, facebook_result["video_id"], script["title"], topic, pillar,
+                            script, structure_tag, fb_video_length_sec, cta_style,
+                        )
+                    except Exception as e:  # noqa: BLE001 - logging must never abort the run
+                        print(f"[pipeline] could not log FacebookVideoMeta for cross-post: {e}")
                 else:
                     print(f"[pipeline] Facebook: not posted - status={facebook_result['status']} reason={facebook_result['reason']}")
         except Exception as e:  # noqa: BLE001 - Facebook posting must never abort the run
