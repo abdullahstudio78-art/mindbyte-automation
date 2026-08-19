@@ -3114,6 +3114,21 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001 - TikTok posting must never abort the run
             print(f"[pipeline] TikTok posting failed unexpectedly, continuing: {e}")
 
+        # Facebook Page cross-post (added 2026-08-19) - same best-effort
+        # pattern as TikTok: never raises, must run before the temp dir
+        # (and output_path) is cleaned up.
+        try:
+            from facebook_publish import post_short_to_facebook
+            facebook_result = post_short_to_facebook(output_path, script["title"], description)
+            if facebook_result["status"] == "skipped":
+                print(f"[pipeline] Facebook: skipped ({facebook_result['reason']})")
+            elif facebook_result["posted"]:
+                print(f"[pipeline] Facebook: posted (video_id={facebook_result['video_id']})")
+            else:
+                print(f"[pipeline] Facebook: not posted - status={facebook_result['status']} reason={facebook_result['reason']}")
+        except Exception as e:  # noqa: BLE001 - Facebook posting must never abort the run
+            print(f"[pipeline] Facebook posting failed unexpectedly, continuing: {e}")
+
     sheet_row_base[0] = video_id
     sheet_row_base[3] = "Scheduled"
     sheet_row_base[5] = publish_at.isoformat()
