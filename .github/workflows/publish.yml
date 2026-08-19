@@ -37,21 +37,40 @@ jobs:
 
       - name: Install ffmpeg
         # 2026-08-19: run #97 hung on apt-get for the full 30min job
-        # timeout and got silently cancelled - no video published, no
-        # failure alert (a cancelled run isn't a "failure" conclusion, so
-        # alert-on-failure's `if: failure()` never fired either). Added a
-        # dedicated step timeout so a hung apt mirror fails fast, plus a
-        # 3-attempt retry for transient mirror flakiness, instead of
-        # silently eating the whole job budget.
+        # timeout and got silently cancelled. Added a dedicated step
+        # timeout + apt retry loop as a first fix - but run #101 showed
+        # that doesn't actually fix a slow/stalled apt mirror: retrying
+        # `apt-get update` 3 times just re-hits the same flaky mirror and
+        # still burns the whole 5-minute step budget with nothing to show
+        # for it (annotation: "The action 'Install ffmpeg' has timed out
+        # after 5 minutes").
+        #
+        # Real fix: stop depending on apt mirrors for this at all. Pull a
+        # static, self-contained ffmpeg build directly from a CDN
+        # (johnvansickle.com's well-known static builds, used widely in
+        # CI for exactly this reason) - one file download instead of an
+        # apt-get update against a package index, so it isn't exposed to
+        # mirror sync/availability flakiness. Falls back to apt only if
+        # the static download itself fails.
         timeout-minutes: 5
         run: |
-          for i in 1 2 3; do
-            sudo apt-get update && sudo apt-get install -y ffmpeg && exit 0
-            echo "[ffmpeg install] attempt $i failed, retrying in 10s"
-            sleep 10
-          done
-          echo "[ffmpeg install] all attempts failed"
-          exit 1
+          set -e
+          if curl -fL --retry 3 --retry-delay 5 -o /tmp/ffmpeg.tar.xz \
+              https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz; then
+            mkdir -p /tmp/ffmpeg-extract
+            tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
+            sudo mv /tmp/ffmpeg-extract/ffmpeg /tmp/ffmpeg-extract/ffprobe /usr/local/bin/
+            ffmpeg -version
+          else
+            echo "[ffmpeg install] static build download failed, falling back to apt"
+            for i in 1 2 3; do
+              sudo apt-get update && sudo apt-get install -y ffmpeg && exit 0
+              echo "[ffmpeg install] apt attempt $i failed, retrying in 10s"
+              sleep 10
+            done
+            echo "[ffmpeg install] all attempts failed"
+            exit 1
+          fi
 
       - name: Install dependencies
         run: pip install -r requirements.txt
