@@ -69,11 +69,23 @@ FACEBOOK_CAPTION_LIMIT = 2200  # Meta's stated Reels description limit
 def _tag_to_hashtag(tag: str) -> str | None:
     """'relationship psychology' -> '#RelationshipPsychology'. Drops
     anything that doesn't reduce to at least one real word, or that would
-    make an unreasonably long/short hashtag."""
-    words = re.findall(r"[A-Za-z0-9]+", tag)
-    if not words:
-        return None
-    hashtag = "#" + "".join(w.capitalize() for w in words)
+    make an unreasonably long/short hashtag.
+
+    If `tag` already looks like a formed hashtag (starts with '#', no
+    spaces - e.g. an inline hashtag pulled out of the AI-written
+    description, already correctly camelCased as '#EmotionalIntelligence'),
+    it's returned as-is rather than run through the word-capitalize path
+    below, which would lowercase everything after the first letter and
+    destroy the camelCase ('#EmotionalIntelligence' -> '#Emotionalintelligence' -
+    caught during testing on the first real post, 2026-08-19)."""
+    tag = tag.strip()
+    if tag.startswith("#") and re.fullmatch(r"#[A-Za-z0-9_]+", tag):
+        hashtag = tag
+    else:
+        words = re.findall(r"[A-Za-z0-9]+", tag)
+        if not words:
+            return None
+        hashtag = "#" + "".join(w.capitalize() for w in words)
     if len(hashtag) < 4 or len(hashtag) > 30:
         return None
     return hashtag
@@ -113,10 +125,38 @@ def build_facebook_caption(title: str, description: str, tags: list) -> str:
         if not re.match(r"^\s*(Music:|Video by|Photo by)", line, re.IGNORECASE)
     ]
     description = "\n".join(clean_lines).strip()
-    # Collapse the blank-line gaps left behind by stripped attribution lines.
+
+    # The Groq-written SEO description sometimes already ends with its own
+    # inline hashtags (e.g. "...boost your mental control.
+    # #EmotionalIntelligence #Psychology #MindByte") - confirmed live on the
+    # first real post (2026-08-19, video_id=2239326366890562), where that
+    # produced TWO separate hashtag blocks stacked on top of each other.
+    # Pull any hashtag-only lines/trailing hashtag runs out of the
+    # description text itself and feed them into the same dedup pool as the
+    # tag-derived hashtags below, so everything collapses into one clean
+    # hashtag line with no repeats, keeping the description's own wording
+    # otherwise untouched.
+    inline_hashtags = []
+
+    def _pull_trailing_hashtags(line: str) -> str:
+        match = re.match(r"^(.*?)((?:\s*#[A-Za-z0-9_]+)+)\s*$", line)
+        if match and match.group(1).strip():
+            inline_hashtags.extend(re.findall(r"#[A-Za-z0-9_]+", match.group(2)))
+            return match.group(1).rstrip()
+        return line
+
+    kept_lines = []
+    for line in description.splitlines():
+        stripped = line.strip()
+        if stripped and re.fullmatch(r"(?:#[A-Za-z0-9_]+\s*)+", stripped):
+            inline_hashtags.extend(re.findall(r"#[A-Za-z0-9_]+", stripped))
+            continue
+        kept_lines.append(_pull_trailing_hashtags(line))
+    description = "\n".join(kept_lines).strip()
+    # Collapse the blank-line gaps left behind by stripped attribution/hashtag lines.
     description = re.sub(r"\n{3,}", "\n\n", description)
 
-    hashtags = _build_hashtags(tags)
+    hashtags = _build_hashtags(list(tags or []) + inline_hashtags)
 
     parts = []
     if title:
