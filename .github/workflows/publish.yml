@@ -36,7 +36,22 @@ jobs:
           python-version: '3.11'
 
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        # 2026-08-19: run #97 hung on apt-get for the full 30min job
+        # timeout and got silently cancelled - no video published, no
+        # failure alert (a cancelled run isn't a "failure" conclusion, so
+        # alert-on-failure's `if: failure()` never fired either). Added a
+        # dedicated step timeout so a hung apt mirror fails fast, plus a
+        # 3-attempt retry for transient mirror flakiness, instead of
+        # silently eating the whole job budget.
+        timeout-minutes: 5
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y ffmpeg && exit 0
+            echo "[ffmpeg install] attempt $i failed, retrying in 10s"
+            sleep 10
+          done
+          echo "[ffmpeg install] all attempts failed"
+          exit 1
 
       - name: Install dependencies
         run: pip install -r requirements.txt

@@ -32,7 +32,18 @@ jobs:
           python-version: '3.11'
 
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        # 2026-08-19: same fix as publish.yml - a hung apt mirror should
+        # fail fast (and trigger alert-on-failure) rather than silently
+        # eating the whole job's timeout and getting cancelled.
+        timeout-minutes: 5
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y ffmpeg && exit 0
+            echo "[ffmpeg install] attempt $i failed, retrying in 10s"
+            sleep 10
+          done
+          echo "[ffmpeg install] all attempts failed"
+          exit 1
 
       - name: Install dependencies
         run: pip install -r requirements.txt
