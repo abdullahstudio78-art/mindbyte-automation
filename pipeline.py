@@ -78,6 +78,28 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_MODEL_FALLBACKS = ["openai/gpt-oss-20b"]
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
+# 2026-08-21: added after the 2026-08-18 outage as a second layer of
+# protection - GROQ_MODEL_FALLBACKS only helps when Groq still works but one
+# *model* is gone. If Groq itself is down/rate-limited account-wide, every
+# model in that list fails together. These are OPTIONAL free-tier providers
+# (all read via os.environ.get, so the pipeline runs exactly as before if
+# they're never set) that call_groq() tries, in order, only after every
+# configured Groq model has been exhausted. Free API keys:
+#   Gemini:   https://aistudio.google.com/apikey  (Google account, no card)
+#   Cerebras: https://cloud.cerebras.ai/           (free tier, no card)
+#   OpenRouter free models: https://openrouter.ai/keys (no card)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+CEREBRAS_MODEL = "llama-3.3-70b"
+CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
 PUBLISH_DELAY_HOURS = 18  # rolling safety delay before a video goes public
 VIDEO_WIDTH = 1080
 VIDEO_HEIGHT = 1920
@@ -744,6 +766,87 @@ def discover_live_groq_fallback_model(exclude: set) -> str:
         return ""
 
 
+def _call_gemini(prompt: str) -> str:
+    """Free-tier Gemini fallback. Raises on any failure/misconfiguration so
+    the caller can move on to the next provider in the chain."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not configured")
+    resp = SESSION.post(
+        f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text": prompt + "\n\nRespond with ONLY valid JSON, no markdown fences, no commentary."}]}],
+            "generationConfig": {"temperature": 0.9, "responseMimeType": "application/json"},
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def _call_cerebras(prompt: str) -> str:
+    """Free-tier Cerebras fallback (same OpenAI-style chat schema as Groq)."""
+    if not CEREBRAS_API_KEY:
+        raise RuntimeError("CEREBRAS_API_KEY not configured")
+    resp = SESSION.post(
+        CEREBRAS_URL,
+        headers={
+            "Authorization": f"Bearer {CEREBRAS_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": CEREBRAS_MODEL,
+            "messages": [{"role": "user", "content": prompt + "\n\nRespond with ONLY valid JSON."}],
+            "temperature": 0.9,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def _call_openrouter(prompt: str) -> str:
+    """Free-tier OpenRouter fallback (":free" model, OpenAI-style schema)."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY not configured")
+    resp = SESSION.post(
+        OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": OPENROUTER_MODEL,
+            "messages": [{"role": "user", "content": prompt + "\n\nRespond with ONLY valid JSON."}],
+            "temperature": 0.9,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def _call_fallback_providers(prompt: str, groq_exc: Exception):
+    """Tried, in order, only after every configured Groq model has failed.
+    Each is optional (skipped silently if its API key isn't set) - added
+    2026-08-21 so an account-wide Groq outage/rate-limit can no longer take
+    the whole publishing pipeline down the way the 2026-08-18 incident did.
+    Returns the text content on the first provider that succeeds, or
+    re-raises the original Groq exception if every fallback also fails."""
+    for name, fn in (("Gemini", _call_gemini), ("Cerebras", _call_cerebras), ("OpenRouter", _call_openrouter)):
+        try:
+            content = fn(prompt)
+            print(f"[pipeline] Groq unavailable - fell back to {name} successfully")
+            return content
+        except Exception as exc:
+            print(f"[pipeline] fallback provider {name} also failed/unconfigured: {exc}")
+            continue
+    raise groq_exc
+
+
 def call_groq(prompt: str, _retries: int = 2) -> str:
     """Same Groq call as before, now with retry-with-backoff on a 429
     (added 2026-07-19 after long-form run #2: the free/on-demand tier's
@@ -824,7 +927,9 @@ def call_groq(prompt: str, _retries: int = 2) -> str:
                 break
             data = resp.json()
             return data["choices"][0]["message"]["content"]
-    raise last_exc
+    if last_exc is None:
+        last_exc = RuntimeError("All configured Groq models unavailable (404) and no live fallback model could be discovered")
+    return _call_fallback_providers(prompt, last_exc)
 
 
 # ---------------------------------------------------------------------------
