@@ -36,26 +36,39 @@ jobs:
           python-version: '3.11'
 
       - name: Install ffmpeg
-        # Same static-binary approach as publish.yml (2026-08-19 fix for
-        # apt-mirror flakiness - see that workflow's comment for the full
-        # history/reasoning). Kept in sync between the two workflows.
-        timeout-minutes: 5
+        # Same bounded-timeout, multi-source approach as publish.yml
+        # (2026-08-19, revised after run #106 showed the static-binary CDN
+        # itself can have a connectivity blip with no bounded timeout on
+        # the attempt - see that workflow's comment for the full history).
+        # Kept in sync between the two workflows.
+        timeout-minutes: 6
         run: |
           set -e
-          if curl -fL --retry 3 --retry-delay 5 -o /tmp/ffmpeg.tar.xz \
-              https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz; then
+          install_static() {
+            curl -fL --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 3 \
+              -o /tmp/ffmpeg.tar.xz "$1" || return 1
             mkdir -p /tmp/ffmpeg-extract
             tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
             sudo mv /tmp/ffmpeg-extract/ffmpeg /tmp/ffmpeg-extract/ffprobe /usr/local/bin/
+          }
+
+          if install_static "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"; then
+            echo "[ffmpeg install] installed via johnvansickle.com"
+            ffmpeg -version
+          elif install_static "https://www.johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"; then
+            echo "[ffmpeg install] installed via www.johnvansickle.com (primary host was unreachable)"
             ffmpeg -version
           else
-            echo "[ffmpeg install] static build download failed, falling back to apt"
-            for i in 1 2 3; do
-              sudo apt-get update && sudo apt-get install -y ffmpeg && exit 0
-              echo "[ffmpeg install] apt attempt $i failed, retrying in 10s"
-              sleep 10
+            echo "[ffmpeg install] static build sources unreachable - falling back to apt (bounded per attempt)"
+            for i in 1 2; do
+              if timeout 90 sudo apt-get update && timeout 90 sudo apt-get install -y ffmpeg; then
+                ffmpeg -version
+                exit 0
+              fi
+              echo "[ffmpeg install] apt attempt $i failed/timed out, retrying in 5s"
+              sleep 5
             done
-            echo "[ffmpeg install] all attempts failed"
+            echo "[ffmpeg install] all sources failed"
             exit 1
           fi
 
