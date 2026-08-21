@@ -15,6 +15,13 @@ jobs:
   generate:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # 2026-08-21: this workflow had NO failure alerting at all - a broken
+    # run here (Groq down, Sheets auth expired, whatever) would fail
+    # completely silently, forever, with zero notification. Added the same
+    # alert-on-failure step every other workflow already has.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
 
@@ -23,9 +30,18 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        timeout-minutes: 5
+        run: |
+          for i in 1 2 3; do
+            timeout 90 pip install requests && exit 0
+            echo "[pip install] attempt $i failed/timed out, retrying in 5s"
+            sleep 5
+          done
+          echo "[pip install] all attempts failed"
+          exit 1
 
       - name: Draft a new comment batch (writes drafts only, never posts)
+        timeout-minutes: 15
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
@@ -39,3 +55,10 @@ jobs:
         run: |
           echo "::notice::New batch drafted into the CommentQueue sheet tab as pending_review."
           echo "::notice::Nothing will be posted until you set Approved=TRUE on the rows you want published."
+
+      - name: Alert on failure
+        if: failure()
+        uses: ./.github/actions/alert-on-failure
+        with:
+          workflow-name: "Community Engagement - Generate Batch"
+          github-token: ${{ secrets.GITHUB_TOKEN }}

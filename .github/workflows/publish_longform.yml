@@ -32,23 +32,61 @@ jobs:
           python-version: '3.11'
 
       - name: Install ffmpeg
-        # 2026-08-19: same fix as publish.yml - a hung apt mirror should
-        # fail fast (and trigger alert-on-failure) rather than silently
-        # eating the whole job's timeout and getting cancelled.
+        # 2026-08-21: this had only ever gotten the FIRST fix (apt retry
+        # loop), not the later static-binary fix applied to publish.yml
+        # after run #101/#106 showed apt/CDN mirrors can each hang or have
+        # connectivity blips with no bounded timeout. Brought in sync with
+        # publish.yml's current approach - see that workflow's comment for
+        # the full history.
+        timeout-minutes: 6
+        run: |
+          set -e
+          install_static() {
+            curl -fL --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 3 \
+              -o /tmp/ffmpeg.tar.xz "$1" || return 1
+            mkdir -p /tmp/ffmpeg-extract
+            tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
+            sudo mv /tmp/ffmpeg-extract/ffmpeg /tmp/ffmpeg-extract/ffprobe /usr/local/bin/
+          }
+
+          if install_static "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"; then
+            echo "[ffmpeg install] installed via johnvansickle.com"
+            ffmpeg -version
+          elif install_static "https://www.johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"; then
+            echo "[ffmpeg install] installed via www.johnvansickle.com (primary host was unreachable)"
+            ffmpeg -version
+          else
+            echo "[ffmpeg install] static build sources unreachable - falling back to apt (bounded per attempt)"
+            for i in 1 2; do
+              if timeout 90 sudo apt-get update && timeout 90 sudo apt-get install -y ffmpeg; then
+                ffmpeg -version
+                exit 0
+              fi
+              echo "[ffmpeg install] apt attempt $i failed/timed out, retrying in 5s"
+              sleep 5
+            done
+            echo "[ffmpeg install] all sources failed"
+            exit 1
+          fi
+
+      - name: Install dependencies
         timeout-minutes: 5
         run: |
           for i in 1 2 3; do
-            sudo apt-get update && sudo apt-get install -y ffmpeg && exit 0
-            echo "[ffmpeg install] attempt $i failed, retrying in 10s"
-            sleep 10
+            timeout 90 pip install -r requirements.txt && exit 0
+            echo "[pip install] attempt $i failed/timed out, retrying in 5s"
+            sleep 5
           done
-          echo "[ffmpeg install] all attempts failed"
+          echo "[pip install] all attempts failed"
           exit 1
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
       - name: Run long-form pipeline
+        # 2026-08-21: same fix as publish.yml's "Run pipeline" step - give
+        # this its own bounded timeout (well under the job's 75-minute
+        # ceiling) so a stall fails as a real "failure" (alerting fires)
+        # instead of silently hitting the job timeout and getting
+        # "cancelled" (which if: failure() below would NOT catch).
+        timeout-minutes: 65
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}

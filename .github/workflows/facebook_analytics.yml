@@ -27,9 +27,18 @@ jobs:
         # facebook_analytics.py imports pipeline.py for its Sheets/OAuth
         # helpers, so it needs the full dependency set, not just `requests`
         # (unlike analytics_sync.py, which is fully self-contained).
-        run: pip install -r requirements.txt
+        timeout-minutes: 5
+        run: |
+          for i in 1 2 3; do
+            timeout 90 pip install -r requirements.txt && exit 0
+            echo "[pip install] attempt $i failed/timed out, retrying in 5s"
+            sleep 5
+          done
+          echo "[pip install] all attempts failed"
+          exit 1
 
       - name: Run Facebook analytics sync
+        timeout-minutes: 12
         env:
           OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
           OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}

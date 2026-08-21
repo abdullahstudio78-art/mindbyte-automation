@@ -17,6 +17,11 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # 2026-08-21: this workflow had no failure alerting at all - fixed the
+    # same way as every other workflow (see publish.yml's history).
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
 
@@ -25,9 +30,18 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        timeout-minutes: 5
+        run: |
+          for i in 1 2 3; do
+            timeout 90 pip install requests && exit 0
+            echo "[pip install] attempt $i failed/timed out, retrying in 5s"
+            sleep 5
+          done
+          echo "[pip install] all attempts failed"
+          exit 1
 
       - name: Publish today's approved, scheduled comments (up to the daily limit)
+        timeout-minutes: 15
         env:
           OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
           OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
@@ -35,3 +49,10 @@ jobs:
           YOUTUBE_CHANNEL_ID: ${{ secrets.YOUTUBE_CHANNEL_ID }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
         run: python community_engagement.py publish
+
+      - name: Alert on failure
+        if: failure()
+        uses: ./.github/actions/alert-on-failure
+        with:
+          workflow-name: "Community Engagement - Publish Approved Comments"
+          github-token: ${{ secrets.GITHUB_TOKEN }}

@@ -23,9 +23,18 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        timeout-minutes: 5
+        run: |
+          for i in 1 2 3; do
+            timeout 90 pip install requests && exit 0
+            echo "[pip install] attempt $i failed/timed out, retrying in 5s"
+            sleep 5
+          done
+          echo "[pip install] all attempts failed"
+          exit 1
 
       - name: Run weekly content review
+        timeout-minutes: 12
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}

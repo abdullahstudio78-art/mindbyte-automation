@@ -91,9 +91,36 @@ jobs:
           fi
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        # Bounded the same way as ffmpeg above (2026-08-21) - a stalled
+        # PyPI mirror would otherwise be able to eat the whole job here too.
+        timeout-minutes: 5
+        run: |
+          for i in 1 2 3; do
+            timeout 90 pip install -r requirements.txt && exit 0
+            echo "[pip install] attempt $i failed/timed out, retrying in 5s"
+            sleep 5
+          done
+          echo "[pip install] all attempts failed"
+          exit 1
 
       - name: Run pipeline
+        # 2026-08-21: runs #97 and #104 both silently ran the full 30-minute
+        # JOB timeout and got cancelled - no video, no failure email, nothing
+        # in the run log past the first line. Root cause: this step had no
+        # timeout of its own, so when something inside pipeline.py stalls
+        # (most likely Groq API rate-limit backoffs compounding across the
+        # several chained calls a single run makes - topic idea-scoring,
+        # script generation/retries, storyboard, compliance - each with its
+        # own legitimate wait-and-retry logic that can stack up under
+        # sustained throttling), the only thing that ever stopped it was the
+        # JOB's 30-minute ceiling. A job that hits ITS OWN timeout is marked
+        # "cancelled", and `if: failure()` below does NOT fire for a
+        # cancelled run - so these two runs failed completely silently.
+        # Giving this step its own shorter timeout fixes that: when a STEP
+        # times out, the step (and job) conclusion is "failure", not
+        # "cancelled" - so the Alert on failure step below actually fires
+        # and emails a real notification instead of going dark.
+        timeout-minutes: 22
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}

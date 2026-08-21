@@ -12,6 +12,11 @@ jobs:
   external_trends:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # 2026-08-21: this workflow had no failure alerting at all - fixed the
+    # same way as every other workflow (see publish.yml's history).
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
 
@@ -20,12 +25,28 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        timeout-minutes: 5
+        run: |
+          for i in 1 2 3; do
+            timeout 90 pip install requests && exit 0
+            echo "[pip install] attempt $i failed/timed out, retrying in 5s"
+            sleep 5
+          done
+          echo "[pip install] all attempts failed"
+          exit 1
 
       - name: Run external trend learning
+        timeout-minutes: 8
         env:
           OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
           OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
           OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
         run: python external_trends.py
+
+      - name: Alert on failure
+        if: failure()
+        uses: ./.github/actions/alert-on-failure
+        with:
+          workflow-name: "External Trend Learning"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
