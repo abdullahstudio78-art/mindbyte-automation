@@ -28,6 +28,8 @@ jobs:
     permissions:
       contents: read
       issues: write
+    env:
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -120,7 +122,21 @@ jobs:
         # times out, the step (and job) conclusion is "failure", not
         # "cancelled" - so the Alert on failure step below actually fires
         # and emails a real notification instead of going dark.
-        timeout-minutes: 22
+        #
+        # 2026-08-22: run #110 (scheduled) hit exactly this 22-minute limit
+        # and got killed - but the log showed ZERO output the whole time,
+        # which turned out to be a red herring: Python buffers stdout fully
+        # when it isn't attached to a terminal (always true on a GitHub
+        # Actions runner), so a perfectly normal run can show a blank log
+        # right up until the buffer flushes or the process exits. Added
+        # PYTHONUNBUFFERED=1 at the job level below so future runs show
+        # real-time progress instead of a wall of silence, and bumped this
+        # from 22 to 26 minutes - some legitimate runs (slow stock-footage
+        # fetches, TTS, ffmpeg render) can run past 22 minutes without
+        # anything actually being stuck; 26 leaves a ~3.5 minute safety
+        # margin under the 30-minute job ceiling for setup/install/alert
+        # steps while giving normal runs more breathing room.
+        timeout-minutes: 26
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

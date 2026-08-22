@@ -28,6 +28,8 @@ jobs:
     permissions:
       contents: read
       issues: write
+    env:
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -92,7 +94,12 @@ jobs:
         # cancelled with no failure email" risk. See publish.yml's comment
         # for the full explanation of why a step-level timeout (not just the
         # job-level one) is what makes the Alert-on-failure step actually fire.
-        timeout-minutes: 22
+        #
+        # 2026-08-22: bumped 22->26 (see publish.yml's matching comment) -
+        # PYTHONUNBUFFERED=1 added at job level so a stall is actually
+        # visible in logs, and 26 gives normal-but-slow runs more room
+        # while still leaving safety margin under the 30-min job ceiling.
+        timeout-minutes: 26
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
