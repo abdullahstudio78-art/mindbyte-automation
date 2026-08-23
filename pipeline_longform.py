@@ -770,7 +770,7 @@ def generate_voiceover_paragraphs(paragraphs: list, workdir: str, pillar: str) -
             "-t", f"{gap_seconds:.3f}", "-c:a", "libmp3lame", "-q:a", "4",
             silence_path,
         ],
-        check=True, capture_output=True,
+        check=True, capture_output=True, timeout=30,
     )
 
     concat_list = os.path.join(workdir, "voice_concat_lf.txt")
@@ -786,7 +786,7 @@ def generate_voiceover_paragraphs(paragraphs: list, workdir: str, pillar: str) -
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
             "-c:a", "libmp3lame", "-q:a", "4", combined_path,
         ],
-        check=True, capture_output=True,
+        check=True, capture_output=True, timeout=120,
     )
     return combined_path, segment_durations
 
@@ -1002,7 +1002,7 @@ def build_thumbnail_longform(dest_path: str, title: str, pillar: str,
                            "vignette=PI/6",
                     dest_path,
                 ],
-                check=True, capture_output=True,
+                check=True, capture_output=True, timeout=30,
             )
             img = Image.open(dest_path)
             img = _apply_brand_overlay(img)
@@ -1094,7 +1094,12 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
                     "-pix_fmt", "yuv420p",
                     norm_path,
                 ],
-                check=True, capture_output=True,
+                # 2026-08-22: same fix as pipeline.py's assemble_video() -
+                # no ffmpeg/ffprobe call in either file had a timeout, so a
+                # single stuck clip could hang forever with zero visibility
+                # (root cause of run #113's stall). Bounded here so a hang
+                # fails fast and clearly instead of consuming the whole run.
+                check=True, capture_output=True, timeout=90,
             )
             normalized.append(norm_path)
             idx += 1
@@ -1109,7 +1114,7 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
     subprocess.run(
         ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
          "-c", "copy", silent_video],
-        check=True, capture_output=True,
+        check=True, capture_output=True, timeout=120,
     )
 
     ass_escaped = ass_path.replace(":", r"\:")
@@ -1176,7 +1181,11 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
         "-c:a", "aac", "-b:a", "192k", "-shortest",
         output_path,
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    # 2026-08-22: bounded (was unbounded, same bug as pipeline.py) - this is
+    # the heaviest single ffmpeg call for an 8-15 minute video, so it gets
+    # a generous 20-minute cap, still comfortably inside this step's
+    # 65-minute budget under the 75-minute job ceiling.
+    subprocess.run(cmd, check=True, capture_output=True, timeout=1200)
 
 
 # ---------------------------------------------------------------------------

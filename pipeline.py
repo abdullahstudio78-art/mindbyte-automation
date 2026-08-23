@@ -1566,7 +1566,7 @@ def _character_image_to_clip(image_path: str, dest_path: str, duration: float = 
             ["ffmpeg", "-y", "-i", image_path,
              "-c:v", "libx264", "-preset", "medium", "-crf", "18",
              "-pix_fmt", "yuv420p", "-vf", zoompan, base_path],
-            check=True, capture_output=True,
+            check=True, capture_output=True, timeout=90,
         )
         # Give Byte's own shots the same subtle living/flicker motion as the
         # illustrated Environment backgrounds (lighter opacity here since a
@@ -2102,7 +2102,7 @@ def build_thumbnail(dest_path: str, title: str, pillar: str,
                            "vignette=PI/6",
                     dest_path,
                 ],
-                check=True, capture_output=True,
+                check=True, capture_output=True, timeout=30,
             )
             img = Image.open(dest_path)
             img = _apply_brand_overlay(img)
@@ -2242,7 +2242,7 @@ def mix_background_music(voice_path: str, music_path: str, duration: float,
             "-c:a", "libmp3lame", "-q:a", "4",
             dest_path,
         ],
-        check=True, capture_output=True,
+        check=True, capture_output=True, timeout=90,
     )
 
 def master_audio(src_path: str, dest_path: str, duration: float) -> None:
@@ -2270,7 +2270,7 @@ def master_audio(src_path: str, dest_path: str, duration: float) -> None:
             "-c:a", "libmp3lame", "-q:a", "2",
             dest_path,
         ],
-        check=True, capture_output=True,
+        check=True, capture_output=True, timeout=60,
     )
 
 
@@ -2336,7 +2336,7 @@ def ffprobe_duration(path: str) -> float:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", path],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, timeout=30,
     )
     return float(out.stdout.strip())
 
@@ -2392,7 +2392,7 @@ def generate_voiceover_segments(sentences: list, workdir: str, pillar: str) -> t
             "-t", f"{gap_seconds:.3f}", "-c:a", "libmp3lame", "-q:a", "4",
             silence_path,
         ],
-        check=True, capture_output=True,
+        check=True, capture_output=True, timeout=30,
     )
 
     concat_list = os.path.join(workdir, "voice_concat.txt")
@@ -2411,7 +2411,7 @@ def generate_voiceover_segments(sentences: list, workdir: str, pillar: str) -> t
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
             "-c:a", "libmp3lame", "-q:a", "4", combined_path,
         ],
-        check=True, capture_output=True,
+        check=True, capture_output=True, timeout=90,
     )
     return combined_path, segment_durations
 
@@ -2622,7 +2622,14 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
                 "-pix_fmt", "yuv420p",
                 norm_path,
             ],
-            check=True, capture_output=True,
+            # 2026-08-22: root cause of run #113's 26-minute stall - every
+            # ffmpeg/ffprobe subprocess.run() call in this file had NO
+            # timeout, so a single stuck clip (corrupted download, a filter
+            # that hangs, a slow/throttled shared runner) could block
+            # forever with zero visibility, only ever stopped by the whole
+            # step's outer timeout. A bounded timeout here turns a silent,
+            # multi-minute hang into a fast, clearly-logged failure instead.
+            check=True, capture_output=True, timeout=90,
         )
         normalized.append(norm_path)
 
@@ -2635,7 +2642,7 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
     subprocess.run(
         ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
          "-c", "copy", silent_video],
-        check=True, capture_output=True,
+        check=True, capture_output=True, timeout=60,
     )
 
     # The .ass file (built by build_ass()) carries its own Style line -
@@ -2726,7 +2733,12 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
             "-c:a", "aac", "-b:a", "192k", "-shortest",
             output_path,
         ],
-        check=True, capture_output=True,
+        # Heaviest single ffmpeg call in the pipeline (subtitles + title
+        # card + watermark + subscribe-badge overlay compositing), so it
+        # gets the largest bound - still well under this step's 26-minute
+        # ceiling, so a real hang here fails fast instead of consuming the
+        # whole run.
+        check=True, capture_output=True, timeout=240,
     )
 
 def upload_to_youtube(access_token: str, video_path: str, title: str, description: str,
@@ -2814,7 +2826,7 @@ def ffprobe_video_info(path: str) -> dict:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-print_format", "json",
          "-show_format", "-show_streams", path],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, timeout=30,
     )
     data = json.loads(out.stdout)
     duration = float(data.get("format", {}).get("duration", 0))
