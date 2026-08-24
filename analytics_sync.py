@@ -462,6 +462,60 @@ def sheet_append(token: str, a1_range: str, row: list) -> None:
     resp.raise_for_status()
 
 
+def sheet_append_multi(token: str, a1_range: str, rows: list) -> None:
+    """Append MANY rows to the same tab in a single API call, instead of
+    one call per row. The Sheets append endpoint already accepts a list of
+    rows in one request - there was never a need to call it once per video."""
+    if not rows:
+        return
+    resp = _api_call_with_retry(
+        lambda: SESSION.post(
+            f"{SHEETS_BASE}/values/{a1_range}:append",
+            headers=headers(token),
+            params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+            json={"values": rows},
+            timeout=30,
+        ),
+        _label="Sheets",
+    )
+    resp.raise_for_status()
+
+
+def sheet_batch_update(token: str, updates: list) -> None:
+    """Write MANY different-range single-row updates in one API call via
+    Sheets' native values:batchUpdate endpoint, instead of one values.update
+    (PUT) call per video.
+
+    2026-08-24 root-cause fix: run #40's original per-video-YouTube-call
+    bottleneck was fixed by batching the READS (see get_*_batch above), but
+    that fix alone let the loop reach Google Sheets' per-minute WRITE quota
+    (~60 requests/min/user) almost instantly once ~90 sequential PUT calls
+    ran back-to-back with no throttling - manual re-verification run #41
+    hit exactly this wall and crashed with HTTPError 429 on a Videos! write.
+    Collecting every row's update and sending them all as one batchUpdate
+    call keeps this at ONE Sheets write per sync run regardless of how many
+    videos exist, so it can never hit the write quota again as the channel
+    grows - a genuine fix, not a bigger retry budget that would just delay
+    the same failure.
+    updates: list of (a1_range, row) tuples.
+    """
+    if not updates:
+        return
+    resp = _api_call_with_retry(
+        lambda: SESSION.post(
+            f"{SHEETS_BASE}/values:batchUpdate",
+            headers=headers(token),
+            json={
+                "valueInputOption": "USER_ENTERED",
+                "data": [{"range": a1_range, "values": [row]} for a1_range, row in updates],
+            },
+            timeout=30,
+        ),
+        _label="Sheets",
+    )
+    resp.raise_for_status()
+
+
 def ensure_sheet_tab(token: str, tab_name: str, header_row: list) -> bool:
     """Same self-heal pattern used throughout pipeline.py: create the tab
     (with a header row) the first time a write to it fails because it
@@ -543,6 +597,11 @@ def sync_longform_videos(token: str, video_meta: dict, today: str) -> None:
     analytics_by_id = get_video_analytics_batch(token, video_ids)
     retention_by_id = get_early_retention_batch(token, video_ids, is_longform=True)
 
+    # Same batched-write fix as the Shorts loop in main() - see
+    # sheet_batch_update()'s docstring.
+    pending_updates = []
+    pending_history_rows = []
+
     for i, row in enumerate(rows, start=2):
         row = row + [""] * (14 - len(row))
         video_id = row[0].strip()
@@ -564,10 +623,7 @@ def sync_longform_videos(token: str, video_meta: dict, today: str) -> None:
         # New end-of-header columns O-S (Views, Likes, Comments, Shares,
         # LastSynced) - the existing A-N columns (VideoID..Notes) are
         # completely untouched.
-        try:
-            sheet_update(token, f"LongformVideos!O{i}:S{i}", [views, likes, comments, shares, now])
-        except Exception as e:  # noqa: BLE001 - a write failure shouldn't stop the loop
-            print(f"[analytics] LongformVideos row {i}: could not write new columns (non-fatal): {e}")
+        pending_updates.append((f"LongformVideos!O{i}:S{i}", [views, likes, comments, shares, now]))
 
         early_retention = retention_by_id.get(video_id)
         print(f"[analytics] LongformVideos row {i}: video {video_id} -> views={views} likes={likes} "
@@ -575,13 +631,34 @@ def sync_longform_videos(token: str, video_meta: dict, today: str) -> None:
               f"early_retention_pct={early_retention}")
 
         meta = video_meta.get(video_id, {})
-        append_history_row(token, [
+        pending_history_rows.append([
             today, video_id, title, topic, meta.get("pillar", ""), "longform",
             views, likes, comments, shares,
             round(analytics["avg_view_duration"], 1), round(analytics["avg_view_pct"], 2),
             analytics["subs_gained"], meta.get("upload_hour_utc", ""), publish_date,
             early_retention,
         ])
+
+    try:
+        sheet_batch_update(token, pending_updates)
+        print(f"[analytics] wrote {len(pending_updates)} LongformVideos row updates in a single batch call")
+    except Exception as e:  # noqa: BLE001 - a write failure shouldn't stop the sync
+        print(f"[analytics] LongformVideos batch write failed (non-fatal): {e}")
+
+    try:
+        sheet_append_multi(token, f"{ANALYTICS_HISTORY_TAB}!A:P", pending_history_rows)
+        print(f"[analytics] appended {len(pending_history_rows)} longform history rows in a single batch call")
+    except Exception as e:  # noqa: BLE001 - history logging must never crash the sync
+        healed = False
+        try:
+            healed = ensure_sheet_tab(token, ANALYTICS_HISTORY_TAB, ANALYTICS_HISTORY_HEADER)
+            if healed:
+                sheet_append_multi(token, f"{ANALYTICS_HISTORY_TAB}!A:P", pending_history_rows)
+                healed = True
+        except Exception:
+            healed = False
+        if not healed:
+            print(f"[analytics] could not log longform rows to {ANALYTICS_HISTORY_TAB} tab (non-fatal): {e}")
 
 
 def load_video_meta(token: str) -> dict:
@@ -624,6 +701,14 @@ def main() -> None:
     analytics_by_id = get_video_analytics_batch(token, video_ids)
     retention_by_id = get_early_retention_batch(token, video_ids, is_longform=False)
 
+    # 2026-08-24 root-cause fix: accumulate every row's Sheets write instead
+    # of writing it immediately, then send ONE batchUpdate + ONE multi-row
+    # append at the end - see sheet_batch_update()'s docstring for why (run
+    # #41 hit a 429 quota error the moment the YouTube-call bottleneck above
+    # was fixed and ~90 sequential per-row writes ran back-to-back).
+    pending_updates = []
+    pending_history_rows = []
+
     for i, row in enumerate(rows, start=2):  # sheet row 2 is the first data row
         row = row + [""] * (15 - len(row))
         video_id = row[0].strip()
@@ -645,20 +730,36 @@ def main() -> None:
         # Columns I-M are Views, Likes, Comments, Shares, Last Synced -
         # unchanged from before, so anything reading the Videos tab today
         # keeps working exactly as before.
-        sheet_update(token, f"Videos!I{i}:M{i}", [views, likes, comments, shares, now])
+        pending_updates.append((f"Videos!I{i}:M{i}", [views, likes, comments, shares, now]))
         print(f"[analytics] row {i}: video {video_id} -> views={views} likes={likes} "
               f"comments={comments} shares={shares} avg_view_pct={analytics['avg_view_pct']:.1f} "
               f"avg_view_duration={analytics['avg_view_duration']:.1f}s subs_gained={analytics['subs_gained']}")
 
         early_retention = retention_by_id.get(video_id)
         meta = video_meta.get(video_id, {})
-        append_history_row(token, [
+        pending_history_rows.append([
             today, video_id, title, topic, meta.get("pillar", ""), meta.get("format", ""),
             views, likes, comments, shares,
             round(analytics["avg_view_duration"], 1), round(analytics["avg_view_pct"], 2),
             analytics["subs_gained"], meta.get("upload_hour_utc", ""), publish_date,
             early_retention,
         ])
+
+    sheet_batch_update(token, pending_updates)
+    print(f"[analytics] wrote {len(pending_updates)} Videos row updates in a single batch call")
+    try:
+        sheet_append_multi(token, f"{ANALYTICS_HISTORY_TAB}!A:P", pending_history_rows)
+        print(f"[analytics] appended {len(pending_history_rows)} history rows in a single batch call")
+    except Exception as e:  # noqa: BLE001 - history logging must never crash the sync
+        healed = False
+        try:
+            healed = ensure_sheet_tab(token, ANALYTICS_HISTORY_TAB, ANALYTICS_HISTORY_HEADER)
+            if healed:
+                sheet_append_multi(token, f"{ANALYTICS_HISTORY_TAB}!A:P", pending_history_rows)
+        except Exception:
+            healed = False
+        if not healed:
+            print(f"[analytics] could not log to {ANALYTICS_HISTORY_TAB} tab (does it exist yet?): {e}")
 
     # Long-form parity loop (2026-07-31) - best-effort, never breaks the
     # Shorts sync above even if it fails entirely.
