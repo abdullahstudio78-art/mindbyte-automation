@@ -2728,17 +2728,27 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
             "ffmpeg", "-y", "-i", silent_video, "-i", audio_path, *extra_input_args,
             "-filter_complex", filter_complex,
             "-map", f"[{last_label}]", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "17",
+            # 2026-08-23: preset bumped medium->faster after run #116 hit
+            # the 240s timeout on this exact call (subtitles + title card +
+            # watermark + subscribe-badge all composited in one pass is the
+            # heaviest single encode in the pipeline). "faster" trades a
+            # small amount of compression efficiency for meaningfully
+            # quicker encoding - at this bitrate/CRF for a ~60s vertical
+            # video the visual difference is not meaningfully perceptible,
+            # and it directly attacks the actual bottleneck instead of
+            # just hoping a bigger timeout is enough on a slow runner.
+            "-c:v", "libx264", "-preset", "faster", "-crf", "17",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             "-c:a", "aac", "-b:a", "192k", "-shortest",
             output_path,
         ],
         # Heaviest single ffmpeg call in the pipeline (subtitles + title
-        # card + watermark + subscribe-badge overlay compositing), so it
-        # gets the largest bound - still well under this step's 26-minute
-        # ceiling, so a real hang here fails fast instead of consuming the
-        # whole run.
-        check=True, capture_output=True, timeout=240,
+        # card + watermark + subscribe-badge overlay compositing). Bumped
+        # 240->420s after run #116 timed out at 240s on a slow shared
+        # runner - still comfortably under this step's 26-minute ceiling
+        # (every other step here takes well under a minute combined), so a
+        # genuine hang still fails fast instead of consuming the whole run.
+        check=True, capture_output=True, timeout=420,
     )
 
 def upload_to_youtube(access_token: str, video_path: str, title: str, description: str,

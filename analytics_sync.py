@@ -243,6 +243,147 @@ def get_early_retention_pct(token: str, video_id: str, is_longform: bool) -> flo
         return None
 
 
+# ---------------------------------------------------------------------------
+# Batched lookups (2026-08-23 root-cause fix)
+#
+# The three per-video functions above were each called once per video, in
+# a sequential loop - 3 network round trips per video (get_video_stats,
+# get_video_analytics, get_early_retention_pct). That was fine when the
+# channel had a handful of videos, but it does not scale: at ~2 new Shorts
+# a day the video count grows forever, so the total sync time grows
+# forever too. It finally caught up with us at run #40 (~95 videos, ~285
+# sequential API calls), which ran past the step's 12-minute timeout and
+# failed - and every future day would only be slower, so simply raising
+# the timeout again would just delay the same failure, not fix it.
+#
+# The permanent fix: both the YouTube Data API (videos.list) and the
+# YouTube Analytics API (reports.query) accept MULTIPLE video IDs in a
+# single request - Data API via a comma-separated `id` param, Analytics
+# API via `dimensions=video` + a comma-separated `video==id1,id2,...`
+# filter, which returns one row per video instead of one aggregated row.
+# Chunking at 50 IDs per request (comfortably under both APIs' practical
+# per-request limits) turns ~95 sequential calls into ~2 chunked calls per
+# lookup type, regardless of channel size - this is what keeps the sync
+# fast forever instead of only "fast enough for today's video count."
+_BATCH_CHUNK_SIZE = 50
+
+
+def _chunked(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def get_video_stats_batch(token: str, video_ids: list) -> dict:
+    """Same data as get_video_stats(), for every ID in video_ids, in
+    ceil(len(video_ids)/50) calls instead of len(video_ids) calls. Missing/
+    private videos are simply absent from the returned dict - callers
+    already handle a missing entry as "not found" the same as before."""
+    out = {}
+    for chunk in _chunked([v for v in video_ids if v], _BATCH_CHUNK_SIZE):
+        resp = _api_call_with_retry(
+            lambda chunk=chunk: SESSION.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                headers=headers(token),
+                params={"part": "statistics", "id": ",".join(chunk)},
+                timeout=30,
+            ),
+            _label="YouTube Data API (video stats, batched)",
+        )
+        resp.raise_for_status()
+        for item in resp.json().get("items", []):
+            out[item["id"]] = item.get("statistics", {})
+    return out
+
+
+def get_video_analytics_batch(token: str, video_ids: list) -> dict:
+    """Same data as get_video_analytics(), for every ID in video_ids, in
+    ceil(len(video_ids)/50) calls instead of len(video_ids) calls, via
+    dimensions=video so each response row is tagged with its own video ID
+    in column 0. A video with no rows in the response (e.g. too new for
+    Analytics data) gets the same all-zero default get_video_analytics()
+    used to return for that case."""
+    default = {"shares": 0, "avg_view_duration": 0, "avg_view_pct": 0.0, "subs_gained": 0}
+    out = {}
+    for chunk in _chunked([v for v in video_ids if v], _BATCH_CHUNK_SIZE):
+        resp = _api_call_with_retry(
+            lambda chunk=chunk: SESSION.get(
+                "https://youtubeanalytics.googleapis.com/v2/reports",
+                headers=headers(token),
+                params={
+                    "ids": f"channel=={YOUTUBE_CHANNEL_ID}",
+                    "startDate": "2020-01-01",
+                    "endDate": datetime.now(timezone.utc).date().isoformat(),
+                    "metrics": "shares,averageViewDuration,averageViewPercentage,subscribersGained",
+                    "dimensions": "video",
+                    "filters": f"video=={','.join(chunk)}",
+                },
+                timeout=30,
+            ),
+            _label="YouTube Analytics API (video metrics, batched)",
+        )
+        if resp.status_code != 200:
+            continue
+        for row in resp.json().get("rows", []):
+            # row[0] is the video ID (from dimensions=video); metrics follow.
+            out[row[0]] = {
+                "shares": int(row[1]) if len(row) > 1 else 0,
+                "avg_view_duration": float(row[2]) if len(row) > 2 else 0,
+                "avg_view_pct": float(row[3]) if len(row) > 3 else 0.0,
+                "subs_gained": int(row[4]) if len(row) > 4 else 0,
+            }
+    return {vid: out.get(vid, default) for vid in video_ids}
+
+
+def get_early_retention_batch(token: str, video_ids: list, is_longform: bool) -> dict:
+    """Same data as get_early_retention_pct(), for every ID in video_ids,
+    in ceil(len(video_ids)/50) calls instead of len(video_ids) calls, via
+    dimensions=video,elapsedVideoTimeRatio - rows are grouped by video ID
+    (column 0) and reduced with the same per-format picking logic
+    get_early_retention_pct() used (first bucket for Shorts, bucket
+    closest to ratio 0.05 for long-form). A video absent from the response
+    maps to None, same as get_early_retention_pct()'s failure/no-data case."""
+    by_video: dict = {}
+    for chunk in _chunked([v for v in video_ids if v], _BATCH_CHUNK_SIZE):
+        try:
+            resp = _api_call_with_retry(
+                lambda chunk=chunk: SESSION.get(
+                    "https://youtubeanalytics.googleapis.com/v2/reports",
+                    headers=headers(token),
+                    params={
+                        "ids": f"channel=={YOUTUBE_CHANNEL_ID}",
+                        "startDate": "2020-01-01",
+                        "endDate": datetime.now(timezone.utc).date().isoformat(),
+                        "metrics": "audienceWatchRatio",
+                        "dimensions": "video,elapsedVideoTimeRatio",
+                        "filters": f"video=={','.join(chunk)}",
+                        "sort": "video,elapsedVideoTimeRatio",
+                    },
+                    timeout=30,
+                ),
+                _label="YouTube Analytics API (retention curve, batched)",
+            )
+            if resp.status_code != 200:
+                continue
+            for row in resp.json().get("rows", []):
+                # row = [video_id, elapsedVideoTimeRatio, audienceWatchRatio]
+                by_video.setdefault(row[0], []).append((float(row[1]), float(row[2])))
+        except Exception as e:  # noqa: BLE001 - retention-curve data is a bonus, never fatal
+            print(f"[analytics] EarlyRetentionPct batch lookup failed (non-fatal): {e}")
+    out = {}
+    for vid in video_ids:
+        rows = by_video.get(vid)
+        if not rows:
+            out[vid] = None
+            continue
+        if not is_longform:
+            ratio, watch_ratio = rows[0]
+            out[vid] = round(watch_ratio * 100, 2)
+        else:
+            best = min(rows, key=lambda r: abs(r[0] - 0.05))
+            out[vid] = round(best[1] * 100, 2)
+    return out
+
+
 def get_channel_audience_snapshot(token: str) -> dict | None:
     """Best-effort, once-per-run (NOT per-video, to avoid quota
     multiplication) channel-level subscribedStatus report - a simple
@@ -392,6 +533,16 @@ def sync_longform_videos(token: str, video_meta: dict, today: str) -> None:
         return
     print(f"[analytics] {len(rows)} rows in LongformVideos sheet")
 
+    # 2026-08-23 root-cause fix: prefetch all three YouTube lookups for
+    # every video in this tab in a handful of batched calls up front,
+    # instead of 3 sequential calls per video inside the loop below - see
+    # the batch functions' docstrings for why (run #40's timeout, and every
+    # future day only getting slower as the channel grows).
+    video_ids = [row[0].strip() for row in rows if row and row[0].strip()]
+    stats_by_id = get_video_stats_batch(token, video_ids)
+    analytics_by_id = get_video_analytics_batch(token, video_ids)
+    retention_by_id = get_early_retention_batch(token, video_ids, is_longform=True)
+
     for i, row in enumerate(rows, start=2):
         row = row + [""] * (14 - len(row))
         video_id = row[0].strip()
@@ -399,15 +550,11 @@ def sync_longform_videos(token: str, video_meta: dict, today: str) -> None:
         publish_date = row[4]
         if not video_id:
             continue
-        try:
-            stats = get_video_stats(token, video_id)
-        except Exception as e:  # noqa: BLE001 - one bad video must not stop the loop
-            print(f"[analytics] LongformVideos row {i}: stats lookup failed (non-fatal): {e}")
-            continue
+        stats = stats_by_id.get(video_id)
         if not stats:
             print(f"[analytics] LongformVideos row {i}: video {video_id} not found (may still be private)")
             continue
-        analytics = get_video_analytics(token, video_id)
+        analytics = analytics_by_id[video_id]
         views = stats.get("viewCount", 0)
         likes = stats.get("likeCount", 0)
         comments = stats.get("commentCount", 0)
@@ -422,7 +569,7 @@ def sync_longform_videos(token: str, video_meta: dict, today: str) -> None:
         except Exception as e:  # noqa: BLE001 - a write failure shouldn't stop the loop
             print(f"[analytics] LongformVideos row {i}: could not write new columns (non-fatal): {e}")
 
-        early_retention = get_early_retention_pct(token, video_id, is_longform=True)
+        early_retention = retention_by_id.get(video_id)
         print(f"[analytics] LongformVideos row {i}: video {video_id} -> views={views} likes={likes} "
               f"comments={comments} shares={shares} avg_view_pct={analytics['avg_view_pct']:.1f} "
               f"early_retention_pct={early_retention}")
@@ -466,6 +613,17 @@ def main() -> None:
     video_meta = load_video_meta(token)
     today = datetime.now(timezone.utc).date().isoformat()
 
+    # 2026-08-23 root-cause fix (see the batch functions' docstrings above):
+    # prefetch stats/analytics/retention for every video in ONE pass of
+    # chunked, batched API calls instead of 3 sequential calls per video
+    # inside the loop. This is what actually fixes run #40's failure - not
+    # just a bigger timeout, which would only have delayed the same
+    # failure as the channel keeps growing.
+    video_ids = [row[0].strip() for row in rows if row and row[0].strip()]
+    stats_by_id = get_video_stats_batch(token, video_ids)
+    analytics_by_id = get_video_analytics_batch(token, video_ids)
+    retention_by_id = get_early_retention_batch(token, video_ids, is_longform=False)
+
     for i, row in enumerate(rows, start=2):  # sheet row 2 is the first data row
         row = row + [""] * (15 - len(row))
         video_id = row[0].strip()
@@ -473,11 +631,11 @@ def main() -> None:
         publish_date = row[4]
         if not video_id:
             continue
-        stats = get_video_stats(token, video_id)
+        stats = stats_by_id.get(video_id)
         if not stats:
             print(f"[analytics] row {i}: video {video_id} not found (may still be private)")
             continue
-        analytics = get_video_analytics(token, video_id)
+        analytics = analytics_by_id[video_id]
         views = stats.get("viewCount", 0)
         likes = stats.get("likeCount", 0)
         comments = stats.get("commentCount", 0)
@@ -492,7 +650,7 @@ def main() -> None:
               f"comments={comments} shares={shares} avg_view_pct={analytics['avg_view_pct']:.1f} "
               f"avg_view_duration={analytics['avg_view_duration']:.1f}s subs_gained={analytics['subs_gained']}")
 
-        early_retention = get_early_retention_pct(token, video_id, is_longform=False)
+        early_retention = retention_by_id.get(video_id)
         meta = video_meta.get(video_id, {})
         append_history_row(token, [
             today, video_id, title, topic, meta.get("pillar", ""), meta.get("format", ""),
