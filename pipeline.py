@@ -2723,33 +2723,49 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
         next_input_index += 1
     filter_complex = ";".join(filter_stages)
 
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", silent_video, "-i", audio_path, *extra_input_args,
-            "-filter_complex", filter_complex,
-            "-map", f"[{last_label}]", "-map", "1:a:0",
-            # 2026-08-23: preset bumped medium->faster after run #116 hit
-            # the 240s timeout on this exact call (subtitles + title card +
-            # watermark + subscribe-badge all composited in one pass is the
-            # heaviest single encode in the pipeline). "faster" trades a
-            # small amount of compression efficiency for meaningfully
-            # quicker encoding - at this bitrate/CRF for a ~60s vertical
-            # video the visual difference is not meaningfully perceptible,
-            # and it directly attacks the actual bottleneck instead of
-            # just hoping a bigger timeout is enough on a slow runner.
-            "-c:v", "libx264", "-preset", "faster", "-crf", "17",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            "-c:a", "aac", "-b:a", "192k", "-shortest",
-            output_path,
-        ],
-        # Heaviest single ffmpeg call in the pipeline (subtitles + title
-        # card + watermark + subscribe-badge overlay compositing). Bumped
-        # 240->420s after run #116 timed out at 240s on a slow shared
-        # runner - still comfortably under this step's 26-minute ceiling
-        # (every other step here takes well under a minute combined), so a
-        # genuine hang still fails fast instead of consuming the whole run.
-        check=True, capture_output=True, timeout=420,
-    )
+    def _run_final_render(preset: str, crf: str, timeout: int) -> None:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", silent_video, "-i", audio_path, *extra_input_args,
+                "-filter_complex", filter_complex,
+                "-map", f"[{last_label}]", "-map", "1:a:0",
+                "-c:v", "libx264", "-preset", preset, "-crf", crf,
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-c:a", "aac", "-b:a", "192k", "-shortest",
+                output_path,
+            ],
+            check=True, capture_output=True, timeout=timeout,
+        )
+
+    # Heaviest single ffmpeg call in the pipeline (subtitles + title card +
+    # watermark + subscribe-badge overlay compositing, one pass).
+    #
+    # 2026-08-24 root-cause fix: run #120 hit the 420s timeout added after
+    # run #116 - proving a bigger fixed timeout was never going to be a
+    # permanent fix. GitHub's free shared runners have real day-to-day CPU
+    # speed variance; any single fixed timeout, however generous, still has
+    # some chance of being too small on a slow day, and that's exactly what
+    # was causing every-other-day gaps in the 2/day publish schedule (one
+    # of the two daily runs would silently lose its render and never
+    # upload). A bigger number just delays the same failure to a slower day
+    # - it doesn't remove it.
+    #
+    # The actual fix: make the render adaptive instead of fixed. Try the
+    # normal quality first (preset "faster", crf 17) with a bounded 300s
+    # timeout. If that's not enough - meaning this run landed on an
+    # unusually slow runner - automatically retry ONCE with a much faster,
+    # still-free encode preset ("veryfast") and crf 20, which finishes in a
+    # fraction of the time on the same hardware. Worst case this costs one
+    # retry (well within the step's 26-minute ceiling); best case (most
+    # runs) nothing changes at all. This is what actually stops the
+    # recurring gap regardless of which day's runner happens to be slow,
+    # instead of picking one more static number and hoping.
+    try:
+        _run_final_render(preset="faster", crf="17", timeout=300)
+    except subprocess.TimeoutExpired:
+        print("[pipeline] final render exceeded 300s on preset 'faster' (slow runner today) "
+              "- retrying once with preset 'veryfast' for a faster, still-free encode")
+        _run_final_render(preset="veryfast", crf="20", timeout=300)
 
 def upload_to_youtube(access_token: str, video_path: str, title: str, description: str,
                        tags: list, publish_at_iso: str) -> str:
