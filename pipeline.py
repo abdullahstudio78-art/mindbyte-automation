@@ -2748,24 +2748,29 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
     # was causing every-other-day gaps in the 2/day publish schedule (one
     # of the two daily runs would silently lose its render and never
     # upload). A bigger number just delays the same failure to a slower day
-    # - it doesn't remove it.
+    # - it doesn't remove it. Made the render adaptive: try normal quality
+    # first, auto-retry with a faster preset if that's not enough.
     #
-    # The actual fix: make the render adaptive instead of fixed. Try the
-    # normal quality first (preset "faster", crf 17) with a bounded 300s
-    # timeout. If that's not enough - meaning this run landed on an
-    # unusually slow runner - automatically retry ONCE with a much faster,
-    # still-free encode preset ("veryfast") and crf 20, which finishes in a
-    # fraction of the time on the same hardware. Worst case this costs one
-    # retry (well within the step's 26-minute ceiling); best case (most
-    # runs) nothing changes at all. This is what actually stops the
-    # recurring gap regardless of which day's runner happens to be slow,
-    # instead of picking one more static number and hoping.
+    # 2026-08-27 follow-up: run #123 proved the FIRST version of this fix
+    # picked its two 300s budgets too conservatively rather than actually
+    # using the headroom available. Both the "faster" attempt AND the
+    # "veryfast" fallback timed out at exactly 300s each on that day's
+    # runner - the retry logic worked correctly, but 300s wasn't enough
+    # even for the fast preset under that day's CPU contention. The rest of
+    # this pipeline run (topic scoring, script gen, TTS, footage fetch,
+    # normalize/concat) only used ~5 minutes of the step's 26-minute
+    # ceiling, so there was plenty of unused budget being wasted by two
+    # timeouts set smaller than necessary. Raised both attempts to 480s
+    # (800s combined worst case) - still leaves ~15+ minutes of margin
+    # under the step ceiling for everything else, while giving a slow
+    # runner roughly 60% more time per attempt to actually finish instead
+    # of failing at the same wall every time.
     try:
-        _run_final_render(preset="faster", crf="17", timeout=300)
+        _run_final_render(preset="faster", crf="17", timeout=480)
     except subprocess.TimeoutExpired:
-        print("[pipeline] final render exceeded 300s on preset 'faster' (slow runner today) "
+        print("[pipeline] final render exceeded 480s on preset 'faster' (slow runner today) "
               "- retrying once with preset 'veryfast' for a faster, still-free encode")
-        _run_final_render(preset="veryfast", crf="20", timeout=300)
+        _run_final_render(preset="veryfast", crf="20", timeout=480)
 
 def upload_to_youtube(access_token: str, video_path: str, title: str, description: str,
                        tags: list, publish_at_iso: str) -> str:
