@@ -2756,21 +2756,35 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
     # using the headroom available. Both the "faster" attempt AND the
     # "veryfast" fallback timed out at exactly 300s each on that day's
     # runner - the retry logic worked correctly, but 300s wasn't enough
-    # even for the fast preset under that day's CPU contention. The rest of
-    # this pipeline run (topic scoring, script gen, TTS, footage fetch,
-    # normalize/concat) only used ~5 minutes of the step's 26-minute
-    # ceiling, so there was plenty of unused budget being wasted by two
-    # timeouts set smaller than necessary. Raised both attempts to 480s
-    # (800s combined worst case) - still leaves ~15+ minutes of margin
-    # under the step ceiling for everything else, while giving a slow
-    # runner roughly 60% more time per attempt to actually finish instead
-    # of failing at the same wall every time.
+    # even for the fast preset under that day's CPU contention. Raised both
+    # attempts to 480s - but run #125 showed even THAT wasn't always
+    # enough: both the "faster" AND "veryfast" attempts timed out again, at
+    # the full 480s each, eating 22m1s of the (then) 26-minute step ceiling
+    # with almost no margin left. Tuning these two numbers a third time
+    # wasn't converging - the actual problem was fighting inside a job/step
+    # ceiling (30/26 min) that was sized before any of this retry logic
+    # existed, not the preset choice itself.
+    #
+    # Real fix this time (two parts, see publish.yml's matching comment):
+    # 1) Widened the workflow's job ceiling 30->45 min and this step's
+    #    26->40 min, so a genuinely slow/throttled runner has real room to
+    #    finish instead of racing an artificially tight wall every time.
+    # 2) Added a THIRD, even-faster fallback tier ("ultrafast") as a safety
+    #    net for an exceptionally slow day, now that there's actually
+    #    budget to spend on a third attempt without blowing the step
+    #    ceiling.
     try:
         _run_final_render(preset="faster", crf="17", timeout=480)
     except subprocess.TimeoutExpired:
         print("[pipeline] final render exceeded 480s on preset 'faster' (slow runner today) "
               "- retrying once with preset 'veryfast' for a faster, still-free encode")
-        _run_final_render(preset="veryfast", crf="20", timeout=480)
+        try:
+            _run_final_render(preset="veryfast", crf="20", timeout=480)
+        except subprocess.TimeoutExpired:
+            print("[pipeline] final render exceeded 480s on preset 'veryfast' too (severely "
+                  "throttled runner today) - retrying once more with preset 'ultrafast' as a "
+                  "last, still-free fallback")
+            _run_final_render(preset="ultrafast", crf="23", timeout=600)
 
 def upload_to_youtube(access_token: str, video_path: str, title: str, description: str,
                        tags: list, publish_at_iso: str) -> str:
