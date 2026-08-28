@@ -56,24 +56,54 @@ jobs:
         # still burns the whole 5-minute step budget with nothing to show
         # for it. Switched to a static-binary download from johnvansickle.com
         # as a second fix - but run #106 showed THAT source can itself have
-        # a connectivity blip (curl: "Failed to connect to johnvansickle.com
-        # port 443 after 133791 ms"), and because no attempt had a bounded
-        # connect timeout, curl spent 2+ minutes per attempt failing to even
-        # connect, burning the whole step budget on dead connections before
-        # ever reaching the apt fallback.
+        # a connectivity blip, so a bounded --connect-timeout/--max-time
+        # chain (static primary -> static mirror -> apt) was added.
         #
-        # Real fix (this time addressing the actual root cause, not just
-        # swapping which single source can hang): every network attempt
-        # below now has an explicit --connect-timeout/--max-time (curl) or
-        # `timeout` wrapper (apt), so a stalled/dead connection to ANY one
-        # source fails in seconds, not minutes - leaving the step time to
-        # actually try the next source in the chain instead of losing the
-        # whole budget to whichever source happens to be down that day.
-        # Chain: static build (primary host) -> static build (www mirror,
-        # same file, different DNS name/edge) -> apt (bounded, 2 attempts).
+        # 2026-08-28: root-caused the render-timeout cluster (runs #106-#127,
+        # ~36% failure rate on this workflow, ZERO on Publish Facebook Reel
+        # which shares the same render code path) to THIS step. Since
+        # 2026-08-19 it has unconditionally downloaded a generic static
+        # ffmpeg build into /usr/local/bin, which sits earlier on PATH than
+        # ubuntu-latest's own pre-installed ffmpeg - so every run silently
+        # discarded the runner image's ffmpeg (already present, zero
+        # network cost, built by Ubuntu's own toolchain) in favor of a
+        # generic cross-distro static build that isn't tuned for this
+        # runner and isn't even the same libx264/libass build. The render-
+        # timeout cluster starts the week after this switch, and widening
+        # timeouts and dropping the x264 preset all the way to "ultrafast"
+        # (run #127) still wasn't enough - consistent with the bottleneck
+        # being the preset-independent filter_complex/libass subtitle-burn
+        # stage running on a slower ffmpeg build, not encode speed.
+        #
+        # Permanent, free fix: use the runner's pre-installed ffmpeg first
+        # (no download, no network risk, it's the one actually built for
+        # this image) and only fall back to apt, then the static download,
+        # if it's genuinely missing.
         timeout-minutes: 6
         run: |
           set -e
+          if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+            echo "[ffmpeg install] using runner's pre-installed ffmpeg (no download needed)"
+            ffmpeg -version
+            exit 0
+          fi
+
+          echo "[ffmpeg install] not pre-installed on this runner - trying apt (bounded per attempt)"
+          apt_ok=1
+          for i in 1 2; do
+            if timeout 90 sudo apt-get update && timeout 90 sudo apt-get install -y ffmpeg; then
+              apt_ok=0
+              break
+            fi
+            echo "[ffmpeg install] apt attempt $i failed/timed out, retrying in 5s"
+            sleep 5
+          done
+          if [ "$apt_ok" = "0" ]; then
+            ffmpeg -version
+            exit 0
+          fi
+
+          echo "[ffmpeg install] apt unavailable - falling back to static build download"
           install_static() {
             curl -fL --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 3 \
               -o /tmp/ffmpeg.tar.xz "$1" || return 1
@@ -89,15 +119,6 @@ jobs:
             echo "[ffmpeg install] installed via www.johnvansickle.com (primary host was unreachable)"
             ffmpeg -version
           else
-            echo "[ffmpeg install] static build sources unreachable - falling back to apt (bounded per attempt)"
-            for i in 1 2; do
-              if timeout 90 sudo apt-get update && timeout 90 sudo apt-get install -y ffmpeg; then
-                ffmpeg -version
-                exit 0
-              fi
-              echo "[ffmpeg install] apt attempt $i failed/timed out, retrying in 5s"
-              sleep 5
-            done
             echo "[ffmpeg install] all sources failed"
             exit 1
           fi

@@ -34,15 +34,36 @@ jobs:
           python-version: '3.11'
 
       - name: Install ffmpeg
-        # 2026-08-21: this had only ever gotten the FIRST fix (apt retry
-        # loop), not the later static-binary fix applied to publish.yml
-        # after run #101/#106 showed apt/CDN mirrors can each hang or have
-        # connectivity blips with no bounded timeout. Brought in sync with
-        # publish.yml's current approach - see that workflow's comment for
-        # the full history.
+        # 2026-08-28: brought in sync with publish.yml's current approach -
+        # prefer the runner's own pre-installed ffmpeg first (root cause of
+        # publish.yml's render-timeout cluster - see that workflow's comment
+        # for the full writeup), only falling back to apt/static download if
+        # it's genuinely missing.
         timeout-minutes: 6
         run: |
           set -e
+          if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+            echo "[ffmpeg install] using runner's pre-installed ffmpeg (no download needed)"
+            ffmpeg -version
+            exit 0
+          fi
+
+          echo "[ffmpeg install] not pre-installed on this runner - trying apt (bounded per attempt)"
+          apt_ok=1
+          for i in 1 2; do
+            if timeout 90 sudo apt-get update && timeout 90 sudo apt-get install -y ffmpeg; then
+              apt_ok=0
+              break
+            fi
+            echo "[ffmpeg install] apt attempt $i failed/timed out, retrying in 5s"
+            sleep 5
+          done
+          if [ "$apt_ok" = "0" ]; then
+            ffmpeg -version
+            exit 0
+          fi
+
+          echo "[ffmpeg install] apt unavailable - falling back to static build download"
           install_static() {
             curl -fL --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 3 \
               -o /tmp/ffmpeg.tar.xz "$1" || return 1
