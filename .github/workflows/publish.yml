@@ -24,7 +24,17 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 2026-08-27: run #125 proved the render-retry approach (adaptive
+    # preset fallback within a fixed 26/30-minute box) had hit its limit -
+    # BOTH the "faster" and "veryfast" attempts timed out at their full
+    # budget (480s each) on that day's runner, using 22m1s of the 26-minute
+    # step ceiling with almost no margin left. Tuning the preset/timeout
+    # numbers a third time wasn't converging on anything - the real issue
+    # was fighting inside an artificially tight ceiling instead of using
+    # the room GitHub's free runners already allow for a job like this.
+    # Widened to 45 min (from 30) so a genuinely slow/throttled runner day
+    # has real space to finish instead of racing the same wall every time.
+    timeout-minutes: 45
     permissions:
       contents: read
       issues: write
@@ -136,7 +146,17 @@ jobs:
         # anything actually being stuck; 26 leaves a ~3.5 minute safety
         # margin under the 30-minute job ceiling for setup/install/alert
         # steps while giving normal runs more breathing room.
-        timeout-minutes: 26
+        #
+        # 2026-08-27: run #125 used 22m1s of this 26-minute budget with
+        # BOTH render fallback attempts (480s+480s=960s) timing out back to
+        # back - almost no margin left for a third escalation tier or an
+        # even slower day. Bumped to 40 minutes (paired with the job's
+        # 30->45 minute bump above) so the adaptive render retry (now three
+        # tiers - see assemble_video()'s _run_final_render fallback chain
+        # in pipeline.py) has genuine room to actually finish on a slow
+        # runner instead of being squeezed by a ceiling picked before any
+        # of this render-retry logic existed.
+        timeout-minutes: 40
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
