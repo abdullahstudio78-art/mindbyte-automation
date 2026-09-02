@@ -79,7 +79,24 @@ jobs:
         # (no download, no network risk, it's the one actually built for
         # this image) and only fall back to apt, then the static download,
         # if it's genuinely missing.
-        timeout-minutes: 6
+        #
+        # 2026-09-02: run #139 proved "pre-installed" isn't universal -
+        # GitHub's runner images aren't perfectly consistent, and this
+        # particular runner didn't have ffmpeg, so it fell into the apt
+        # fallback, which then broke for two compounding reasons: (1) the
+        # 90s per-attempt timeout was too short for a cold install (94MB
+        # download + ~99 packages), so it killed apt mid-unpack and left
+        # dpkg in an "interrupted" state that made the retry fail
+        # immediately too; (2) the static-binary fallback (johnvansickle.com)
+        # is now serving tiny ~7KB non-archive responses on both the
+        # primary host and the www mirror, so that safety net was broken
+        # too ("xz: file format not recognized"). Free, permanent fix:
+        # give apt a realistic timeout for a cold install, recover a
+        # half-finished dpkg state with `dpkg --configure -a` before
+        # retrying instead of retrying into the same broken state, and
+        # validate the static download actually looks like a real archive
+        # (size check) before trusting it.
+        timeout-minutes: 12
         run: |
           set -e
           if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
@@ -91,24 +108,33 @@ jobs:
           echo "[ffmpeg install] not pre-installed on this runner - trying apt (bounded per attempt)"
           apt_ok=1
           for i in 1 2; do
-            if timeout 90 sudo apt-get update && timeout 90 sudo apt-get install -y ffmpeg; then
+            if timeout 240 sudo apt-get update && timeout 240 sudo apt-get install -y ffmpeg; then
               apt_ok=0
               break
             fi
-            echo "[ffmpeg install] apt attempt $i failed/timed out, retrying in 5s"
+            echo "[ffmpeg install] apt attempt $i failed/timed out - recovering dpkg state and retrying in 5s"
+            sudo dpkg --configure -a || true
             sleep 5
           done
-          if [ "$apt_ok" = "0" ]; then
+          if [ "$apt_ok" = "0" ] && command -v ffmpeg >/dev/null 2>&1; then
             ffmpeg -version
             exit 0
           fi
 
           echo "[ffmpeg install] apt unavailable - falling back to static build download"
           install_static() {
-            curl -fL --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 3 \
+            curl -fL --connect-timeout 10 --max-time 90 --retry 2 --retry-delay 3 \
               -o /tmp/ffmpeg.tar.xz "$1" || return 1
+            # Guard against run #139's failure mode: johnvansickle.com
+            # returning a tiny non-archive response that "succeeds" as a
+            # download but corrupts the install - a real static build is
+            # tens of MB, so anything under 1MB is not a real archive.
+            if [ "$(stat -c%s /tmp/ffmpeg.tar.xz 2>/dev/null || echo 0)" -lt 1000000 ]; then
+              echo "[ffmpeg install] downloaded file too small to be a real ffmpeg build - source is broken"
+              return 1
+            fi
             mkdir -p /tmp/ffmpeg-extract
-            tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
+            tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1 || return 1
             sudo mv /tmp/ffmpeg-extract/ffmpeg /tmp/ffmpeg-extract/ffprobe /usr/local/bin/
           }
 
