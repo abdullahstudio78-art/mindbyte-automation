@@ -1234,14 +1234,16 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
           these sentences: roughly 1 hook sentence, 2-3 for the relatable
           problem, 2-3 building curiosity, 5-7 explaining the psychology,
           3-4 for examples, 1-2 for the closing insight.
-        - HARD REQUIREMENT: total narration between 140 and 160 words.
-          Count before finalizing - under 140 words is a failed response.
-          Do not exceed 160 words even to fit more detail - this channel's
-          videos have a hard 80-second publish ceiling, and at this
-          channel's actual narration pace, anything past ~160 words
-          renders long enough to get rejected and never published. If the
-          explanation beat needs more room, cut a redundant example rather
-          than lengthening the narration past this limit.
+        - HARD REQUIREMENT: this narration section between 115 and 130
+          words. Count before finalizing - under 115 words is a failed
+          response. Do not exceed 130 words even to fit more detail - a
+          separate short subscribe line (up to ~20 more words) is spoken
+          right after this narration, and this channel's videos have a
+          hard 80-second publish ceiling. Leaving this headroom for the
+          subscribe line is what keeps the combined spoken total safely
+          inside that ceiling. If the explanation beat needs more room,
+          cut a redundant example rather than lengthening the narration
+          past this limit.
         - Keep the energy high throughout - rhetorical questions, quick
           reveals, or "but here's the part that changes everything" style
           pivots are welcome, but the throughline must still read as ONE
@@ -1373,16 +1375,28 @@ MIN_SCRIPT_WORDS = 130  # keeps narration filling the 45-55s target instead of d
 # 2026-09-02 root-cause fix: the generation prompt's own word range (see
 # generate_script()'s "HARD REQUIREMENT" line) went up to 190 words, but
 # MAX_VIDEO_DURATION_SEC (80s) is enforced separately by the pre-publish
-# checklist AFTER a full render. At this channel's observed narration pace
-# (run #141: 171 words -> 81.3s, ~2.1 words/sec), anything past ~160 words
-# renders long enough to blow the 80s ceiling - and until now there was no
-# upper-bound check before rendering, only the MIN_SCRIPT_WORDS floor
-# below, so an overlong script wasted a full render (TTS + footage + ffmpeg)
-# before being silently rejected at the very last step and never published.
-# This is what run #141 hit. MAX_SCRIPT_WORDS mirrors MIN_SCRIPT_WORDS's
-# existing retry-with-feedback pattern so an overlong script gets caught
-# and re-generated within the same run instead of reaching the checklist.
-MAX_SCRIPT_WORDS = 160
+# checklist AFTER a full render. At this channel's observed narration pace,
+# anything past ~150 total spoken words (story sentences + cta_line - see
+# the word_count fix just above) renders long enough to risk the 80s
+# ceiling - and until now there was no upper-bound check before rendering,
+# only the MIN_SCRIPT_WORDS floor below, so an overlong script wasted a
+# full render (TTS + footage + ffmpeg) before being silently rejected at
+# the very last step and never published. This is what runs #141 and #142
+# hit. MAX_SCRIPT_WORDS mirrors MIN_SCRIPT_WORDS's existing
+# retry-with-feedback pattern so an overlong script gets caught and
+# re-generated within the same run instead of reaching the checklist.
+#
+# IMPORTANT CAVEAT (why this alone isn't a full guarantee): this channel's
+# actual narration pace varies run-to-run (observed 1.77-2.10 words/sec
+# across runs #141/#142, presumably driven by sentence rhythm/punctuation,
+# not just word count) - a word count is an ESTIMATE of duration, not a
+# measurement. 150 words at the slower observed pace (1.77 wps) still
+# lands near 85s. This constant is tuned to catch the common case and cut
+# most rejections, but the real, deterministic backstop is the early
+# measured-audio-duration abort added in main() right after TTS synthesis
+# (see the comment there) - that one can never be fooled by a pacing
+# outlier the word count didn't anticipate.
+MAX_SCRIPT_WORDS = 150
 
 
 def generate_and_score_script(
@@ -1419,7 +1433,21 @@ def generate_and_score_script(
         script = generate_script(topic, pillar, feedback=feedback, brief=brief, cta_style=cta_style,
                                   structure_tag=structure_tag)
         quality = score_quality(topic, pillar, script)
-        word_count = sum(len(s.split()) for s in script["sentences"])
+        # 2026-09-02 root-cause fix (part 2): word_count must include
+        # cta_line, not just "sentences" - the CTA line is generated
+        # separately (see generate_script()'s cta_block) but IS actually
+        # appended to spoken_sentences and rendered into the final audio
+        # (see the "Subscriber-conversion CTA line" comment further down
+        # in main()). Run #142 hit this exactly: the story alone was 150
+        # words (within the 160 cap below), but the rendered video still
+        # measured 84.7s because the ~15-20 word CTA line was never
+        # counted here, silently pushing the real spoken total over
+        # budget. Counting it here is what makes this gate actually match
+        # what gets rendered.
+        word_count = (
+            sum(len(s.split()) for s in script["sentences"])
+            + len(script.get("cta_line", "").split())
+        )
         meets_bar = (
             quality["score"] >= QUALITY_THRESHOLD
             and MIN_SCRIPT_WORDS <= word_count <= MAX_SCRIPT_WORDS
@@ -3244,6 +3272,40 @@ def main() -> None:
         # not a word-count estimate, so captions/cuts land exactly on them.
         audio_path, segment_durations = generate_voiceover_segments(spoken_sentences, workdir, pillar)
         audio_duration = ffprobe_duration(audio_path)
+
+        # 2026-09-02 root-cause fix (part 3 - the deterministic backstop):
+        # word-count checks in generate_and_score_script() are an ESTIMATE
+        # of duration, not a measurement - this channel's actual narration
+        # pace varies run-to-run (1.77-2.10 words/sec observed across runs
+        # #141/#142), so a word-count-based script that looks fine can
+        # still render long. audio_duration here is the REAL measured
+        # narration length (ffprobe on the actual synthesized voiceover),
+        # available cheaply right after TTS and well before the expensive
+        # music/mastering/ffmpeg-assembly steps below. Aborting here on a
+        # clear overshoot - rather than continuing all the way to the
+        # pre-publish checklist, which is where runs #141 and #142 both
+        # wasted their full render before being silently rejected - saves
+        # most of a run's time/cost on an unpublishable take, and gives an
+        # unambiguous log reason instead of a generic checklist rejection.
+        # A small allowance (VIDEO_DURATION_OVERHEAD_SEC) covers the
+        # difference between raw narration length and final video length
+        # (e.g. any lead-in/lead-out padding added during assembly).
+        VIDEO_DURATION_OVERHEAD_SEC = 2.0
+        if audio_duration > (MAX_VIDEO_DURATION_SEC - VIDEO_DURATION_OVERHEAD_SEC):
+            sheet_row_base[3] = "Failed"
+            sheet_row_base[14] = (
+                f"Aborted early: narration measured {audio_duration:.1f}s, "
+                f"which would exceed the {MAX_VIDEO_DURATION_SEC}s publish "
+                f"ceiling once assembled - skipped the rest of this run "
+                f"rather than rendering an unpublishable video."
+            )
+            sheet_append(access_token, "Videos!A:O", sheet_row_base)
+            print(
+                f"[pipeline] narration measured {audio_duration:.1f}s "
+                f"(> {MAX_VIDEO_DURATION_SEC - VIDEO_DURATION_OVERHEAD_SEC}s safe budget) "
+                f"- aborting before the expensive render/upload steps"
+            )
+            return
 
         # Background music is best-effort: fetch + mix under the narration,
         # but fall back to the plain voiceover on any failure rather than
