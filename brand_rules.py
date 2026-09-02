@@ -197,6 +197,37 @@ SCRIPT_STRUCTURES = {
     },
 }
 
+# 2026-09-02: pacing-beat target added per the 2026-08-30 weekly trend
+# report's virvid.ai finding (500-video faceless-niche study) - narrative
+# psychology content that front-loads a short hook/claim, spends the
+# longest single block on the actual explanation, then closes with a short
+# application + cliffhanger cites 68-78% average retention vs 35-48% for
+# content without this timing shape (a 40-60% gap attributed to structure,
+# not topic). This maps the same SCRIPT_STRUCTURES steps above onto
+# proportional time targets rather than only a qualitative shape, so the
+# writer has a concrete pacing target instead of just "hook then explain
+# then payoff." Expressed as proportions of total runtime (not fixed
+# seconds) since MindByte's accepted Short length varies ~45-65s per the
+# user's own confirmed target - a 60s video and a 50s video should keep the
+# same relative beat proportions, not the same absolute second counts.
+TIMING_BEATS_INSTRUCTION = (
+    "PACING - within the structure above, keep these proportions of the\n"
+    "        video's total runtime (approximate, not exact-second math):\n"
+    "        - Hook (~0-5% of runtime): the pattern-interrupt opening line.\n"
+    "        - Claim/setup (~5-25%): the surprising claim or stakes that\n"
+    "          earns the next 30+ seconds of attention.\n"
+    "        - Explanation (~25-65%, the SINGLE LONGEST block): the actual\n"
+    "          mechanism, told through the concrete example/story, not a\n"
+    "          rushed aside - this is where most of the runtime should go.\n"
+    "        - Practical application (~65-90%): what this means for the\n"
+    "          viewer's own life, grounded and specific.\n"
+    "        - Cliffhanger/closing insight (~90-100%): the memorable final\n"
+    "          line, not a fade-out.\n"
+    "        Do not pad the hook or claim beats just to hit a word count -\n"
+    "        the explanation beat earning the most real estate is the part\n"
+    "        of this pacing shape that actually drives retention."
+)
+
 SCRIPT_STRUCTURE_KEYS = list(SCRIPT_STRUCTURES.keys())
 
 

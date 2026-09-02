@@ -1131,7 +1131,7 @@ def generate_storyboard(sentences: list) -> list:
 
 def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = None, cta_style: str = None,
                      structure_tag: str = None) -> dict:
-    from brand_rules import SCRIPT_STRUCTURES
+    from brand_rules import SCRIPT_STRUCTURES, TIMING_BEATS_INSTRUCTION
     structure_tag = structure_tag if structure_tag in SCRIPT_STRUCTURES else "hook_problem_reveal"
     structure_instruction = SCRIPT_STRUCTURES[structure_tag]["instruction"]
     feedback_block = ""
@@ -1195,6 +1195,8 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
         {feedback_block}{brief_block}{cta_block}
         STRUCTURE - tell one small story, do not dump facts:
         {structure_instruction}
+
+        {TIMING_BEATS_INSTRUCTION}
 
         HOOK RULES - the first sentence decides whether anyone stays:
         Never start with "Welcome back", "Today we will discuss", "Did you
@@ -2562,9 +2564,20 @@ def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
             chunks.append(cur)
         return chunks
 
+    # 2026-09-02: caption lead-in, per the 2026-08-23 weekly trend report's
+    # OpusClip-sourced spec - captions timed 0.1-0.3s ahead of the audio
+    # they caption create a constant micro-anticipation cue that's cited as
+    # a retention lever independent of the visual cut rate. Previously every
+    # chunk's displayed start exactly matched its audio start (no lead-in
+    # at all). Mid-point of that range; clamped so a lead-in never pushes a
+    # chunk's start before the prior chunk's displayed end (no overlap) or
+    # before 0.
+    CAPTION_LEAD_IN = 0.2
+
     events = []
     cursor = 0.0
     is_first_chunk_overall = True
+    prev_display_end = 0.0
     for sentence, duration in zip(sentences, segment_durations):
         words = sentence.split()
         if not words:
@@ -2586,10 +2599,12 @@ def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
             chunk_dur = max(chunk_dur, min_dur)
             start = t
             end = min(t + chunk_dur, cursor + duration)
+            display_start = max(prev_display_end, start - CAPTION_LEAD_IN, 0.0)
             text = _highlight_ass_text(" ".join(chunk))
             events.append(
-                f"Dialogue: 0,{_fmt_time(start)},{_fmt_time(end)},{style_name},,0,0,0,,{text}"
+                f"Dialogue: 0,{_fmt_time(display_start)},{_fmt_time(end)},{style_name},,0,0,0,,{text}"
             )
+            prev_display_end = end
             t = end
             is_first_chunk_overall = False
         cursor += duration
