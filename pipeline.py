@@ -3284,12 +3284,29 @@ def main() -> None:
         )
         print(f"[pipeline] uploaded video id: {video_id}")
 
+        # 2026-09-02: this success/failure was previously only ever printed
+        # to the Actions log (which nobody reviews per-run) and never
+        # recorded anywhere durable - so a systematic failure here (e.g.
+        # thumbnails.set silently rejected because the channel isn't
+        # phone-verified for custom thumbnails, a real YouTube eligibility
+        # gate, or Shorts simply not honoring a custom thumbnail the way
+        # regular videos do) could run for weeks with zero visibility, which
+        # matches exactly what a live-channel check found: none of several
+        # recently published Shorts show the branded logo badge/caption
+        # treatment build_thumbnail() generates - they show a plain
+        # auto-selected video frame instead. Recording the real outcome in
+        # VideoMeta (thumbnail_identity column) makes this checkable across
+        # every run going forward instead of only visible by re-checking the
+        # live channel by hand.
+        thumbnail_set_status = "no thumbnail generated"
         if thumbnail_path:
             try:
                 set_youtube_thumbnail(access_token, video_id, thumbnail_path)
                 print("[pipeline] custom branded thumbnail set")
+                thumbnail_set_status = "set_ok"
             except Exception as e:  # noqa: BLE001 - thumbnail upload must never abort the run
                 print(f"[pipeline] could not set custom thumbnail: {e}")
+                thumbnail_set_status = f"set_failed: {e}"[:180]
 
         # TikTok cross-post - best-effort, must run before the temp dir
         # (and output_path) is cleaned up. tiktok_publish.py never raises;
@@ -3421,7 +3438,10 @@ def main() -> None:
         checklist["duration"], script.get("tags", []),
         hook_type=script.get("hook_type", "unclassified"),
         series=(brief.get("series", "") if brief else ""),
-        thumbnail_identity=os.path.basename(thumbnail_path) if thumbnail_path else "",
+        thumbnail_identity=(
+            f"{os.path.basename(thumbnail_path)} [{thumbnail_set_status}]"
+            if thumbnail_path else thumbnail_set_status
+        ),
         cta_style=cta_style, cta_text=script.get("cta_line", ""),
     )
     print("[pipeline] done")
