@@ -135,6 +135,13 @@ CONTENT_PILLARS = {
             "communication mistakes that quietly ruin relationships",
             "why you can't stop thinking about someone",
             "the psychology of love and rejection",
+            # Added 2026-09-02 from weekly-trend-reports.md (2026-08-30,
+            # FlowShorts sourcing) - fresh angles the research flagged as
+            # unused, seeded here since they had been sitting in the doc
+            # rather than in actual topic rotation.
+            "why someone goes quiet during an argument instead of yelling back",
+            "the difference between real love and anxious attachment",
+            "why couples who never fight might be in more trouble than couples who do",
         ],
     },
     "Human Behavior Psychology": {
@@ -157,6 +164,12 @@ CONTENT_PILLARS = {
             "why people act differently in groups",
             "the hidden psychology behind everyday habits",
             "why people make irrational decisions",
+            # Added 2026-09-02 from weekly-trend-reports.md (fluxnote/
+            # FlowShorts sourcing across 2026-08-23/2026-08-30) - the
+            # Zeigarnik effect and notification-design angles had been
+            # flagged as fresh but unused for multiple weeks running.
+            "why an unfinished task sticks in your memory longer than a finished one",
+            "why a phone notification is designed to work like a slot machine",
         ],
     },
     "Social Psychology": {
@@ -2613,8 +2626,22 @@ def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
         "\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Caption,Liberation Sans,74,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,3,2,2,60,60,420,1\n"
-        "Style: Hook,Liberation Sans,92,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,1,0,0,0,100,100,0,0,1,4,3,2,50,50,420,1\n"
+        # 2026-09-02: BorderStyle changed 1 -> 3 (opaque box) per the
+        # 2026-08-23 weekly trend report's sourced OpusClip caption spec
+        # (white text on a 60-80%-opacity black box). BorderStyle=1 only
+        # draws an outline + drop shadow - it never actually renders
+        # BackColour as a background box (most ASS renderers, including
+        # ffmpeg's libass, simply ignore BackColour under BorderStyle=1),
+        # so the "box behind the text" this channel's captions were
+        # supposed to have per that research was silently a no-op the
+        # whole time. BackColour's alpha also moved &H64 (~61% opacity,
+        # barely in-spec) -> &H4D (~70% opacity, comfortably mid-band).
+        # Under BorderStyle=3, Outline/Shadow become the box's padding/
+        # drop-shadow depth rather than an outline width, so the existing
+        # Outline/Shadow numbers are kept as-is (they already read fine
+        # as padding values, not just coincidentally).
+        "Style: Caption,Liberation Sans,74,&H00FFFFFF,&H000000FF,&H00000000,&H4D000000,1,0,0,0,100,100,0,0,3,3,2,2,60,60,420,1\n"
+        "Style: Hook,Liberation Sans,92,&H00FFFFFF,&H000000FF,&H00000000,&H4D000000,1,0,0,0,100,100,0,0,3,4,3,2,50,50,420,1\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
