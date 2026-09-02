@@ -1234,8 +1234,14 @@ def generate_script(topic: str, pillar: str, feedback: str = "", brief: dict = N
           these sentences: roughly 1 hook sentence, 2-3 for the relatable
           problem, 2-3 building curiosity, 5-7 explaining the psychology,
           3-4 for examples, 1-2 for the closing insight.
-        - HARD REQUIREMENT: total narration between 140 and 190 words.
+        - HARD REQUIREMENT: total narration between 140 and 160 words.
           Count before finalizing - under 140 words is a failed response.
+          Do not exceed 160 words even to fit more detail - this channel's
+          videos have a hard 80-second publish ceiling, and at this
+          channel's actual narration pace, anything past ~160 words
+          renders long enough to get rejected and never published. If the
+          explanation beat needs more room, cut a redundant example rather
+          than lengthening the narration past this limit.
         - Keep the energy high throughout - rhetorical questions, quick
           reveals, or "but here's the part that changes everything" style
           pivots are welcome, but the throughline must still read as ONE
@@ -1364,23 +1370,40 @@ def score_quality(topic: str, pillar: str, script: dict) -> dict:
 
 MIN_SCRIPT_WORDS = 130  # keeps narration filling the 45-55s target instead of drifting to ~30s
 
+# 2026-09-02 root-cause fix: the generation prompt's own word range (see
+# generate_script()'s "HARD REQUIREMENT" line) went up to 190 words, but
+# MAX_VIDEO_DURATION_SEC (80s) is enforced separately by the pre-publish
+# checklist AFTER a full render. At this channel's observed narration pace
+# (run #141: 171 words -> 81.3s, ~2.1 words/sec), anything past ~160 words
+# renders long enough to blow the 80s ceiling - and until now there was no
+# upper-bound check before rendering, only the MIN_SCRIPT_WORDS floor
+# below, so an overlong script wasted a full render (TTS + footage + ffmpeg)
+# before being silently rejected at the very last step and never published.
+# This is what run #141 hit. MAX_SCRIPT_WORDS mirrors MIN_SCRIPT_WORDS's
+# existing retry-with-feedback pattern so an overlong script gets caught
+# and re-generated within the same run instead of reaching the checklist.
+MAX_SCRIPT_WORDS = 160
+
 
 def generate_and_score_script(
     topic: str, pillar: str, max_attempts: int = MAX_SCRIPT_ATTEMPTS, brief: dict = None,
     cta_style: str = None, structure_tag: str = None,
 ) -> tuple:
     """Generate + score a script, retrying with feedback if it falls short
-    of the quality bar OR is too short to fill the target duration, so a
-    single pipeline run gets multiple shots at clearing both bars instead
-    of failing outright (or silently landing short) on one weak first draft.
+    of the quality bar OR lands outside the target word-count window, so a
+    single pipeline run gets multiple shots at clearing every bar instead
+    of failing outright (or silently landing short/long) on one weak first
+    draft.
 
     Videos were consistently landing at 30-35s despite the prompt asking
     for 45-55s (~130-160 words) - the quality score alone doesn't catch
     this, since a short script can still score well on hook/pacing. This
-    adds an explicit word-count floor to the retry decision, on top of the
-    existing quality check, so a script that's high-scoring but too short
-    gets sent back for another attempt with specific feedback instead of
-    being accepted as-is.
+    adds an explicit word-count floor (MIN_SCRIPT_WORDS) AND ceiling
+    (MAX_SCRIPT_WORDS) to the retry decision, on top of the existing
+    quality check, so a script that's high-scoring but too short OR too
+    long for the 80s publish ceiling gets sent back for another attempt
+    with specific feedback instead of being accepted as-is and rejected
+    only after a full, wasted render.
 
     Returns the (script, quality) pair that best satisfies both bars, or
     the best-scoring one seen if no attempt clears both within the budget.
@@ -1397,11 +1420,31 @@ def generate_and_score_script(
                                   structure_tag=structure_tag)
         quality = score_quality(topic, pillar, script)
         word_count = sum(len(s.split()) for s in script["sentences"])
-        meets_bar = quality["score"] >= QUALITY_THRESHOLD and word_count >= MIN_SCRIPT_WORDS
+        meets_bar = (
+            quality["score"] >= QUALITY_THRESHOLD
+            and MIN_SCRIPT_WORDS <= word_count <= MAX_SCRIPT_WORDS
+        )
         print(
             f"[pipeline] attempt {attempt}/{max_attempts}: "
             f"quality score {quality['score']} - {quality['notes']} "
             f"(word count: {word_count})"
+        )
+        # Tie-break among non-passing attempts: prefer whichever word count
+        # is closest to the target window rather than just "more words" -
+        # that old rule made sense when the only failure mode was "too
+        # short," but now that "too long" is also a failure mode, blindly
+        # preferring more words would bias the fallback pick toward
+        # overlong (and therefore reject-prone) scripts.
+        distance = (
+            0 if MIN_SCRIPT_WORDS <= word_count <= MAX_SCRIPT_WORDS
+            else MIN_SCRIPT_WORDS - word_count if word_count < MIN_SCRIPT_WORDS
+            else word_count - MAX_SCRIPT_WORDS
+        )
+        best_distance = (
+            0 if best_word_count >= 0 and MIN_SCRIPT_WORDS <= best_word_count <= MAX_SCRIPT_WORDS
+            else None if best_word_count < 0
+            else MIN_SCRIPT_WORDS - best_word_count if best_word_count < MIN_SCRIPT_WORDS
+            else best_word_count - MAX_SCRIPT_WORDS
         )
         is_better = (
             (meets_bar and not best_meets_bar)
@@ -1409,7 +1452,7 @@ def generate_and_score_script(
             or (
                 meets_bar == best_meets_bar
                 and quality["score"] == best_quality["score"]
-                and word_count > best_word_count
+                and (best_distance is None or distance < best_distance)
             )
         )
         if best_script is None or is_better:
@@ -1421,12 +1464,20 @@ def generate_and_score_script(
             )
         if meets_bar:
             break
-        if quality["score"] >= QUALITY_THRESHOLD:
+        if quality["score"] >= QUALITY_THRESHOLD and word_count < MIN_SCRIPT_WORDS:
             feedback = (
                 f"the script scored well but was only {word_count} words - too "
                 f"short to fill 45-55 seconds. Write at least {MIN_SCRIPT_WORDS} "
                 f"words this time by adding 2-3 more surprising beats, while "
                 f"keeping the same punchy short-sentence style."
+            )
+        elif quality["score"] >= QUALITY_THRESHOLD and word_count > MAX_SCRIPT_WORDS:
+            feedback = (
+                f"the script scored well but was {word_count} words - too long, "
+                f"it will render past this channel's 80-second publish ceiling. "
+                f"Write no more than {MAX_SCRIPT_WORDS} words this time by cutting "
+                f"a redundant example or tightening the explanation beat, while "
+                f"keeping the same punchy short-sentence style and the full story arc."
             )
         else:
             feedback = quality.get("notes", "")
