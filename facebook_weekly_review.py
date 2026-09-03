@@ -83,16 +83,26 @@ def write_facebook_report_sections(token: str, week_of: str, sections: dict) -> 
     prefixed so they're clearly distinguishable at a glance. Never raises -
     this is a reporting nicety, not something worth risking the rest of
     this script's real work (queuing next week's briefs) over."""
+    written = 0
     for section, content in sections.items():
         row = [week_of, f"facebook_{section}", content]
         try:
             p.sheet_append(token, f"{WEEKLY_REPORT_FULL_TAB}!A:C", row)
+            written += 1
         except Exception:
             try:
                 if p.ensure_sheet_tab(token, WEEKLY_REPORT_FULL_TAB, WEEKLY_REPORT_FULL_HEADER):
                     p.sheet_append(token, f"{WEEKLY_REPORT_FULL_TAB}!A:C", row)
+                    written += 1
             except Exception as e:  # noqa: BLE001 - reporting must never abort the run
                 print(f"[facebook_weekly] could not write WeeklyReportFull section '{section}': {e}")
+    # Explicit success confirmation (2026-09-03: the first live verification
+    # run of this function had zero failure output, which is ambiguous on
+    # its own - "silent" could mean "wrote fine" or "never ran". Every other
+    # writer in this codebase logs a positive confirmation; this one should
+    # too, so a future run's log is provable either way instead of inferred.
+    print(f"[facebook_weekly] wrote {written}/{len(sections)} WeeklyReportFull section rows "
+          f"(facebook_* prefix) for week {week_of}")
 
 
 def safe_num(v) -> float:
