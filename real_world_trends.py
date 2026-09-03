@@ -76,7 +76,15 @@ SOURCE_SUBREDDITS = [
 # same reason - too much of its content centers on identifiable specific
 # disputes between named (if pseudonymous) real people in a way a generic
 # "someone" retelling doesn't fully launder.
-REDDIT_HEADERS = {"User-Agent": "MindByteRealWorldTrends/1.0 (topic sourcing, read-only)"}
+# Reddit's own API rules ask for "platform:app_id:version (by /u/username)"
+# style user agents and are known to 403 generic/bot-looking UAs, especially
+# from cloud/CI IP ranges (GitHub Actions runners included) - verified live
+# on run #2 (2026-09-03): all 5 subreddits 403'd with the previous generic
+# UA. This is a best-effort source either way (see fetch_reddit_candidates'
+# non-fatal per-subreddit try/except) - CompetitorTrends alone already
+# supplies real candidates every run, so a still-failing Reddit fetch here
+# degrades gracefully rather than blocking anything.
+REDDIT_HEADERS = {"User-Agent": "python:mindbyte-real-world-trends:v1.0 (by /u/mindbyte_automation)"}
 
 MAX_POSTS_PER_SUB = 8
 MAX_IDEAS_PER_RUN = 5  # small cap: proposal's ~30%-of-weekly-output ceiling, kept well under it
@@ -98,41 +106,63 @@ _BANNED_PATTERNS = [
     re.compile(r"\bTikTok\b|\bInstagram\b|\bTwitter\b|\bX\.com\b", re.IGNORECASE),
 ]
 
-# Crude but deliberately conservative "looks like a real full name" check:
-# two-or-more consecutive Capitalized words that are NOT a known safe
-# multi-word phrase. False positives (flagging a safe idea) just cost one
-# skipped candidate - acceptable, since the gate's job is to never let a
-# real leak through, not to maximize yield.
+# Real-name detection: deliberately NOT applied to title-style fields
+# (title/seo_title/thumbnail_concept/seo_tags), because those are Title
+# Case by construction - "The Halo Effect", "Free Will", "Social Proof",
+# "Tiny Grievances" all capitalize every content word, which made the first
+# version of this check (any two consecutive capitalized words) flag every
+# single idea a run produced (verified live: 15/15 rejected on run #2,
+# 2026-09-03 - a totally silent 100% false-positive rate is worse than no
+# gate at all, since it looks like the gate is working while it's actually
+# just discarding everything). A real name is a signal worth catching in
+# normal SENTENCE-case prose (hook/angle/seo_description), where capitals
+# are meaningful, not in headline-style fields where every word is
+# capitalized regardless of content.
+PROSE_FIELDS = ("hook", "angle", "seo_description")
+TITLE_STYLE_FIELDS = ("title", "seo_title", "thumbnail_concept")
+
 _SAFE_CAPITALIZED_PHRASES = {
     "psychology of", "the psychology", "social psychology", "human behavior",
     "emotional intelligence", "brain and", "attachment styles",
+    "social proof", "free will", "halo effect", "peak end", "self efficacy",
 }
 
 
 def _looks_like_real_name(text: str) -> bool:
+    """Only meaningful on sentence-case prose. A capitalized two-word match
+    is skipped when it opens the string or follows sentence-ending
+    punctuation, since that capitalization is just normal English grammar,
+    not a name."""
     for match in re.finditer(r"\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b", text):
         phrase = match.group(0).lower()
         if phrase in _SAFE_CAPITALIZED_PHRASES:
             continue
+        start = match.start()
+        preceding = text[:start].rstrip()
+        if start == 0 or preceding.endswith((".", "!", "?", ":")):
+            continue  # sentence-initial capitalization, not a name signal
         return True
     return False
 
 
 def compliance_gate(idea: dict) -> tuple:
-    """Returns (passed: bool, reason: str). Scans every generated text
-    field. This is the hard gate from the proposal - a failure here means
-    the idea is dropped, never rewritten/auto-fixed."""
-    fields_to_check = [
-        idea.get("title", ""), idea.get("hook", ""), idea.get("angle", ""),
-        idea.get("seo_title", ""), idea.get("seo_description", ""),
-        " ".join(idea.get("seo_tags", []) or []),
-    ]
-    joined = " | ".join(fields_to_check)
+    """Returns (passed: bool, reason: str). This is the hard gate from the
+    proposal - a failure here means the idea is dropped, never rewritten/
+    auto-fixed. Banned-pattern (URL/handle/platform) scanning covers every
+    generated field; the real-name heuristic only runs on prose fields
+    (see PROSE_FIELDS above) since it produces near-100% false positives on
+    Title Case headline fields."""
+    all_fields = [idea.get(f, "") for f in (*PROSE_FIELDS, *TITLE_STYLE_FIELDS)]
+    all_fields.append(" ".join(idea.get("seo_tags", []) or []))
+    joined_all = " | ".join(all_fields)
     for pattern in _BANNED_PATTERNS:
-        if pattern.search(joined):
+        if pattern.search(joined_all):
             return False, f"banned pattern matched: {pattern.pattern}"
-    if _looks_like_real_name(joined):
-        return False, "generated text contains what looks like a real full name"
+
+    prose_text = " ".join(idea.get(f, "") for f in PROSE_FIELDS)
+    if _looks_like_real_name(prose_text):
+        return False, "generated prose contains what looks like a real full name"
+
     if not idea.get("genericized_ok", True):
         return False, "model itself flagged this scenario as not safely genericizable"
     return True, "OK"
