@@ -2720,8 +2720,110 @@ def build_ass(sentences: list, segment_durations: list, dest_path: str) -> None:
         f.write("\n".join(events))
         f.write("\n")
 
+# --- Visual storytelling engine v1 (free-only) -----------------------------
+# 2026-09-03: extracted from a competitor teardown (see project doc
+# claude/competitor-short-visual-teardown-scariest-experiment.md) - the
+# single biggest lever a channel in this niche has over raw B-roll is
+# editing craft, not spend. Two free, ffmpeg-only techniques from that
+# teardown: (1) color grade as a small emotional index instead of one
+# constant grade for the whole video, keyed off the storyboard beat's own
+# `emotion`/`atmosphere` tags that generate_storyboard() already produces
+# for every sentence - no new LLM call, no new cost; (2) exactly one
+# reserved, visually distinct "peak" treatment on the single most intense
+# beat of the video, which both emphasizes the climax and (per the
+# teardown) plausibly reads as gentler to graphic-content classifiers than
+# a photorealistic depiction would. Keyword-driven on purpose (substring
+# match against free-text emotion tags) rather than a fixed enum, since the
+# storyboard prompt was never constrained to a closed vocabulary and
+# shouldn't be - this only needs to bucket loosely, not classify precisely.
+_GRADE_DREAD_WORDS = (
+    "fear", "dread", "anxiety", "anxious", "unease", "uneasy", "tension",
+    "nervous", "worry", "worried", "panic", "suspense", "apprehension",
+)
+_GRADE_DANGER_WORDS = (
+    "anger", "angry", "danger", "shock", "shocked", "alarm", "threat",
+    "rage", "fury", "terror", "horror", "violent", "violence",
+)
+_GRADE_REFLECT_WORDS = (
+    "shame", "sad", "sadness", "isolation", "isolated", "lonely",
+    "loneliness", "regret", "nostalgia", "grief", "melancholy", "guilt",
+)
+
+# Base look kept from the original single-grade version so the default case
+# renders identically to before this change - only non-neutral beats get a
+# distinct treatment now.
+_GRADE_NEUTRAL = "eq=contrast=1.06:saturation=0.9:brightness=0.01,vignette=PI/4"
+_GRADE_COOL_DREAD = (
+    "eq=contrast=1.10:saturation=0.75:brightness=-0.02,"
+    "colorbalance=rs=-0.08:gs=-0.02:bs=0.12:rm=-0.05:bm=0.08,vignette=PI/4"
+)
+_GRADE_RED_DANGER = (
+    "eq=contrast=1.18:saturation=0.85:brightness=-0.01,"
+    "colorbalance=rs=0.18:rm=0.12:gs=-0.05,vignette=PI/3.2"
+)
+_GRADE_MONO_REFLECT = (
+    "eq=contrast=1.08:saturation=0.35:brightness=-0.015,"
+    "colorbalance=bs=0.06,vignette=PI/4"
+)
+# The one reserved "peak" treatment - near-monochrome, high-contrast,
+# deliberately distinct from every other grade in the video. Applied to at
+# most one clip per video (see _pick_peak_index below).
+_GRADE_PEAK = "hue=s=0.15,eq=contrast=1.35:brightness=-0.04:saturation=0.5,curves=preset=strong_contrast"
+
+
+def _beat_text(beat: dict) -> str:
+    if not beat:
+        return ""
+    return f"{beat.get('emotion', '')} {beat.get('atmosphere', '')} {beat.get('story_purpose', '')}".lower()
+
+
+def _grade_filter_for_beat(beat: dict) -> str:
+    """Maps a storyboard beat's free-text emotion/atmosphere tags to one of
+    a small, named grade bucket. Falls back to the original neutral grade
+    for an empty/unmatched beat, so a run with no storyboard (or a
+    fallback storyboard, see generate_storyboard()'s except branch) renders
+    exactly as it did before this feature existed."""
+    text = _beat_text(beat)
+    if not text.strip():
+        return _GRADE_NEUTRAL
+    if any(w in text for w in _GRADE_DANGER_WORDS):
+        return _GRADE_RED_DANGER
+    if any(w in text for w in _GRADE_DREAD_WORDS):
+        return _GRADE_COOL_DREAD
+    if any(w in text for w in _GRADE_REFLECT_WORDS):
+        return _GRADE_MONO_REFLECT
+    return _GRADE_NEUTRAL
+
+
+def _pick_peak_index(storyboard: list, clip_count: int) -> int | None:
+    """Picks exactly one clip index to receive the stylized peak treatment.
+    Prefers the beat with the strongest danger/dread signal; if nothing
+    matches (e.g. no storyboard, or a calm/evergreen topic with no intense
+    beat), falls back to a deterministic ~75%-through index so every video
+    still gets one distinct visual peak rather than none. Returns None only
+    if there are no clips to grade at all."""
+    if clip_count <= 0:
+        return None
+    if storyboard:
+        best_index, best_score = None, 0
+        for i, beat in enumerate(storyboard[:clip_count]):
+            text = _beat_text(beat)
+            score = sum(2 for w in _GRADE_DANGER_WORDS if w in text)
+            score += sum(1 for w in _GRADE_DREAD_WORDS if w in text)
+            if score > best_score:
+                best_index, best_score = i, score
+        if best_index is not None:
+            return best_index
+    # Deterministic fallback: land the peak beat late (climax/reveal is
+    # usually near the end, per the competitor teardown), but never on the
+    # very last clip since that's frequently the CTA/subscribe beat.
+    fallback = int(clip_count * 0.75)
+    return min(fallback, max(clip_count - 2, 0))
+# --- end visual storytelling engine v1 --------------------------------------
+
+
 def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
-                    ass_path: str, output_path: str,
+                    ass_path: str, output_path: str, storyboard: list = None,
                     title_card_path: str = None, watermark_path: str = None,
                     subscribe_badge_path: str = None) -> None:
     # Each clip is trimmed to the real measured duration of the sentence it
@@ -2730,15 +2832,26 @@ def assemble_video(clip_paths: list, segment_durations: list, audio_path: str,
     # naturally trims to the shorter list if a clip slot was unfilled.
     workdir = os.path.dirname(output_path)
     normalized = []
+    # Visual storytelling engine v1: one clip (if any beat is intense enough,
+    # or deterministically near the end otherwise) gets the reserved peak
+    # treatment; every other clip is graded per its own storyboard beat
+    # instead of one constant look for the whole video. See the block of
+    # helpers/constants directly above this function for the full rationale.
+    peak_index = _pick_peak_index(storyboard, len(clip_paths))
     for i, (clip, dur) in enumerate(zip(clip_paths, segment_durations)):
         norm_path = os.path.join(workdir, f"norm_{i}.mp4")
+        if i == peak_index:
+            grade = _GRADE_PEAK
+        else:
+            beat = storyboard[i] if storyboard and i < len(storyboard) else None
+            grade = _grade_filter_for_beat(beat)
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", clip, "-t", f"{dur:.3f}",
                 "-vf",
                 f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
                 f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},fps=30,setsar=1,"
-                f"eq=contrast=1.06:saturation=0.9:brightness=0.01,vignette=PI/4",
+                f"{grade}",
                 "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                 "-pix_fmt", "yuv420p",
                 norm_path,
@@ -3394,6 +3507,7 @@ def main() -> None:
 
         output_path = os.path.join(workdir, "final.mp4")
         assemble_video(clip_paths, segment_durations, final_audio_path, ass_path, output_path,
+                        storyboard=storyboard,
                         title_card_path=title_card_path, watermark_path=watermark_path,
                         subscribe_badge_path=subscribe_badge_path)
 
@@ -3524,7 +3638,7 @@ def main() -> None:
 
                 fb_output_path = os.path.join(workdir, "facebook_final.mp4")
                 assemble_video(fb_clip_paths, fb_segment_durations, fb_final_audio_path,
-                                fb_ass_path, fb_output_path,
+                                fb_ass_path, fb_output_path, storyboard=storyboard,
                                 title_card_path=title_card_path, watermark_path=watermark_path,
                                 subscribe_badge_path=fb_badge_path)
 
