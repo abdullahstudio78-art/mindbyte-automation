@@ -1505,6 +1505,15 @@ def main() -> None:
             series=(brief.get("series", "") if brief else ""),
             thumbnail_identity=os.path.basename(thumb_path) if thumb_path else "",
             cta_style=cta_style,
+            # 2026-09-03: long-form always synthesizes a per-paragraph grade +
+            # one reserved peak treatment when paragraphs exist (see
+            # assemble_video_longform's synthetic_beats/_pick_peak_index use)
+            # - mirrors pipeline.py's visual_approach_tag() without needing
+            # that function's per-clip storyboard, which long-form lacks.
+            visual_approach=("stock+paragraph-grade+peak-shot" if script.get("paragraphs")
+                              else "stock+constant-grade"),
+            trend_source=(brief.get("trend_source", "") if brief else ""),
+            idea_confidence=(brief.get("confidence", "") if brief else ""),
         )
         print("[pipeline_longform] done")
 

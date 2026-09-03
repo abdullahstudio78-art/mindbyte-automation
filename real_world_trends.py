@@ -295,12 +295,14 @@ def write_idea_to_queue(access_token: str, idea: dict, fmt: str, week_of: str) -
         idea.get("hook_type", "unclassified"), "",
         idea.get("thumbnail_concept", ""), "", "",
         "Medium",  # Confidence: this is a fresh trend idea, not yet performance-validated
+        "real_world_trends",  # TrendSource (2026-09-03 column) - lets VideoMeta/weekly-review
+                               # compare trend-sourced vs evergreen performance for real later
     ]
     try:
-        p.sheet_append(access_token, "NextWeekQueue!A:S", row)
+        p.sheet_append(access_token, "NextWeekQueue!A:T", row)
     except Exception:
         if p.ensure_sheet_tab(access_token, "NextWeekQueue", p.NEXT_QUEUE_HEADER):
-            p.sheet_append(access_token, "NextWeekQueue!A:S", row)
+            p.sheet_append(access_token, "NextWeekQueue!A:T", row)
         else:
             print("[real_world_trends] could not write idea to NextWeekQueue (tab missing and self-heal failed)")
 

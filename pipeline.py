@@ -621,7 +621,7 @@ def pick_topic_with_idea_score(access_token: str, max_attempts: int = MAX_IDEA_A
 # random/idea-scored topic selection with zero behavior change.
 
 NEXT_QUEUE_SHEET_TAB = "NextWeekQueue"
-NEXT_QUEUE_RANGE = f"{NEXT_QUEUE_SHEET_TAB}!A2:S"
+NEXT_QUEUE_RANGE = f"{NEXT_QUEUE_SHEET_TAB}!A2:T"
 NEXT_QUEUE_HEADER = [
     "WeekOf", "Format", "Pillar", "Title", "Hook", "Angle",
     "SEOTitle", "SEODescription", "SEOTags", "CTAStyle",
@@ -629,6 +629,13 @@ NEXT_QUEUE_HEADER = [
     # Appended at end 2026-07-31 - see weekly_review.py's confidence/loyalty upgrade
     "HookType", "Series", "ThumbnailConcept", "ChapterOutline",
     "LoyaltyAngle", "Confidence",
+    # Appended at end 2026-09-03 - real-world-psychology build-order item #2:
+    # tags where this brief actually came from (e.g. "real_world_trends",
+    # "weekly_review", or "" for the older random/idea-scored path), read
+    # back below and logged onto VideoMeta at publish time so future
+    # analysis can compare trend-sourced vs evergreen performance for real
+    # instead of guessing (see real-world-psychology-system-proposal.md Q14).
+    "TrendSource",
 ]
 
 
@@ -649,14 +656,15 @@ def get_next_queue_brief(access_token: str, fmt: str = "short") -> dict:
         print(f"[pipeline] NextWeekQueue not available yet ({e}) - using normal topic selection")
         return None
     for i, row in enumerate(rows, start=2):  # sheet row 2 is the first data row
-        row = row + [""] * (19 - len(row))
+        row = row + [""] * (20 - len(row))
         week_of, row_fmt, pillar, title, hook, angle = row[0], row[1], row[2], row[3], row[4], row[5]
         seo_title, seo_desc, seo_tags, cta_style, target_len, used = (
             row[6], row[7], row[8], row[9], row[10], row[11],
         )
-        hook_type, series, thumbnail_concept, chapter_outline_raw, loyalty_angle = (
-            row[13], row[14], row[15], row[16], row[17],
+        hook_type, series, thumbnail_concept, chapter_outline_raw, loyalty_angle, confidence = (
+            row[13], row[14], row[15], row[16], row[17], row[18],
         )
+        trend_source = row[19]  # appended 2026-09-03, blank on any pre-existing row
         if not title or used.strip().upper() == "Y":
             continue
         if row_fmt.strip().lower() != fmt.strip().lower():
@@ -679,6 +687,8 @@ def get_next_queue_brief(access_token: str, fmt: str = "short") -> dict:
             "thumbnail_concept": thumbnail_concept,
             "chapter_outline": [c.strip() for c in chapter_outline_raw.split(";") if c.strip()],
             "loyalty_angle": loyalty_angle,
+            "confidence": confidence or "Low",
+            "trend_source": trend_source,
         }
     return None
 
@@ -2819,6 +2829,26 @@ def _pick_peak_index(storyboard: list, clip_count: int) -> int | None:
     # very last clip since that's frequently the CTA/subscribe beat.
     fallback = int(clip_count * 0.75)
     return min(fallback, max(clip_count - 2, 0))
+
+
+def visual_approach_tag(storyboard: list, clip_count: int) -> str:
+    """Real-world-psychology-proposal build-order item #2 (2026-09-03):
+    'buildable now, doesn't need generation to exist first: tag every
+    published video with its actual visual approach used ... so that
+    whatever visual R&D happens later has real comparison data waiting for
+    it instead of starting blind.' This channel is stock-footage-only right
+    now (character_assets.py is disabled - see mindbyte-character-bible.md),
+    so the tag is necessarily simple today: whether this video's storyboard
+    produced a per-beat emotional grade, and whether it landed a reserved
+    stylized peak shot (see _pick_peak_index above) - the two visual
+    variables that actually differ video-to-video at this stage. Cheap,
+    zero new LLM calls, logged at publish time so future analysis (e.g.
+    "do peak-shot videos retain better") has real data instead of starting
+    from nothing once a richer visual system exists to compare against."""
+    if not storyboard:
+        return "stock+constant-grade"  # no storyboard at all (shouldn't normally happen for Shorts)
+    peak_index = _pick_peak_index(storyboard, clip_count)
+    return "stock+per-beat-grade+peak-shot" if peak_index is not None else "stock+per-beat-grade"
 # --- end visual storytelling engine v1 --------------------------------------
 
 
@@ -3198,6 +3228,14 @@ VIDEO_META_HEADER = [
     "HookType", "Series", "ThumbnailIdentity",
     # Appended at end 2026-08-01 (subscriber-conversion CTA feature):
     "CTAStyle", "CTAText",
+    # Appended at end 2026-09-03 - real-world-psychology build-order item #2:
+    # per-video visual-approach tag (see visual_approach_tag() above),
+    # trend-source (blank = normal evergreen pick, else e.g.
+    # "real_world_trends"), and the idea's confidence tier at queue time -
+    # infrastructure so future weekly-review analysis can actually compare
+    # trend-sourced vs evergreen and per-visual-approach performance
+    # instead of starting blind (proposal Q20/Q29-30).
+    "VisualApproach", "TrendSource", "IdeaConfidence",
 ]
 
 
@@ -3207,6 +3245,7 @@ def log_video_meta(
     unit_count: int, video_length_sec: float, tags: list,
     hook_type: str = "", series: str = "", thumbnail_identity: str = "",
     cta_style: str = "", cta_text: str = "",
+    visual_approach: str = "", trend_source: str = "", idea_confidence: str = "",
 ) -> None:
     """Best-effort logging of one row per published video to the VideoMeta
     tab. Never raises - a failure here (e.g. tab doesn't exist yet) must
@@ -3220,7 +3259,9 @@ def log_video_meta(
     with optional cta_style/cta_text kwargs, same backward-compatible
     default-to-"" pattern, so get_recent_cta_styles() can read the
     CTAStyle column back out for rotation and the weekly review can
-    eventually score which style converts best."""
+    eventually score which style converts best. Extended again 2026-09-03
+    with optional visual_approach/trend_source/idea_confidence kwargs, same
+    pattern - see VIDEO_META_HEADER comment above."""
     hook_opener = " ".join((hook_text or "").split()[:6])
     row = [
         video_id, title, topic, pillar, fmt, hook_text, hook_opener,
@@ -3229,6 +3270,7 @@ def log_video_meta(
         datetime.now(timezone.utc).isoformat(),
         hook_type or "unclassified", series or "", thumbnail_identity or "",
         cta_style or "", cta_text or "",
+        visual_approach or "", trend_source or "", idea_confidence or "",
     ]
     try:
         sheet_append(access_token, VIDEO_META_SHEET_TAB, row)
@@ -3668,6 +3710,9 @@ def main() -> None:
                         log_facebook_video_meta(
                             access_token, facebook_result["video_id"], script["title"], topic, pillar,
                             script, structure_tag, fb_video_length_sec, cta_style,
+                            visual_approach=visual_approach_tag(storyboard, len(fb_clip_paths)),
+                            trend_source=(brief.get("trend_source", "") if brief else ""),
+                            idea_confidence=(brief.get("confidence", "") if brief else ""),
                         )
                     except Exception as e:  # noqa: BLE001 - logging must never abort the run
                         print(f"[pipeline] could not log FacebookVideoMeta for cross-post: {e}")
@@ -3697,6 +3742,9 @@ def main() -> None:
             if thumbnail_path else thumbnail_set_status
         ),
         cta_style=cta_style, cta_text=script.get("cta_line", ""),
+        visual_approach=visual_approach_tag(storyboard, len(clip_paths)),
+        trend_source=(brief.get("trend_source", "") if brief else ""),
+        idea_confidence=(brief.get("confidence", "") if brief else ""),
     )
     print("[pipeline] done")
 

@@ -39,24 +39,34 @@ from brand_rules import pick_next_cta_style, pick_next_structure
 from facebook_publish import facebook_configured, post_short_to_facebook
 
 FACEBOOK_VIDEO_META_TAB = "FacebookVideoMeta"
-FACEBOOK_VIDEO_META_RANGE = "FacebookVideoMeta!A:N"
+FACEBOOK_VIDEO_META_RANGE = "FacebookVideoMeta!A:Q"
 FACEBOOK_VIDEO_META_HEADER = [
     "FacebookVideoID", "Title", "Topic", "Pillar", "HookText", "HookOpenerWords",
     "ScriptStructure", "WordCount", "SentenceCount", "VideoLengthSec",
     "PostHourUTC", "Tags", "CTAStyle", "CreatedAt",
+    # Appended at end 2026-09-03 - same real-world-psychology build-order
+    # item #2 fields as pipeline.py's VideoMeta (see that file's
+    # VIDEO_META_HEADER comment) - lets a future Facebook-side weekly
+    # review compare trend-sourced vs evergreen and per-visual-approach
+    # performance the same way the YouTube side now can.
+    "VisualApproach", "TrendSource", "IdeaConfidence",
 ]
 
 
 def log_facebook_video_meta(
     access_token: str, video_id: str, title: str, topic: str, pillar: str,
     script: dict, structure_tag: str, video_length_sec: float, cta_style: str,
+    visual_approach: str = "", trend_source: str = "", idea_confidence: str = "",
 ) -> None:
     """Best-effort logging of one row per Facebook post, same self-healing
     pattern as pipeline.py's log_video_meta(). This is what makes
     facebook_analytics.py's per-video Insights pull possible at all (it
     needs a list of FacebookVideoIDs to look up) and what lets
     facebook_weekly_review.py correlate performance against pillar/hook/
-    structure/length/tags, same as the YouTube side already does."""
+    structure/length/tags, same as the YouTube side already does.
+    Extended 2026-09-03 with optional visual_approach/trend_source/
+    idea_confidence kwargs, same backward-compatible default-to-""
+    pattern as every other extension in this codebase."""
     hook_text = script["sentences"][0] if script.get("sentences") else ""
     hook_opener = " ".join((hook_text or "").split()[:6])
     word_count = sum(len(s.split()) for s in script.get("sentences", []))
@@ -66,6 +76,7 @@ def log_facebook_video_meta(
         round(video_length_sec, 1), datetime.now(timezone.utc).hour,
         ", ".join(script.get("tags", [])), cta_style,
         datetime.now(timezone.utc).isoformat(),
+        visual_approach or "", trend_source or "", idea_confidence or "",
     ]
     try:
         p.sheet_append(access_token, FACEBOOK_VIDEO_META_RANGE, row)
@@ -207,6 +218,9 @@ def main() -> None:
         log_facebook_video_meta(
             access_token, result["video_id"], script["title"], topic, pillar,
             script, structure_tag, video_length_sec, cta_style,
+            visual_approach=p.visual_approach_tag(storyboard, len(clip_paths)),
+            trend_source=(brief.get("trend_source", "") if brief else ""),
+            idea_confidence=(brief.get("confidence", "") if brief else ""),
         )
 
     print("[facebook_pipeline] done")
