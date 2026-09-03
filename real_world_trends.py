@@ -44,6 +44,7 @@ rows, never break the workflow it's part of.
 """
 
 import json
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -185,6 +186,14 @@ def fetch_competitor_trend_candidates(access_token: str) -> list:
     except Exception as e:  # noqa: BLE001 - tab may not exist yet
         print(f"[real_world_trends] CompetitorTrends not available ({e}) - skipping that source")
         return []
+    # CompetitorTrends accumulates every week since 2026-07-31 (external_trends.py
+    # appends, never trims) - by now that's hundreds of rows. Only the most
+    # recent batch is "currently resonating"; older rows are stale by
+    # definition for a real-world-trend signal. Take only the tail (most
+    # recently appended rows) instead of the whole sheet history - this is
+    # also what keeps this function from single-handedly blowing the
+    # per-run Groq-call budget (see MAX_CANDIDATES_TO_EVALUATE below).
+    rows = rows[-40:]
     candidates = []
     for row in rows:
         row = row + [""] * (8 - len(row))
@@ -276,10 +285,30 @@ def run() -> None:
         print("[real_world_trends] no candidates available this run - exiting cleanly")
         return
 
+    # Run #1 (2026-09-03) timed out at 8 minutes: nothing capped how many
+    # candidates got a full Groq call before the run gave up trying to hit
+    # MAX_IDEAS_PER_RUN, so a run with a lot of compliance-gate rejections
+    # (or a large CompetitorTrends backlog) just kept calling Groq
+    # sequentially until the workflow's own timeout killed it mid-run,
+    # silently writing zero rows despite real API spend. Shuffle first (so
+    # the hard evaluation cap doesn't always favor whichever source
+    # happened to come first) and hard-cap total Groq calls per run
+    # regardless of how many candidates end up rejected - a run should
+    # always finish and report a real result, even if that result is
+    # "found fewer good ideas than the target this week."
+    random.shuffle(raw_candidates)
+    MAX_CANDIDATES_TO_EVALUATE = 15
+    evaluated = 0
+
     short_written, longform_written = 0, 0
     for candidate in raw_candidates:
         if short_written >= MAX_IDEAS_PER_RUN and longform_written >= MAX_LONGFORM_IDEAS_PER_RUN:
             break
+        if evaluated >= MAX_CANDIDATES_TO_EVALUATE:
+            print(f"[real_world_trends] hit the {MAX_CANDIDATES_TO_EVALUATE}-candidate evaluation cap "
+                  f"for this run - stopping here rather than risking a timeout")
+            break
+        evaluated += 1
         idea = build_brief_from_candidate(candidate)
         if idea is None:
             continue
