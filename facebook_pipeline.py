@@ -185,6 +185,7 @@ def main() -> None:
         output_path = os.path.join(workdir, "facebook_final.mp4")
         p.assemble_video(
             clip_paths, segment_durations, final_audio_path, ass_path, output_path,
+            storyboard=storyboard,
             title_card_path=None, watermark_path=watermark_path, subscribe_badge_path=badge_path,
         )
 
