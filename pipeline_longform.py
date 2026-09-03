@@ -92,6 +92,7 @@ from pipeline import (
     upload_to_youtube,
     ffprobe_video_info,
     set_youtube_thumbnail,
+    assign_video_to_playlist,
     # Branding (Phase 4 polish pass, 2026-07-20) - landscape title
     # card/thumbnail built locally in this module, but the shared
     # low-level drawing helpers and brand constants are reused as-is
@@ -1487,6 +1488,14 @@ def main() -> None:
             print("[pipeline_longform] custom branded thumbnail set")
         except Exception as e:  # noqa: BLE001 - thumbnail is a bonus, never abort the run
             print(f"[pipeline_longform] custom thumbnail upload failed, continuing: {e}")
+
+        # Playlist auto-assignment (2026-09-03 build-order item), same rule
+        # as the Shorts pipeline - one playlist per pillar x format, skipped
+        # for trend-sourced videos.
+        assign_video_to_playlist(
+            access_token, pillar, "longform", video_id,
+            brief.get("trend_source", "") if brief else "",
+        )
 
         sheet_row_base[0] = video_id
         sheet_row_base[3] = "Scheduled"

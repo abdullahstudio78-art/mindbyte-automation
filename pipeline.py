@@ -3127,6 +3127,110 @@ def set_youtube_thumbnail(access_token: str, video_id: str, thumbnail_path: str)
     resp.raise_for_status()
 
 
+# ---------------------------------------------------------------------------
+# Playlists (added 2026-09-03 - real-world-psychology-system-proposal.md
+# Q25-28: one playlist per pillar x format, auto-assigned at publish time.
+# Uses the SAME OAuth scope already granted for video upload (playlists.
+# insert/playlistItems.insert are covered by the same youtube.upload scope
+# a channel-owning token already has - no new consent screen needed, unlike
+# the community-engagement comment-posting feature which does).
+# ---------------------------------------------------------------------------
+
+PLAYLIST_REGISTRY_TAB = "PlaylistRegistry"
+PLAYLIST_REGISTRY_RANGE = "PlaylistRegistry!A2:D"
+PLAYLIST_REGISTRY_HEADER = ["Pillar", "Format", "PlaylistID", "CreatedAt"]
+
+
+def _playlist_title_for(pillar: str, fmt: str) -> str:
+    format_label = "Long-form" if fmt == "longform" else "Shorts"
+    return f"{pillar} — {format_label}"
+
+
+def get_or_create_playlist(access_token: str, pillar: str, fmt: str) -> str:
+    """Returns the YouTube playlist ID for this pillar+format pair,
+    creating it once and caching the mapping in a self-healing Sheet tab
+    (same append/self-heal pattern as every other registry in this file) so
+    subsequent runs reuse the same playlist instead of creating a new one
+    each time. Deliberately ONE playlist per (pillar, format) pair - Shorts
+    and long-form are never mixed (different discovery mechanics per the
+    proposal), and trending content is never added here at all (see the
+    trend_source skip at the call site) so an evergreen-themed playlist
+    never fills up with dated trend references. Raises on any real API
+    failure - callers treat playlist assignment as best-effort and catch
+    around this."""
+    try:
+        rows = sheet_get(access_token, PLAYLIST_REGISTRY_RANGE)
+    except Exception:
+        rows = []
+    for row in rows:
+        row = row + [""] * (4 - len(row))
+        if row[0] == pillar and row[1] == fmt and row[2]:
+            return row[2]
+
+    # Not registered yet - create it fresh.
+    title = _playlist_title_for(pillar, fmt)
+    resp = SESSION.post(
+        "https://www.googleapis.com/youtube/v3/playlists",
+        params={"part": "snippet,status"},
+        headers=google_headers(access_token),
+        data=json.dumps({
+            "snippet": {
+                "title": title,
+                "description": f"MindByte {pillar} content ({'long-form videos' if fmt == 'longform' else 'Shorts'}).",
+            },
+            "status": {"privacyStatus": "public"},
+        }),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    playlist_id = resp.json()["id"]
+
+    row = [pillar, fmt, playlist_id, datetime.now(timezone.utc).isoformat()]
+    try:
+        sheet_append(access_token, f"{PLAYLIST_REGISTRY_TAB}!A:D", row)
+    except Exception:
+        if ensure_sheet_tab(access_token, PLAYLIST_REGISTRY_TAB, PLAYLIST_REGISTRY_HEADER):
+            sheet_append(access_token, f"{PLAYLIST_REGISTRY_TAB}!A:D", row)
+    print(f"[pipeline] created new playlist '{title}' ({playlist_id})")
+    return playlist_id
+
+
+def add_video_to_playlist(access_token: str, playlist_id: str, video_id: str) -> None:
+    resp = SESSION.post(
+        "https://www.googleapis.com/youtube/v3/playlistItems",
+        params={"part": "snippet"},
+        headers=google_headers(access_token),
+        data=json.dumps({
+            "snippet": {
+                "playlistId": playlist_id,
+                "resourceId": {"kind": "youtube#video", "videoId": video_id},
+            },
+        }),
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+
+def assign_video_to_playlist(access_token: str, pillar: str, fmt: str, video_id: str, trend_source: str) -> None:
+    """Best-effort playlist auto-assignment, called right after a video
+    publishes successfully. Never raises - a failure here must never
+    affect a publish run that already succeeded. Deliberately skips
+    trend-sourced videos (see real-world-psychology-system-proposal.md
+    Q25-28: 'trend-driven content should NOT share playlists' with
+    evergreen content, since it ages out of relevance and would make an
+    evergreen-themed playlist look stale)."""
+    if trend_source:
+        print(f"[pipeline] skipping playlist assignment for trend-sourced video {video_id} "
+              f"(trend-driven content stays unplaylisted, per design)")
+        return
+    try:
+        playlist_id = get_or_create_playlist(access_token, pillar, fmt)
+        add_video_to_playlist(access_token, playlist_id, video_id)
+        print(f"[pipeline] added video {video_id} to playlist '{_playlist_title_for(pillar, fmt)}'")
+    except Exception as e:  # noqa: BLE001 - playlist assignment must never abort the run
+        print(f"[pipeline] playlist assignment failed for video {video_id}, continuing: {e}")
+
+
 def ffprobe_video_info(path: str) -> dict:
     """Technical sanity-check on the final assembled video: resolution,
     duration, and whether an audio stream actually made it into the file.
@@ -3603,6 +3707,14 @@ def main() -> None:
             except Exception as e:  # noqa: BLE001 - thumbnail upload must never abort the run
                 print(f"[pipeline] could not set custom thumbnail: {e}")
                 thumbnail_set_status = f"set_failed: {e}"[:180]
+
+        # Playlist auto-assignment (2026-09-03 build-order item) - one
+        # playlist per pillar x format, skipped entirely for trend-sourced
+        # videos (see assign_video_to_playlist's docstring).
+        assign_video_to_playlist(
+            access_token, pillar, "short", video_id,
+            brief.get("trend_source", "") if brief else "",
+        )
 
         # TikTok cross-post - best-effort, must run before the temp dir
         # (and output_path) is cleaned up. tiktok_publish.py never raises;
