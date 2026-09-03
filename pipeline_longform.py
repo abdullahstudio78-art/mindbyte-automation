@@ -108,6 +108,16 @@ from pipeline import (
     # reused as-is with LF_SUBSCRIBE_BADGE_WIDTH/HEIGHT passed in below,
     # since it already accepts width/height overrides for exactly this.
     build_subscribe_badge,
+    # Visual storytelling engine v1 (2026-09-03) - same per-beat emotional
+    # color-grade index and reserved "peak" treatment as the Shorts
+    # pipeline, reused here rather than reimplemented. Long-form has no
+    # per-sentence storyboard (it works in whole paragraphs, see
+    # clip_groups above), so each paragraph's own text stands in for a
+    # storyboard beat's emotion/atmosphere tags - same keyword-bucket
+    # classifier, just fed the paragraph directly instead of an LLM tag.
+    _grade_filter_for_beat,
+    _pick_peak_index,
+    _GRADE_PEAK,
 )
 
 # ---------------------------------------------------------------------------
@@ -1024,7 +1034,7 @@ def build_thumbnail_longform(dest_path: str, title: str, pillar: str,
 
 
 def assemble_video_longform(clip_groups: list, segment_durations: list, audio_path: str,
-                             ass_path: str, output_path: str,
+                             ass_path: str, output_path: str, paragraphs: list = None,
                              title_card_path: str = None, watermark_path: str = None,
                              subscribe_badge_path: str = None) -> None:
     """Each paragraph's real measured audio duration is divided evenly
@@ -1051,6 +1061,16 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
     idx = 0
     last_good_clip = None
     total_paragraphs = len(clip_groups)
+    # Visual storytelling engine v1: one synthetic "beat" per paragraph
+    # (its own text standing in for a storyboard's emotion/atmosphere
+    # tags), reusing the exact same grade buckets and peak-selection logic
+    # as the Shorts pipeline - see the import comment above for why this
+    # is paragraph-level rather than sentence-level for long-form.
+    synthetic_beats = (
+        [{"emotion": para, "atmosphere": "", "story_purpose": ""} for para in paragraphs]
+        if paragraphs else None
+    )
+    peak_para_index = _pick_peak_index(synthetic_beats, total_paragraphs)
     for para_idx, (clips, dur) in enumerate(zip(clip_groups, segment_durations)):
         if not clips:
             # A paragraph with zero B-roll clips used to be silently
@@ -1082,6 +1102,11 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
         n = min(n, max_slices)
         clips = clips[:n]
         slice_dur = dur / n
+        if para_idx == peak_para_index:
+            grade = _GRADE_PEAK
+        else:
+            beat = synthetic_beats[para_idx] if synthetic_beats and para_idx < len(synthetic_beats) else None
+            grade = _grade_filter_for_beat(beat)
         for clip in clips:
             norm_path = os.path.join(workdir, f"norm_{idx}.mp4")
             subprocess.run(
@@ -1089,7 +1114,7 @@ def assemble_video_longform(clip_groups: list, segment_durations: list, audio_pa
                     "ffmpeg", "-y", "-i", clip, "-t", f"{slice_dur:.3f}",
                     "-vf",
                     f"scale={LF_VIDEO_WIDTH}:{LF_VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
-                    f"crop={LF_VIDEO_WIDTH}:{LF_VIDEO_HEIGHT},fps=30,setsar=1",
+                    f"crop={LF_VIDEO_WIDTH}:{LF_VIDEO_HEIGHT},fps=30,setsar=1,{grade}",
                     "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                     "-pix_fmt", "yuv420p",
                     norm_path,
@@ -1427,6 +1452,7 @@ def main() -> None:
         output_path = os.path.join(workdir, "final_lf.mp4")
         assemble_video_longform(
             clip_groups, segment_durations, final_audio_path, ass_path, output_path,
+            paragraphs=script.get("paragraphs"),
             title_card_path=title_card_path, watermark_path=watermark_path,
             subscribe_badge_path=subscribe_badge_path,
         )
