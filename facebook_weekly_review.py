@@ -58,6 +58,42 @@ FACEBOOK_WEEKLY_PLAN_HEADER = [
     "WeekOf", "PostsAnalyzed", "TopPattern", "WeakPattern", "PlanNotes", "GeneratedAt",
 ]
 
+# Added 2026-09-03 - real-world-psychology build-order item #3 (analytics
+# extension): this was the one real gap left after confirming the rest of
+# "Self-Improving System v2" (see claude/self-improving-system-v2-
+# implementation.md) was already live - this file had its OWN confidence-
+# scored weekly review (see build_pattern_summary below), but it never fed
+# into the SAME consolidated report weekly_review.py already writes for
+# YouTube. Rather than build a second reporting system, this writes
+# Facebook's sections into weekly_review.py's own WEEKLY_REPORT_FULL_TAB
+# under a "facebook_"-prefixed section name, same WeekOf - so a human (or
+# a future system) reading WeeklyReportFull sees both platforms for the
+# same week in one place, not two separate reports to cross-reference by
+# hand. Tab name/header duplicated here (not imported from weekly_review.py)
+# on purpose - this file already duplicates NEXT_QUEUE_HEADER the same way,
+# matching this codebase's existing pattern of small constant duplication
+# over a cross-import between the two weekly-review scripts.
+WEEKLY_REPORT_FULL_TAB = "WeeklyReportFull"
+WEEKLY_REPORT_FULL_HEADER = ["Date", "Section", "Content"]
+
+
+def write_facebook_report_sections(token: str, week_of: str, sections: dict) -> None:
+    """Best-effort: appends Facebook's weekly findings into the SAME shared
+    WeeklyReportFull tab the YouTube side writes to, one row per section,
+    prefixed so they're clearly distinguishable at a glance. Never raises -
+    this is a reporting nicety, not something worth risking the rest of
+    this script's real work (queuing next week's briefs) over."""
+    for section, content in sections.items():
+        row = [week_of, f"facebook_{section}", content]
+        try:
+            p.sheet_append(token, f"{WEEKLY_REPORT_FULL_TAB}!A:C", row)
+        except Exception:
+            try:
+                if p.ensure_sheet_tab(token, WEEKLY_REPORT_FULL_TAB, WEEKLY_REPORT_FULL_HEADER):
+                    p.sheet_append(token, f"{WEEKLY_REPORT_FULL_TAB}!A:C", row)
+            except Exception as e:  # noqa: BLE001 - reporting must never abort the run
+                print(f"[facebook_weekly] could not write WeeklyReportFull section '{section}': {e}")
+
 
 def safe_num(v) -> float:
     try:
@@ -265,6 +301,27 @@ def main() -> None:
         f"{len(ideas)} new Facebook briefs queued this week from {len(videos)} analyzed posts",
         now_iso,
     ]
+    # Fold into the SAME consolidated weekly report the YouTube side gets
+    # (see write_facebook_report_sections' docstring above for why this
+    # lives here instead of a second, separate report).
+    pattern_lines = []
+    for pat in patterns:
+        if pat.get("enough_data"):
+            pattern_lines.append(f"{pat['label']}: best={pat['best']} worst={pat['worst']}")
+        else:
+            pattern_lines.append(f"{pat['label']}: not enough data yet")
+    write_facebook_report_sections(access_token, week_of, {
+        "executive_summary": (
+            f"{len(videos)} Facebook posts analyzed this week. "
+            f"Top performer: {top[0]['title'] if top else 'n/a'} (score {top[0]['score']:.0f})." if top
+            else f"{len(videos)} Facebook posts analyzed this week."
+        ),
+        "biggest_wins": "; ".join(f"{v['title']} (score {v['score']:.0f})" for v in top),
+        "biggest_failures": "; ".join(f"{v['title']} (score {v['score']:.0f})" for v in bottom),
+        "pattern_summary": " | ".join(pattern_lines),
+        "briefs_queued": f"{len(ideas)} new Facebook briefs queued this week from {len(videos)} analyzed posts",
+    })
+
     try:
         p.sheet_append(access_token, f"{FACEBOOK_WEEKLY_PLAN_TAB}!A:F", plan_row)
     except Exception:
