@@ -388,17 +388,21 @@ def load_analytics_history_latest(token: str) -> dict:
 
 
 def load_video_meta(token: str) -> dict:
-    """Reads VideoMeta!A2:S (extended from A2:N 2026-07-31 with HookType,
+    """Reads VideoMeta!A2:V (extended from A2:N 2026-07-31 with HookType,
     Series, ThumbnailIdentity appended at the end; extended again 2026-08-01
-    with CTAStyle, CTAText for the subscriber-conversion feature). Rows
-    written before either upgrade will simply be shorter than 19 cells - the
-    padding below fills those with "" so hook_type/series/cta_style
-    gracefully read as unset ("") rather than raising, exactly as the spec
+    with CTAStyle, CTAText for the subscriber-conversion feature; extended
+    again 2026-09-06 to A2:V to pick up VisualApproach/TrendSource/
+    IdeaConfidence, appended to VideoMeta by pipeline.py on 2026-09-03 but
+    never actually read back until now - the write existed, this consuming
+    read didn't, same gap as thumbnail_identity was before 2026-08-18). Rows
+    written before any of these upgrades will simply be shorter than 22
+    cells - the padding below fills those with "" so every new field
+    gracefully reads as unset ("") rather than raising, exactly as the spec
     requires."""
-    rows = sheet_get(token, "VideoMeta!A2:S")
+    rows = sheet_get(token, "VideoMeta!A2:V")
     meta = {}
     for row in rows:
-        row = row + [""] * (19 - len(row))
+        row = row + [""] * (22 - len(row))
         video_id = row[0].strip()
         if not video_id:
             continue
@@ -413,6 +417,9 @@ def load_video_meta(token: str) -> dict:
             "thumbnail_identity": (row[16] or "").strip(),
             "cta_style": (row[17] or "").strip(),
             "cta_text": (row[18] or "").strip(),
+            "visual_approach": (row[19] or "").strip(),
+            "trend_source": (row[20] or "").strip(),
+            "idea_confidence": (row[21] or "").strip(),
         }
     return meta
 
@@ -471,6 +478,13 @@ def merge_records(videos: list, history: dict, meta: dict) -> list:
             # for videos published before this feature shipped.
             "cta_style": m.get("cta_style", "") or "",
             "cta_text": m.get("cta_text", "") or "",
+            # Visual-approach/trend-source/confidence-tier logging (2026-09-03)
+            # - read back and correlated against performance for the first
+            # time here (2026-09-06); blank for videos published before that
+            # build shipped.
+            "visual_approach": m.get("visual_approach", "") or "",
+            "trend_source": m.get("trend_source", "") or "",
+            "idea_confidence": m.get("idea_confidence", "") or "",
         }
         merged.append(rec)
     return merged
@@ -724,6 +738,21 @@ def detect_patterns(records: list) -> dict:
     # requirement.
     if any(r.get("cta_style") for r in records):
         add("cta_style", lambda r: r["cta_style"] or "(none)")
+
+    # Trend-source and confidence-tier calibration (2026-09-06): closes the
+    # loop the 2026-09-03 build only half-finished - TrendSource/
+    # IdeaConfidence were logged to VideoMeta at publish time but never
+    # correlated against actual performance. trend_source answers "does a
+    # real-world/trend-sourced idea actually outperform an evergreen one?";
+    # idea_confidence answers "does the confidence tier NextWeekQueue briefs
+    # are tagged with actually track real outcomes?" - i.e. is the tiering
+    # itself trustworthy, or just noise dressed up as a label. Both are
+    # gracefully skipped (same as every other optional dimension above) if
+    # no record has the field populated yet.
+    if any(r.get("trend_source") for r in records):
+        add("trend_source", lambda r: r["trend_source"] or "(evergreen)")
+    if any(r.get("idea_confidence") for r in records):
+        add("idea_confidence_calibration", lambda r: r["idea_confidence"] or "(untagged)")
 
     # Keyword/tag-level pattern: a video can carry many tags, so this is a
     # one-to-many expansion rather than a straight groupby.

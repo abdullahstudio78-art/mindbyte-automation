@@ -639,8 +639,16 @@ NEXT_QUEUE_HEADER = [
 ]
 
 
+# Confidence-tiering upgrade (2026-09-06): rank matching NextWeekQueue rows
+# by confidence tier (High first) instead of pure FIFO, so a high-confidence
+# idea gets made before an older but shakier one. Ties within a tier still
+# resolve oldest-first, so this never starves a tier or reorders within it -
+# purely a stable re-sort on top of the existing queue order.
+_CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
 def get_next_queue_brief(access_token: str, fmt: str = "short") -> dict:
-    """Return the oldest not-yet-used NextWeekQueue row matching `fmt`
+    """Return the best not-yet-used NextWeekQueue row matching `fmt`
     ("short" or "longform"), as a dict, plus its 1-based sheet row number
     under key "_row" (needed to mark it consumed later). Returns None if
     the tab doesn't exist, is empty, or has no matching unused row - all
@@ -649,12 +657,19 @@ def get_next_queue_brief(access_token: str, fmt: str = "short") -> dict:
 
     Extended 2026-07-31: also reads the new optional HookType/Series/
     ThumbnailConcept/ChapterOutline/LoyaltyAngle columns (blank/absent on
-    older rows, which is fine - they default to "" / [] below)."""
+    older rows, which is fine - they default to "" / [] below).
+
+    Extended 2026-09-06: picks the highest-confidence unused match rather
+    than simply the oldest (row order is still the tie-breaker within a
+    confidence tier), so the queue's own IdeaConfidence tagging actually
+    changes what gets made next instead of only being logged for later
+    analysis."""
     try:
         rows = sheet_get(access_token, NEXT_QUEUE_RANGE)
     except Exception as e:  # noqa: BLE001 - tab may not exist yet, that's fine
         print(f"[pipeline] NextWeekQueue not available yet ({e}) - using normal topic selection")
         return None
+    candidates = []
     for i, row in enumerate(rows, start=2):  # sheet row 2 is the first data row
         row = row + [""] * (20 - len(row))
         week_of, row_fmt, pillar, title, hook, angle = row[0], row[1], row[2], row[3], row[4], row[5]
@@ -669,8 +684,10 @@ def get_next_queue_brief(access_token: str, fmt: str = "short") -> dict:
             continue
         if row_fmt.strip().lower() != fmt.strip().lower():
             continue
-        return {
+        confidence = confidence or "Low"
+        candidates.append({
             "_row": i,
+            "_rank": _CONFIDENCE_RANK.get(confidence.strip().lower(), 1),
             "week_of": week_of,
             "format": row_fmt,
             "pillar": pillar,
@@ -687,10 +704,18 @@ def get_next_queue_brief(access_token: str, fmt: str = "short") -> dict:
             "thumbnail_concept": thumbnail_concept,
             "chapter_outline": [c.strip() for c in chapter_outline_raw.split(";") if c.strip()],
             "loyalty_angle": loyalty_angle,
-            "confidence": confidence or "Low",
+            "confidence": confidence,
             "trend_source": trend_source,
-        }
-    return None
+        })
+    if not candidates:
+        return None
+    # Stable sort: rank ascending (High=0 first), then original row order
+    # (candidates is already built in ascending row order, and Python's
+    # sort is stable, so ties keep the oldest-first tie-break for free).
+    candidates.sort(key=lambda c: c["_rank"])
+    best = candidates[0]
+    del best["_rank"]
+    return best
 
 
 def mark_queue_brief_used(access_token: str, row_number: int) -> None:
