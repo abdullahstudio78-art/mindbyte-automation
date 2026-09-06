@@ -105,11 +105,24 @@ def run() -> None:
         if key not in playlist_cache:
             try:
                 playlist_id = p.get_or_create_playlist(token, pillar, fmt)
-                existing = existing_playlist_video_ids(token, playlist_id)
-                playlist_cache[key] = (playlist_id, existing)
             except Exception as e:  # noqa: BLE001
                 print(f"[backfill] could not resolve playlist for {key}, skipping its videos: {e}")
                 playlist_cache[key] = (None, set())
+                playlist_id = None
+            if playlist_id is not None:
+                # Listing a playlist's contents can 404 for a brief window
+                # right after it's freshly created (API propagation delay) -
+                # that's not a real failure, it just means the playlist has
+                # no videos in it yet. Treat any listing failure as "assume
+                # empty" rather than abandoning the whole pillar/format
+                # bucket, since the playlist itself was created successfully.
+                try:
+                    existing = existing_playlist_video_ids(token, playlist_id)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[backfill] could not list existing contents of playlist {playlist_id} "
+                          f"(assuming empty - likely just-created): {e}")
+                    existing = set()
+                playlist_cache[key] = (playlist_id, existing)
         playlist_id, existing_ids = playlist_cache[key]
         if playlist_id is None:
             failed += 1
