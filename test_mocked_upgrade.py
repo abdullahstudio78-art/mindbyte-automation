@@ -184,7 +184,6 @@ with mock.patch.object(wr, "get_access_token", return_value="fake-token"), \
 # gap. Verifies the new _api_call_with_retry() helpers actually retry
 # instead of giving up on the first 429/5xx.
 import pipeline as pl
-import community_engagement as ce
 
 def _fake_resp(status, payload):
     r = mock.Mock(status_code=status)
@@ -314,7 +313,7 @@ for mod, label in ((pl, "pipeline"), (wr, "weekly_review")):
 # model 404s, call_groq() queries Groq's /models endpoint and retries with
 # whatever it finds live, instead of requiring another manual code patch
 # the next time a model is decommissioned.
-for mod, label in ((pl, "pipeline"), (wr, "weekly_review"), (ce, "community_engagement")):
+for mod, label in ((pl, "pipeline"), (wr, "weekly_review")):
     calls = []
 
     def fake_post_all_dead(url, headers=None, json=None, timeout=None, _calls=calls):
@@ -333,7 +332,7 @@ for mod, label in ((pl, "pipeline"), (wr, "weekly_review"), (ce, "community_enga
          mock.patch.object(mod.SESSION, "get", side_effect=fake_get_models):
         try:
             result = mod.call_groq("test prompt")
-            expected_result = "OK from live discovery" if mod is not ce else "OK from live discovery"
+            expected_result = "OK from live discovery"
             check(f"{label}.call_groq discovers and uses a live model when every configured model 404s",
                   result == expected_result and "brand/new-live-model" in calls)
         except Exception as e:

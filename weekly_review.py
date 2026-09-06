@@ -417,65 +417,6 @@ def load_video_meta(token: str) -> dict:
     return meta
 
 
-def load_community_engagement_insights(token: str) -> dict:
-    """Best-effort, additive-only: summarizes the Community Engagement
-    Pipeline's CommentQueue + CommunityEngagementResults tabs (written by
-    community_engagement.py) into a small dict this file's Groq prompt can
-    reference. Returns an empty-but-valid dict (has_data=False) if either
-    tab is missing/empty or the pipeline hasn't been used yet - this
-    script must keep working exactly as before for anyone who hasn't set
-    up the community engagement system."""
-    empty = {"has_data": False, "posted_count": 0, "pending_count": 0, "by_query": {}}
-    try:
-        queue_rows = sheet_get(token, "CommentQueue!A2:Z")
-        results_rows = sheet_get(token, "CommunityEngagementResults!A2:F")
-    except Exception:
-        return empty
-    if not queue_rows:
-        return empty
-
-    # CommentQueue columns (see community_engagement_config.COMMENT_QUEUE_HEADER):
-    # BatchMonth, VideoID, VideoURL, VideoTitle, ChannelTitle, Query,
-    # DraftComment, RelevanceScore, SimilarityScore, Status, Approved,
-    # ScheduledDate, PostedAt, CommentID, CommentURL, CreatedAt
-    posted_count = 0
-    pending_count = 0
-    query_by_comment_id = {}
-    for row in queue_rows:
-        padded = row + [""] * (16 - len(row))
-        status, query, comment_id = padded[9], padded[5], padded[13]
-        if status == "posted":
-            posted_count += 1
-            if comment_id:
-                query_by_comment_id[comment_id] = query
-        elif status == "pending_review":
-            pending_count += 1
-
-    # CommunityEngagementResults columns: CheckedAt, CommentID, VideoID,
-    # LikeCount, ReplyCount, Query
-    by_query = defaultdict(lambda: {"likes": 0, "comments_posted": 0, "samples": 0})
-    for row in results_rows:
-        if len(row) < 6:
-            continue
-        comment_id, like_count, query = row[1], row[3], row[5]
-        q = query or query_by_comment_id.get(comment_id, "unknown")
-        try:
-            likes = int(like_count)
-        except (TypeError, ValueError):
-            likes = 0
-        by_query[q]["likes"] += likes
-        by_query[q]["samples"] += 1
-
-    for q in query_by_comment_id.values():
-        by_query.setdefault(q, {"likes": 0, "comments_posted": 0, "samples": 0})
-        by_query[q]["comments_posted"] += 1
-
-    return {
-        "has_data": posted_count > 0,
-        "posted_count": posted_count,
-        "pending_count": pending_count,
-        "by_query": dict(by_query),
-    }
 
 
 def load_competitor_trends(token: str) -> list:
@@ -958,9 +899,7 @@ def format_pattern_line(dimension: str, data: dict) -> str:
     return line
 
 
-def build_groq_prompt(records: list, patterns: dict, has_subscriber_data: bool, competitor_trends: list,
-                       community_insights: dict = None) -> str:
-    community_insights = community_insights or {"has_data": False}
+def build_groq_prompt(records: list, patterns: dict, has_subscriber_data: bool, competitor_trends: list) -> str:
     by_composite = sorted(records, key=lambda r: r["composite_score"], reverse=True)
     top_n = by_composite[:5]
     bottom_n = by_composite[-5:] if len(by_composite) > 5 else []
@@ -1000,27 +939,6 @@ def build_groq_prompt(records: list, patterns: dict, has_subscriber_data: bool, 
     else:
         trend_summary = "(no external trend data collected this week)"
 
-    if community_insights.get("has_data"):
-        query_lines = "\n".join(
-            f"- \"{q}\": {stats['comments_posted']} comment(s) posted, "
-            f"{stats['likes']} total like(s) on tracked comments"
-            for q, stats in sorted(
-                community_insights["by_query"].items(),
-                key=lambda kv: kv[1]["likes"], reverse=True,
-            )
-        ) or "(no per-topic breakdown yet)"
-        community_summary = (
-            f"{community_insights['posted_count']} comment(s) posted via the Community Engagement "
-            f"Pipeline so far, {community_insights['pending_count']} still awaiting your approval. "
-            f"Engagement by discovery topic:\n{query_lines}"
-        )
-    else:
-        community_summary = (
-            "No community engagement data yet (either the pipeline hasn't posted any comments, or "
-            "hasn't been set up) - do not make claims about which communities/topics drive profile "
-            "visits or engagement until this has real data."
-        )
-
     return f"""You are the content strategist for MindByte, a cinematic psychology YouTube channel
 (documentary-style narration over real B-roll, both Shorts and long-form video). Priority order:
 1. Storytelling 2. Viewer retention 3. Emotional connection 4. Visual quality 5. Cinematic identity
@@ -1053,11 +971,6 @@ the public YouTube Data API (real public data, NOT to be copied verbatim - use o
 inspiration: title structure, length, framing):
 {trend_summary}
 
-COMMUNITY ENGAGEMENT PIPELINE - comments posted on other creators' psychology videos (see
-community_engagement.py), each one previously reviewed and approved by the channel owner before
-posting:
-{community_summary}
-
 Return ONLY valid JSON with this EXACT shape (no markdown, no extra keys):
 {{
   "executive_summary": "<2-3 sentence plain-English summary of the week>",
@@ -1069,7 +982,6 @@ Return ONLY valid JSON with this EXACT shape (no markdown, no extra keys):
   "storytelling_analysis": "<short paragraph on structure/pacing patterns>",
   "subscriber_analysis": "<short paragraph - if no subscriber data yet, say so plainly and describe what proxy signals (retention, duration, engagement) are being used instead>",
   "competitor_trend_analysis": "<short paragraph on what the external inspiration data suggests, framed as inspiration only>",
-  "community_engagement_analysis": "<short paragraph on what the community engagement data suggests about which topics/discovery queries produce interest - if no data yet, say so plainly rather than guessing>",
   "priority_actions_next_week": [{{"action": "<concrete action>", "confidence": "High|Medium|Low"}}],
   "topics_to_avoid": [{{"topic": "<topic or pattern to avoid>", "confidence": "High|Medium|Low"}}],
   "topics_to_increase": [{{"topic": "<topic or pattern to lean into>", "confidence": "High|Medium|Low"}}],
@@ -1118,9 +1030,6 @@ def main() -> None:
     meta = load_video_meta(token)
     competitor_trends = load_competitor_trends(token)
     print(f"[weekly] {len(competitor_trends)} competitor-trend rows available as inspiration input")
-    community_insights = load_community_engagement_insights(token)
-    print(f"[weekly] community engagement data available: {community_insights['has_data']} "
-          f"(posted={community_insights['posted_count']}, pending={community_insights['pending_count']})")
     records = merge_records(all_videos, history, meta)
     compute_composite_scores(records)
     patterns, has_subscriber_data = detect_patterns(records)
@@ -1140,7 +1049,7 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"[weekly] could not build/save WinningContentProfile (non-fatal): {e}")
 
-    prompt = build_groq_prompt(records, patterns, has_subscriber_data, competitor_trends, community_insights)
+    prompt = build_groq_prompt(records, patterns, has_subscriber_data, competitor_trends)
     try:
         raw = call_groq(prompt)
     except Exception as e:  # noqa: BLE001 - a Groq outage/non-429 error must not
@@ -1201,7 +1110,6 @@ def main() -> None:
         "storytelling_analysis": report.get("storytelling_analysis", ""),
         "subscriber_analysis": report.get("subscriber_analysis", ""),
         "competitor_trend_analysis": report.get("competitor_trend_analysis", ""),
-        "community_engagement_analysis": report.get("community_engagement_analysis", ""),
         "priority_actions_next_week": _fmt_confidence_list(priority_actions, "action"),
         "topics_to_avoid": _fmt_confidence_list(topics_to_avoid, "topic"),
         "topics_to_increase": _fmt_confidence_list(topics_to_increase, "topic"),
