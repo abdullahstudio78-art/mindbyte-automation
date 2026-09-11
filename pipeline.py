@@ -758,16 +758,27 @@ def select_topic_for_run(access_token: str, fmt: str = "short") -> tuple:
         print(f"[pipeline] idea-scoring the queued brief failed ({e}) - proceeding with it anyway")
         idea_score_avg = IDEA_SCORE_AVG_THRESHOLD  # assume it clears the bar
 
-    # Drain the queue row regardless of outcome - if it scores too low we
-    # fall back to a normal pick below, but we never want to keep retrying
-    # the same weak queued idea forever.
-    mark_queue_brief_used(access_token, brief["_row"])
-
     if idea_score_avg < IDEA_SCORE_AVG_THRESHOLD:
+        # Drain here: a low-scoring queued idea is genuinely weak, so we
+        # never want to keep retrying it forever - fall back to a normal
+        # pick below. (2026-09-11 fix: this used to be unconditional right
+        # after get_next_queue_brief(), before we even knew if the brief
+        # would be used - which meant a brief that scored FINE but then hit
+        # an unrelated crash later in the run (a render timeout, an upload
+        # failure) was marked used anyway and silently lost forever, even
+        # though nothing was wrong with the idea itself. See run #158,
+        # 2026-09-09: 'Why Men Overreact When They Feel Their Partner
+        # Pulling Away' scored idea 7.2/quality 8, passed compliance, then
+        # was lost to a 3-tier ffmpeg timeout - the queue row was already
+        # marked Used=Y before rendering even started, so it was never
+        # retried. Marking used is now deferred to main(), at each point a
+        # brief is definitively rejected (quality/compliance/checklist) or
+        # successfully published - never at selection time.)
         print(
             f"[pipeline] queued brief '{topic}' scored {idea_score_avg:.1f} "
             f"(below {IDEA_SCORE_AVG_THRESHOLD}) - falling back to normal topic selection"
         )
+        mark_queue_brief_used(access_token, brief["_row"])
         topic, pillar, idea_score_avg = pick_topic_with_idea_score(access_token)
         fallback_brief = build_fallback_brief_from_profile(access_token) or None
         if fallback_brief:
@@ -3537,6 +3548,12 @@ def main() -> None:
         sheet_row_base[14] = "Skipped upload: failed quality/compliance gate"
         sheet_append(access_token, "Videos!A:O", sheet_row_base)
         print("[pipeline] rejected by quality/compliance gate - no upload")
+        # Definitive terminal rejection - the idea/script itself is weak,
+        # so drain the queue slot now (matches select_topic_for_run()'s
+        # "never retry a weak idea" design). See 2026-09-11 fix comment
+        # there for why this is no longer done at selection time.
+        if brief:
+            mark_queue_brief_used(access_token, brief["_row"])
         return
 
     with tempfile.TemporaryDirectory() as workdir:
@@ -3700,6 +3717,11 @@ def main() -> None:
             sheet_append(access_token, "Videos!A:O", sheet_row_base)
             log_quality_checklist(access_token, topic, pillar, checklist)
             print(f"[pipeline] rejected by pre-publish checklist: {checklist['failed']}")
+            # Definitive terminal rejection (bad duration/resolution from
+            # this generation attempt) - drain, same rationale as the
+            # quality/compliance gate above.
+            if brief:
+                mark_queue_brief_used(access_token, brief["_row"])
             return
 
         publish_at = datetime.now(timezone.utc) + timedelta(hours=PUBLISH_DELAY_HOURS)
@@ -3708,6 +3730,14 @@ def main() -> None:
             script["tags"], publish_at.isoformat(),
         )
         print(f"[pipeline] uploaded video id: {video_id}")
+        # Success - NOW it's safe to drain the queue slot (2026-09-11 fix).
+        # Anything that crashes between topic selection and this point
+        # (storyboard/voiceover/render/upload - e.g. the ffmpeg timeout
+        # that lost run #158's brief) leaves the row unmarked, so
+        # get_next_queue_brief() picks it up again on a future run instead
+        # of silently discarding a good idea over an infra flake.
+        if brief:
+            mark_queue_brief_used(access_token, brief["_row"])
 
         # 2026-09-02: this success/failure was previously only ever printed
         # to the Actions log (which nobody reviews per-run) and never

@@ -122,6 +122,10 @@ def main() -> None:
     print(f"[facebook_pipeline] compliance: {compliance}")
     if quality["score"] < p.QUALITY_THRESHOLD or not compliance["passed"]:
         print("[facebook_pipeline] rejected by quality/compliance gate - no post")
+        # Definitive terminal rejection - drain the queue slot (2026-09-11
+        # fix, see pipeline.py's select_topic_for_run() for full rationale).
+        if brief:
+            p.mark_queue_brief_used(access_token, brief["_row"])
         return
 
     with tempfile.TemporaryDirectory() as workdir:
@@ -222,6 +226,9 @@ def main() -> None:
             trend_source=(brief.get("trend_source", "") if brief else ""),
             idea_confidence=(brief.get("confidence", "") if brief else ""),
         )
+        # Success - safe to drain the queue slot now (2026-09-11 fix).
+        if brief:
+            p.mark_queue_brief_used(access_token, brief["_row"])
 
     print("[facebook_pipeline] done")
 

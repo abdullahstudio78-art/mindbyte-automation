@@ -72,6 +72,7 @@ from pipeline import (
     # pipeline.py so both formats drain the same NextWeekQueue tab, filtered
     # by format ("short" vs "longform")
     select_topic_for_run,
+    mark_queue_brief_used,
     log_video_meta,
     # Groq
     call_groq,
@@ -1387,6 +1388,13 @@ def main() -> None:
         sheet_row_base[13] = "Skipped upload: failed quality/compliance gate"
         log_video_row()
         print("[pipeline_longform] rejected by quality/compliance gate - no upload")
+        # Definitive terminal rejection - drain the queue slot (2026-09-11
+        # fix, see pipeline.py's select_topic_for_run() for the full
+        # rationale: marking used now happens at each definitive outcome
+        # instead of at selection time, so a mid-render/upload crash no
+        # longer silently loses an otherwise-good queued idea).
+        if brief:
+            mark_queue_brief_used(access_token, brief["_row"])
         return
 
     with tempfile.TemporaryDirectory() as workdir:
@@ -1469,6 +1477,8 @@ def main() -> None:
             log_video_row()
             log_longform_checklist(access_token, topic, pillar, checklist)
             print(f"[pipeline_longform] rejected by pre-publish checklist: {checklist['failed']}")
+            if brief:
+                mark_queue_brief_used(access_token, brief["_row"])
             return
 
         publish_at = datetime.now(timezone.utc) + timedelta(hours=PUBLISH_DELAY_HOURS)
@@ -1477,6 +1487,9 @@ def main() -> None:
             script["tags"], publish_at.isoformat(),
         )
         print(f"[pipeline_longform] uploaded video id: {video_id}")
+        # Success - safe to drain the queue slot now (2026-09-11 fix).
+        if brief:
+            mark_queue_brief_used(access_token, brief["_row"])
 
         # Phase 4 polish pass (2026-07-20): custom branded thumbnail,
         # ported from the Shorts pipeline - long-form had none before this
