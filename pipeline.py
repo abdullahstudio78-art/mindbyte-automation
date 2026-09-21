@@ -3620,51 +3620,84 @@ def get_recent_structures(access_token: str, limit: int = 4) -> list:
     return structures[-limit:]
 
 
+RUN_TOPIC_ATTEMPTS = 2  # see 2026-09-21 comment in main() below
+
+
 def main() -> None:
     access_token = get_access_token()
-    # Closed self-improvement loop (2026-07-30): try a weekly-generated,
-    # performance-informed brief first; falls back to the original random/
-    # idea-scored pick automatically if no brief is queued. See
-    # select_topic_for_run()'s docstring - this is purely additive on top
-    # of pick_topic_with_idea_score(), which is unchanged.
-    topic, pillar, idea_score_avg, brief = select_topic_for_run(access_token, fmt="short")
-    print(f"[pipeline] topic: {topic} (pillar: {pillar}) - idea score avg {idea_score_avg:.1f}"
-          + (" [from weekly self-improvement queue]" if brief else ""))
-
+    # 2026-09-21 fix: this whole topic-selection -> generate/score -> gate
+    # block used to run exactly once per scheduled run - if the topic's
+    # script failed the quality/compliance gate (run #182 hit this live:
+    # best of 3 attempts on a queued brief only scored 7 against the
+    # QUALITY_THRESHOLD=8 bar), main() just returned, so that day's
+    # scheduled Shorts run published NOTHING, with no fallback to try a
+    # different topic. Given a bad topic isn't rare (Groq scoring is
+    # inherently variable run to run), this meant a real chance of a
+    # publish.yml run completing "successfully" while shipping zero
+    # videos - worse than a visible failure, since nothing alerts on it.
+    # Now wrapped in a loop: if a topic's script fails the gate, drain
+    # that topic/brief (same definitive-rejection rule as before) and try
+    # ONE fresh topic (bypassing the weekly queue on the retry, since the
+    # queue brief already got consumed - a plain idea-scored pick instead)
+    # before finally giving up. RUN_TOPIC_ATTEMPTS=2 caps this at at most
+    # 2x the Groq call volume of a normal run, not unbounded retries.
     from brand_rules import pick_next_cta_style, pick_next_structure
-    cta_style = pick_next_cta_style(get_recent_cta_styles(access_token))
-    print(f"[pipeline] CTA style this run: {cta_style}")
-    structure_tag = pick_next_structure(get_recent_structures(access_token))
-    print(f"[pipeline] script structure this run: {structure_tag}")
+    script = quality = compliance = topic = pillar = brief = None
+    sheet_row_base = None
+    for topic_attempt in range(1, RUN_TOPIC_ATTEMPTS + 1):
+        if topic_attempt == 1:
+            # Closed self-improvement loop (2026-07-30): try a weekly-
+            # generated, performance-informed brief first; falls back to
+            # the original random/idea-scored pick automatically if no
+            # brief is queued. See select_topic_for_run()'s docstring.
+            topic, pillar, idea_score_avg, brief = select_topic_for_run(access_token, fmt="short")
+        else:
+            print(f"[pipeline] topic attempt {topic_attempt}/{RUN_TOPIC_ATTEMPTS}: "
+                  "previous topic failed the gate - picking a fresh topic "
+                  "(bypassing the weekly queue, already consumed above)")
+            topic, pillar, idea_score_avg = pick_topic_with_idea_score(access_token)
+            brief = build_fallback_brief_from_profile(access_token) or None
+        print(f"[pipeline] topic: {topic} (pillar: {pillar}) - idea score avg {idea_score_avg:.1f}"
+              + (" [from weekly self-improvement queue]" if brief and topic_attempt == 1 else ""))
 
-    script, quality = generate_and_score_script(topic, pillar, brief=brief, cta_style=cta_style,
-                                                  structure_tag=structure_tag)
-    print(f"[pipeline] title: {script['title']}")
-    if script.get("cta_line"):
-        print(f"[pipeline] CTA line: {script['cta_line']}")
-    print(f"[pipeline] final quality score: {quality['score']} - {quality['notes']}")
+        cta_style = pick_next_cta_style(get_recent_cta_styles(access_token))
+        print(f"[pipeline] CTA style this run: {cta_style}")
+        structure_tag = pick_next_structure(get_recent_structures(access_token))
+        print(f"[pipeline] script structure this run: {structure_tag}")
 
-    compliance = compliance_check(script)
-    print(f"[pipeline] compliance: {compliance}")
+        script, quality = generate_and_score_script(topic, pillar, brief=brief, cta_style=cta_style,
+                                                      structure_tag=structure_tag)
+        print(f"[pipeline] title: {script['title']}")
+        if script.get("cta_line"):
+            print(f"[pipeline] CTA line: {script['cta_line']}")
+        print(f"[pipeline] final quality score: {quality['score']} - {quality['notes']}")
 
-    created_date = datetime.now(timezone.utc).isoformat()
-    sheet_row_base = [
-        "", script["title"], topic, "", created_date, "",
-        quality["score"], compliance["notes"], 0, 0, 0, 0, "", "", "",
-    ]
+        compliance = compliance_check(script)
+        print(f"[pipeline] compliance: {compliance}")
 
-    if quality["score"] < QUALITY_THRESHOLD or not compliance["passed"]:
+        created_date = datetime.now(timezone.utc).isoformat()
+        sheet_row_base = [
+            "", script["title"], topic, "", created_date, "",
+            quality["score"], compliance["notes"], 0, 0, 0, 0, "", "", "",
+        ]
+
+        gate_failed = quality["score"] < QUALITY_THRESHOLD or not compliance["passed"]
+        if not gate_failed:
+            break
+
         sheet_row_base[3] = "Rejected"
         sheet_row_base[14] = "Skipped upload: failed quality/compliance gate"
         sheet_append(access_token, "Videos!A:O", sheet_row_base)
-        print("[pipeline] rejected by quality/compliance gate - no upload")
+        print(f"[pipeline] rejected by quality/compliance gate on attempt {topic_attempt}/{RUN_TOPIC_ATTEMPTS}")
         # Definitive terminal rejection - the idea/script itself is weak,
         # so drain the queue slot now (matches select_topic_for_run()'s
         # "never retry a weak idea" design). See 2026-09-11 fix comment
         # there for why this is no longer done at selection time.
-        if brief:
+        if brief and brief.get("_row"):  # 2026-09-21: fallback_brief (Winning Content Profile) has no "_row" - guard instead of KeyError
             mark_queue_brief_used(access_token, brief["_row"])
-        return
+        if topic_attempt >= RUN_TOPIC_ATTEMPTS:
+            print(f"[pipeline] no topic cleared the gate in {RUN_TOPIC_ATTEMPTS} attempts this run - no upload today")
+            return
 
     with tempfile.TemporaryDirectory() as workdir:
         storyboard = generate_storyboard(script.get("sentences") or [])
@@ -3849,7 +3882,7 @@ def main() -> None:
             # Definitive terminal rejection (bad duration/resolution from
             # this generation attempt) - drain, same rationale as the
             # quality/compliance gate above.
-            if brief:
+            if brief and brief.get("_row"):  # 2026-09-21: fallback_brief (Winning Content Profile) has no "_row" - guard instead of KeyError
                 mark_queue_brief_used(access_token, brief["_row"])
             return
 
@@ -3865,7 +3898,7 @@ def main() -> None:
         # that lost run #158's brief) leaves the row unmarked, so
         # get_next_queue_brief() picks it up again on a future run instead
         # of silently discarding a good idea over an infra flake.
-        if brief:
+        if brief and brief.get("_row"):  # 2026-09-21: fallback_brief (Winning Content Profile) has no "_row" - guard instead of KeyError
             mark_queue_brief_used(access_token, brief["_row"])
 
         # 2026-09-02: this success/failure was previously only ever printed

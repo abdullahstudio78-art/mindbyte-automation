@@ -1393,7 +1393,7 @@ def main() -> None:
         # rationale: marking used now happens at each definitive outcome
         # instead of at selection time, so a mid-render/upload crash no
         # longer silently loses an otherwise-good queued idea).
-        if brief:
+        if brief and brief.get("_row"):  # 2026-09-21: fallback_brief (Winning Content Profile) has no "_row" - guard instead of KeyError
             mark_queue_brief_used(access_token, brief["_row"])
         return
 
@@ -1477,7 +1477,7 @@ def main() -> None:
             log_video_row()
             log_longform_checklist(access_token, topic, pillar, checklist)
             print(f"[pipeline_longform] rejected by pre-publish checklist: {checklist['failed']}")
-            if brief:
+            if brief and brief.get("_row"):  # 2026-09-21: fallback_brief (Winning Content Profile) has no "_row" - guard instead of KeyError
                 mark_queue_brief_used(access_token, brief["_row"])
             return
 
@@ -1488,7 +1488,7 @@ def main() -> None:
         )
         print(f"[pipeline_longform] uploaded video id: {video_id}")
         # Success - safe to drain the queue slot now (2026-09-11 fix).
-        if brief:
+        if brief and brief.get("_row"):  # 2026-09-21: fallback_brief (Winning Content Profile) has no "_row" - guard instead of KeyError
             mark_queue_brief_used(access_token, brief["_row"])
 
         # Phase 4 polish pass (2026-07-20): custom branded thumbnail,

@@ -124,7 +124,7 @@ def main() -> None:
         print("[facebook_pipeline] rejected by quality/compliance gate - no post")
         # Definitive terminal rejection - drain the queue slot (2026-09-11
         # fix, see pipeline.py's select_topic_for_run() for full rationale).
-        if brief:
+        if brief and brief.get("_row"):  # 2026-09-21: fallback_brief (Winning Content Profile) has no "_row" - guard instead of KeyError
             p.mark_queue_brief_used(access_token, brief["_row"])
         return
 
@@ -227,7 +227,7 @@ def main() -> None:
             idea_confidence=(brief.get("confidence", "") if brief else ""),
         )
         # Success - safe to drain the queue slot now (2026-09-11 fix).
-        if brief:
+        if brief and brief.get("_row"):  # 2026-09-21: fallback_brief (Winning Content Profile) has no "_row" - guard instead of KeyError
             p.mark_queue_brief_used(access_token, brief["_row"])
 
     print("[facebook_pipeline] done")
