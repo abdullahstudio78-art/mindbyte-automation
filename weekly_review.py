@@ -369,17 +369,33 @@ def load_longform_videos(token: str) -> list:
 def load_analytics_history_latest(token: str) -> dict:
     """One row per video_id: the MOST RECENT snapshot in AnalyticsHistory,
     keyed by video_id. History rows accumulate daily, so this is a
-    date-sorted dict-overwrite rather than a separate query."""
-    rows = sheet_get(token, "AnalyticsHistory!A2:O")
+    date-sorted dict-overwrite rather than a separate query.
+
+    2026-09-21 fix: this used to read only `AnalyticsHistory!A2:O` (15
+    columns), which stops exactly one column short of `EarlyRetentionPct`
+    (column P / index 15, appended to the header on 2026-07-31 per
+    analytics_sync.py's ANALYTICS_HISTORY_HEADER). analytics_sync.py has
+    been writing that column correctly every day since - the bug was only
+    ever on the read side here, so EarlyRetentionPct silently never made
+    it into a single weekly report or composite score in ~2 months of
+    runs. This is the actual swipe-away/first-few-seconds retention
+    signal (a live Studio check on this channel found 92.3% of Shorts
+    viewers swipe away, which this metric is meant to catch) - see
+    compute_composite_scores() below for how it's now weighted in."""
+    rows = sheet_get(token, "AnalyticsHistory!A2:P")
     latest = {}
     for row in rows:
-        row = row + [""] * (15 - len(row))
+        row = row + [""] * (16 - len(row))
         date, video_id = row[0], row[1]
         if not video_id:
             continue
+        early_retention_raw = row[15]
         entry = {
             "date": date, "avg_view_duration": safe_float(row[10]),
             "avg_view_pct": safe_float(row[11]), "subs_gained": safe_int(row[12]),
+            "early_retention_pct": (
+                safe_float(early_retention_raw) if str(early_retention_raw).strip() != "" else None
+            ),
         }
         prev = latest.get(video_id)
         if prev is None or date >= prev["date"]:
@@ -458,6 +474,12 @@ def merge_records(videos: list, history: dict, meta: dict) -> list:
             "avg_view_duration": h.get("avg_view_duration", 0.0),
             "avg_view_pct": h.get("avg_view_pct", 0.0),
             "subs_gained": h.get("subs_gained", 0),
+            # 2026-09-21: now actually read (see load_analytics_history_
+            # latest()'s docstring for the A2:O->A2:P fix) - None when no
+            # data exists yet for this video rather than 0.0, so it can be
+            # filtered out of scoring/pattern-detection below instead of
+            # dragging every early-data video's retention score to zero.
+            "early_retention_pct": h.get("early_retention_pct"),
             "engagement_rate": engagement_rate,
             "pillar": m.get("pillar", "") or "(unknown)",
             "format": m.get("format", "") or "short",
@@ -534,22 +556,53 @@ def compute_composite_scores(records: list) -> None:
     if not records:
         return
     has_subscriber_data = any(r["subs_gained"] > 0 for r in records)
+    # 2026-09-21: fold in EarlyRetentionPct now that it's actually being
+    # read (see load_analytics_history_latest()'s docstring) - this is the
+    # closest real signal to "did the viewer swipe away in the first
+    # couple seconds," which a live Studio check found is the channel's
+    # actual bottleneck (92.3% swipe-away on a representative Short), far
+    # more directly than AvgViewPercentage (which averages over the WHOLE
+    # video and is skewed by however few viewers stuck around). Weighted
+    # in only where at least MIN_GROUP_SAMPLE records actually have a
+    # value yet (older rows predate the 2026-07-31 column, or the
+    # underlying YouTube Analytics call returned no data for that video) -
+    # otherwise this degrades to the previous weighting exactly, per the
+    # file's standing "missing data never breaks scoring" pattern.
+    has_early_retention = sum(1 for r in records if r["early_retention_pct"] is not None) >= MIN_GROUP_SAMPLE
 
     views_pr = percentile_ranks([r["views"] for r in records])
     retention_pr = percentile_ranks([r["avg_view_pct"] for r in records])
     duration_pr = percentile_ranks([r["avg_view_duration"] for r in records])
     engagement_pr = percentile_ranks([r["engagement_rate"] for r in records])
+    if has_early_retention:
+        early_retention_pr = percentile_ranks(
+            [r["early_retention_pct"] if r["early_retention_pct"] is not None else 0.0 for r in records]
+        )
+    else:
+        early_retention_pr = [0.0] * len(records)
+
     if has_subscriber_data:
         subs_pr = percentile_ranks([r["subs_gained"] for r in records])
-        weights = {"views": 0.20, "retention": 0.25, "duration": 0.15, "engagement": 0.15, "subs": 0.25}
+        if has_early_retention:
+            weights = {"views": 0.15, "retention": 0.15, "early_retention": 0.20,
+                       "duration": 0.10, "engagement": 0.15, "subs": 0.25}
+        else:
+            weights = {"views": 0.20, "retention": 0.25, "early_retention": 0.0,
+                       "duration": 0.15, "engagement": 0.15, "subs": 0.25}
     else:
         subs_pr = [0.0] * len(records)
-        weights = {"views": 0.25, "retention": 0.30, "duration": 0.20, "engagement": 0.25, "subs": 0.0}
+        if has_early_retention:
+            weights = {"views": 0.20, "retention": 0.20, "early_retention": 0.25,
+                       "duration": 0.15, "engagement": 0.20, "subs": 0.0}
+        else:
+            weights = {"views": 0.25, "retention": 0.30, "early_retention": 0.0,
+                       "duration": 0.20, "engagement": 0.25, "subs": 0.0}
 
     for i, r in enumerate(records):
         r["composite_score"] = (
             weights["views"] * views_pr[i]
             + weights["retention"] * retention_pr[i]
+            + weights["early_retention"] * early_retention_pr[i]
             + weights["duration"] * duration_pr[i]
             + weights["engagement"] * engagement_pr[i]
             + weights["subs"] * subs_pr[i]
@@ -713,9 +766,26 @@ def detect_patterns(records: list) -> dict:
     # VideoMeta's new columns. Gracefully skipped (not added to `patterns`
     # at all) if no record has a non-blank value yet, per spec.
     if any(r.get("hook_type") for r in records):
-        add("hook_type", lambda r: r["hook_type"] or "(unclassified)")
+        add("hook_type", lambda r: r["hook_type"] or "(unclassified)",
+            value_fn=lambda r: r["early_retention_pct"] if r["early_retention_pct"] is not None else r["composite_score"])
     if any(r.get("series") for r in records):
         add("series", lambda r: r["series"] or "(none)")
+
+    # Early-retention-by-hook-opener (2026-09-21): now that EarlyRetentionPct
+    # is actually being read (see load_analytics_history_latest()'s
+    # docstring), this is the dimension most directly answering "which
+    # hooks actually survive the first couple of seconds" - separate from
+    # hook_type's composite-score-based ranking above, this groups by the
+    # literal opening words and scores by EarlyRetentionPct itself (falling
+    # back to composite_score for videos without a value yet), so it
+    # doesn't get diluted by later-video watch time the way AvgViewPercentage
+    # does.
+    if any(r["early_retention_pct"] is not None for r in records):
+        add(
+            "hook_opener_early_retention",
+            lambda r: r["hook_opener"] or "(unknown)",
+            value_fn=lambda r: r["early_retention_pct"] if r["early_retention_pct"] is not None else r["composite_score"],
+        )
 
     # Thumbnail-performance correlation (2026-08-18): ThumbnailIdentity has
     # been logged to VideoMeta since 2026-07-31 but was never read back or

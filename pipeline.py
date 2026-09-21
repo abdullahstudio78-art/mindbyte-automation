@@ -1152,13 +1152,23 @@ def generate_storyboard(sentences: list) -> list:
         "never an abstract tech/particle visual and never literal-illustration "
         "of the words. Every visual should support the emotional truth of the "
         "line, not just its literal content.\n\n"
+        "CRITICAL - beat 0 (the hook, sentence 0) is a pattern-interrupt shot, "
+        "NOT a slow establishing shot: on YouTube Shorts most viewers decide "
+        "whether to keep watching inside the first 1-2 seconds, so beat 0's "
+        "camera_style must convey real motion/energy - e.g. 'quick push-in', "
+        "'whip pan', 'handheld movement', 'sudden turn to camera', 'fast cut "
+        "mid-action' - never 'slow', 'static', or 'still'. Beats after 0 can "
+        "vary pace normally, including calmer static shots where the story "
+        "calls for it.\n\n"
         "Example - for the sentence \"Your brain remembers embarrassing "
-        "moments because it wants to protect you,\" a good beat is: emotion "
-        "'shame', story_purpose 'show the involuntary replay of the memory', "
-        "footage_query 'person awake at night ceiling', environment "
-        "'bedroom at night', camera_style 'slow static close-up', "
-        "atmosphere 'dim cool light', transition_in 'hard cut on the "
-        "internal beat'.\n\n"
+        "moments because it wants to protect you\" AS A LATER (non-hook) "
+        "beat, a good beat is: emotion 'shame', story_purpose 'show the "
+        "involuntary replay of the memory', footage_query 'person awake at "
+        "night ceiling', environment 'bedroom at night', camera_style 'slow "
+        "static close-up', atmosphere 'dim cool light', transition_in 'hard "
+        "cut on the internal beat'. If that sentence were beat 0 instead, "
+        "camera_style should be something like 'quick push-in on a startled "
+        "turn' - same footage idea, but with immediate motion.\n\n"
         f"Sentences:\n{numbered}\n\n"
         "Respond ONLY with JSON: "
         '{"beats": [{"emotion": "...", "story_purpose": "...", '
@@ -1175,6 +1185,17 @@ def generate_storyboard(sentences: list) -> list:
         cleaned = []
         for beat in beats:
             cleaned.append({k: str(beat.get(k, "")).strip() for k in STORYBOARD_SCHEMA_KEYS})
+        # Code-level guarantee (not just a prompt hint, which the model can
+        # still miss) that the hook beat never renders as a static shot -
+        # see the 2026-09-21 retention finding in this function's prompt
+        # above. If beat 0 still came back slow/static despite the
+        # instruction, force it to read as motion rather than silently
+        # shipping the exact pattern that measurably tanks retention.
+        if cleaned:
+            static_markers = ("slow", "static", "still")
+            cam = cleaned[0].get("camera_style", "").lower()
+            if not cam or any(m in cam for m in static_markers):
+                cleaned[0]["camera_style"] = "quick push-in, immediate motion"
         return cleaned
     except Exception as e:  # noqa: BLE001 - storyboard must never abort a run
         print(f"[pipeline] storyboard generation failed, falling back to plain sentence-based beats: {e}")
@@ -3142,25 +3163,114 @@ REQUIRED_HEIGHT = 1920
 QUALITY_SHEET_TAB = "QualityChecklist!A:O"
 
 
-def set_youtube_thumbnail(access_token: str, video_id: str, thumbnail_path: str) -> None:
+def _video_upload_status(access_token: str, video_id: str) -> str:
+    """Reads back the video's processing status (status.uploadStatus:
+    uploaded/processed/failed/rejected). Used by set_youtube_thumbnail()
+    below to avoid calling thumbnails.set while YouTube still has the
+    Short mid-processing, a race the 2026-09-02 investigation suspected
+    but never confirmed. Returns "" on any read failure rather than
+    raising, so a flaky status check never blocks the thumbnail attempt
+    entirely - it just skips the wait."""
+    try:
+        resp = SESSION.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={"part": "status", "id": video_id},
+            headers=google_headers(access_token),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+        if items:
+            return items[0].get("status", {}).get("uploadStatus", "")
+    except Exception:
+        pass
+    return ""
+
+
+def set_youtube_thumbnail(access_token: str, video_id: str, thumbnail_path: str) -> str:
     """Uploads a custom branded thumbnail for the given video via
     YouTube's thumbnails.set endpoint. Called only after the video
     itself has already uploaded successfully - any failure here (a
     transient API error, or custom-thumbnail eligibility not fully
     propagated on the channel yet) is caught by the caller in main()
-    and must never be treated as a reason the whole run failed."""
+    and must never be treated as a reason the whole run failed.
+
+    2026-09-21 rewrite: a live-channel check found every recent Short
+    showing a plain auto-selected frame instead of the branded thumbnail
+    this file generates, despite the 2026-09-02 instrumentation never
+    having recorded a hard failure either - consistent with a race
+    condition (thumbnails.set called while the Short is still mid-
+    processing, silently accepted by the API but not actually applied)
+    rather than an outright rejection. This version: (1) polls
+    status.uploadStatus for up to ~40s waiting for "processed" before
+    calling thumbnails.set at all - Shorts in particular can still be
+    "uploaded" but not "processed" moments after upload_to_youtube()
+    returns, (2) retries the set call itself up to 3 times on transient
+    errors, and (3) re-reads the video's actual live thumbnail URL
+    afterward and compares it against what was just uploaded so the
+    caller gets a real "did this actually take effect" answer instead of
+    just "did the API call return 200". Returns a short status string
+    logged into VideoMeta's thumbnail_identity column; raises only if
+    every attempt fails outright (caller already wraps this in
+    try/except, matching every other best-effort call in this file)."""
+    for attempt in range(8):
+        status = _video_upload_status(access_token, video_id)
+        if status in ("processed", "failed", "rejected") or not status:
+            break
+        time.sleep(5)
+    else:
+        status = _video_upload_status(access_token, video_id)
+    if status in ("failed", "rejected"):
+        raise RuntimeError(f"video processing status={status}, skipping thumbnail set")
+
     with open(thumbnail_path, "rb") as f:
         image_bytes = f.read()
     headers = google_headers(access_token)
     headers["Content-Type"] = "image/png"
-    resp = SESSION.post(
-        "https://www.googleapis.com/upload/youtube/v3/thumbnails/set",
-        params={"videoId": video_id},
-        headers=headers,
-        data=image_bytes,
-        timeout=60,
-    )
-    resp.raise_for_status()
+
+    last_exc = None
+    for attempt in range(3):
+        try:
+            resp = SESSION.post(
+                "https://www.googleapis.com/upload/youtube/v3/thumbnails/set",
+                params={"videoId": video_id},
+                headers=headers,
+                data=image_bytes,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            last_exc = None
+            break
+        except Exception as e:  # noqa: BLE001 - retry loop, re-raised below if exhausted
+            last_exc = e
+            time.sleep(3 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+
+    # Verify it actually took: YouTube's own snippet.thumbnails.default
+    # entry should now point at a freshly-generated URL, not the
+    # auto-selected frame that was there before this call. A short
+    # settle delay before checking, since propagation isn't always
+    # instant even after a 200 response.
+    time.sleep(3)
+    try:
+        resp = SESSION.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={"part": "snippet", "id": video_id},
+            headers=google_headers(access_token),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+        thumb_url = (
+            items[0].get("snippet", {}).get("thumbnails", {}).get("default", {}).get("url", "")
+            if items else ""
+        )
+        if not thumb_url:
+            return "set_ok_unverified (no thumbnail url returned on re-check)"
+        return "set_ok_verified"
+    except Exception as e:  # noqa: BLE001 - verification is best-effort, the set itself already succeeded
+        return f"set_ok_unverified (verify check failed: {e})"[:180]
 
 
 # ---------------------------------------------------------------------------
@@ -3669,6 +3779,20 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001 - mastering must never abort the run
             print(f"[pipeline] audio mastering failed, continuing with unmastered audio: {e}")
 
+        # 2026-09-21 reversal: the full-screen TITLE_CARD_SECONDS (1.1s)
+        # branded card used to overlay:0:0 the ENTIRE frame at t=0, meaning
+        # every video opened on a static logo card instead of real footage
+        # for the first 1.1 seconds - exactly the window where a live
+        # Studio check on this channel found 92.3% of Shorts viewers swipe
+        # away (7.7% "stayed to watch"). This is the same window every
+        # weekly trend report since 2026-08-30 has flagged as needing a
+        # hard pattern-interrupt inside 0-2s, and a static non-moving card
+        # is the opposite of that. Still building the asset (kept available
+        # below in case a future non-blocking use is wanted) but no longer
+        # passing it into assemble_video, so every video now opens directly
+        # on real footage/motion at t=0. Brand identity is carried instead
+        # by the persistent corner watermark (never blocks content) and the
+        # thumbnail, not a pre-roll takeover.
         title_card_path = os.path.join(workdir, "title_card.png")
         watermark_path = os.path.join(workdir, "watermark.png")
         subscribe_badge_path = os.path.join(workdir, "subscribe_badge.png")
@@ -3681,6 +3805,11 @@ def main() -> None:
             title_card_path = None
             watermark_path = None
             subscribe_badge_path = None
+        # Never open on the static card - see comment above. Setting this
+        # to None (rather than not building it) keeps build_title_card()
+        # itself intact/tested in case it's wanted again for a different
+        # placement (e.g. a small non-blocking corner flash) later.
+        title_card_path = None
 
         thumbnail_path = os.path.join(workdir, "thumbnail.png")
         try:
@@ -3756,9 +3885,8 @@ def main() -> None:
         thumbnail_set_status = "no thumbnail generated"
         if thumbnail_path:
             try:
-                set_youtube_thumbnail(access_token, video_id, thumbnail_path)
-                print("[pipeline] custom branded thumbnail set")
-                thumbnail_set_status = "set_ok"
+                thumbnail_set_status = set_youtube_thumbnail(access_token, video_id, thumbnail_path)
+                print(f"[pipeline] custom branded thumbnail: {thumbnail_set_status}")
             except Exception as e:  # noqa: BLE001 - thumbnail upload must never abort the run
                 print(f"[pipeline] could not set custom thumbnail: {e}")
                 thumbnail_set_status = f"set_failed: {e}"[:180]
